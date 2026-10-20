@@ -55,6 +55,9 @@ const PAIRED_SEEK_INTERVAL: Duration = Duration::from_secs(300);
 /// After acknowledging the peer's CLOSE, how long to stay for the peer to
 /// see it (it leaves as soon as it has).
 const CLOSE_LINGER: Duration = Duration::from_secs(30);
+/// Once the closing peer has left, how long to stay in case it dropped
+/// before our acknowledgement reached it and comes straight back.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Bytes of messages a peer holds until they are acknowledged.
 pub const OUTBOX_LIMIT: usize = 64 << 20;
 /// A receiver acknowledges after this many messages, this many bytes, or
@@ -187,14 +190,18 @@ impl Outbox {
 
 /// Where we are in the peer's streams.
 struct Inbound {
-    /// For the streams seen most recently (last = latest): the id of the
-    /// next message to deliver. Remembering several keeps two instances of
-    /// the peer, or a replayed handshake, from moving a position backwards.
+    /// For the streams that most recently delivered something (last =
+    /// latest): the id of the next message to deliver. Remembering several
+    /// keeps two instances of the peer from moving each other's position
+    /// back; recording only streams that actually delivered keeps replayed
+    /// handshakes, which never deliver, from crowding them out.
     streams: Vec<(u64, u64)>,
-    /// In the current session: the peer's stream, and the id of the next
-    /// message to arrive (below the delivery position, it is a duplicate).
+    /// In the current session: the peer's stream, the id of the next message
+    /// to arrive, and the id of the next one to deliver (an arrival below it
+    /// is a duplicate).
     current: u64,
     arriving: u64,
+    next: u64,
     /// Delivered since we last acknowledged.
     unacked: u32,
     unacked_bytes: usize,
@@ -218,10 +225,10 @@ impl Inbound {
     }
 
     /// What to announce in a handshake: our position in `stream`, or in the
-    /// latest stream if the peer's is not known yet.
+    /// latest stream if the peer's is not known yet; `(0, 0)` for none.
     fn seen(&self, stream: Option<u64>) -> (u64, u64) {
         match stream {
-            Some(stream) => (stream, self.position(stream).unwrap_or(0)),
+            Some(stream) => self.position(stream).map_or((0, 0), |next| (stream, next)),
             None => self.streams.last().copied().unwrap_or((0, 0)),
         }
     }
@@ -340,6 +347,7 @@ impl Peer {
                 streams: Vec::new(),
                 current: 0,
                 arriving: 0,
+                next: 0,
                 unacked: 0,
                 unacked_bytes: 0,
                 ack_at: None,
@@ -660,9 +668,11 @@ impl Peer {
     /// session with the previous one is over; a new arrival gets a fresh
     /// handshake, which the joiner starts.
     fn presence(&mut self, now: u64, present: bool) {
-        if !present && self.ended_by_peer.is_some() {
-            // The peer has seen our acknowledgement of its CLOSE and gone.
-            return self.finish(CloseReason::ClosedByPeer);
+        if !present && let Some(until) = self.ended_by_peer {
+            // The peer has most likely seen our acknowledgement of its CLOSE
+            // and gone. Stay a few seconds more in case it dropped before
+            // that: reconnecting, its handshake learns that we have it.
+            self.ended_by_peer = Some(until.min(now + ms(CLOSE_GRACE)));
         }
         let at_invite_in_session = matches!(
             &self.link,
@@ -740,8 +750,9 @@ impl Peer {
         // Incoming: the peer resends from the point it computes the same way;
         // what arrives below our delivery position for its stream is a duplicate.
         let arriving = if ours.seen_stream == theirs.stream { ours.seen_next.max(theirs.base) } else { theirs.base };
-        let position = self.inbound.position(theirs.stream).map_or(theirs.base, |p| p.max(theirs.base));
-        self.inbound.set_position(theirs.stream, position);
+        // (The remembered position is updated only once a message from this
+        // stream arrives: a replayed handshake never gets that far.)
+        self.inbound.next = self.inbound.position(theirs.stream).map_or(theirs.base, |p| p.max(theirs.base));
         self.inbound.current = theirs.stream;
         self.inbound.arriving = arriving;
         self.inbound.unacked = 0;
@@ -837,7 +848,7 @@ impl Peer {
     }
 
     fn send_ack(&mut self, now: u64) {
-        let next = self.inbound.position(self.inbound.current).unwrap_or(0);
+        let next = self.inbound.next;
         let Link::Open(Open { phase: Phase::Joined(Session::Established(est)), .. }) = &mut self.link else {
             return;
         };
@@ -907,10 +918,10 @@ impl Peer {
     fn arrived(&mut self) -> bool {
         let id = self.inbound.arriving;
         self.inbound.arriving += 1;
-        let position = self.inbound.position(self.inbound.current).unwrap_or(0);
-        if id < position {
+        if id < self.inbound.next {
             return false;
         }
+        self.inbound.next = id + 1;
         self.inbound.set_position(self.inbound.current, id + 1);
         true
     }

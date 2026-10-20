@@ -59,8 +59,10 @@ struct Relay {
     forwarded: u32,
     /// Cut this node's connection right after forwarding it the next MESSAGE.
     cut_after_next_to: Option<usize>,
-    /// The last INIT forwarded (a malicious relay keeps it to replay later).
-    recorded_init: Option<Vec<u8>>,
+    /// Every INIT forwarded (a malicious relay keeps them to replay later).
+    recorded_inits: Vec<Vec<u8>>,
+    /// Cut this node's connection right after forwarding its next MESSAGE.
+    cut_sender_after_next: Option<usize>,
     /// Silently drop the next MESSAGE frame forwarded.
     swallow_next: bool,
     /// Hold every frame for this node instead of delivering it.
@@ -209,7 +211,7 @@ impl Sim {
                             return;
                         }
                         if frame[0] == wire::INIT {
-                            self.relay.recorded_init = Some(frame.clone());
+                            self.relay.recorded_inits.push(frame.clone());
                         }
                         if frame[0] == wire::MESSAGE && std::mem::take(&mut self.relay.swallow_next) {
                             return;
@@ -229,6 +231,12 @@ impl Sim {
                                 self.relay.kick_after_reply = false;
                                 self.queue.push_back(Delivery::Hangup(p));
                                 self.queue.push_back(Delivery::Closed(node, p, None));
+                            }
+                            let sender = socket.node;
+                            if kind == wire::MESSAGE && self.relay.cut_sender_after_next == Some(sender) {
+                                self.relay.cut_sender_after_next = None;
+                                self.queue.push_back(Delivery::Hangup(id));
+                                self.queue.push_back(Delivery::Closed(sender, id, None));
                             }
                             if kind == wire::MESSAGE && self.relay.cut_after_next_to == Some(node) {
                                 self.relay.cut_after_next_to = None;
@@ -546,6 +554,7 @@ fn closing_ends_the_room_on_both_sides() {
     sim.run();
     assert_eq!(sim.messages(b), vec![b"last words".to_vec()]);
     assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
+    sim.advance(6_000); // b stays a moment in case a dropped before seeing its ACK
     assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
     sim.advance(120_000);
     assert!(sim.nodes.iter().all(|n| n.socket.is_none() && n.peer.poll_timeout().is_none()));
@@ -571,7 +580,7 @@ fn closing_reaches_a_peer_that_was_away() {
     // b comes back, and is told.
     let b_saved = sim.nodes[b].peer.room().clone();
     let b2 = sim.add(b_saved);
-    sim.advance(1_000);
+    sim.advance(7_000);
     assert_eq!(sim.state(b2), State::Closed(CloseReason::ClosedByPeer));
     assert_eq!(sim.state(a2), State::Closed(CloseReason::Closed));
 }
@@ -796,7 +805,7 @@ fn an_inviter_can_close_before_pairing_completes() {
     sim.nodes[a].peer.close(); // cancel the invitation
     sim.run();
     let b = sim.add(joiner);
-    sim.advance(2_000);
+    sim.advance(7_000);
     assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
     assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
     assert!(!sim.events(a).contains(&Event::Paired));
@@ -812,6 +821,7 @@ fn a_lost_acknowledgement_of_close_still_ends_both() {
     assert_ne!(sim.state(a), State::Closed(CloseReason::Closed));
     sim.advance(5_000); // b reconnects, its handshake says it has the CLOSE
     assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
+    sim.advance(6_000);
     assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
 }
 
@@ -929,7 +939,7 @@ fn restarted_instances_never_duplicate() {
 fn a_replayed_handshake_from_an_old_instance_causes_no_duplicates() {
     let mut sim = Sim::new();
     let (a, j0, _, joiner) = pair(&mut sim);
-    let old_init = sim.relay.recorded_init.clone().unwrap(); // from the first joiner instance
+    let old_init = sim.relay.recorded_inits.last().unwrap().clone(); // from the first joiner instance
     sim.nodes[j0].peer.leave();
     sim.run();
     let j1 = sim.add(joiner); // a new instance: a new stream
@@ -957,4 +967,48 @@ fn a_silently_lost_frame_is_resent() {
     sim.advance(20_000);
     assert_eq!(sim.messages(b), vec![b"lost in transit".to_vec()]);
     assert_eq!(sim.nodes[a].peer.queued(), 0);
+}
+
+#[test]
+fn replaying_many_old_handshakes_cannot_flush_positions() {
+    let mut sim = Sim::new();
+    let (a, mut j, _, joiner) = pair(&mut sim);
+    // The joiner restarts many times (each instance a new stream); the relay
+    // keeps an INIT from every one.
+    for _ in 0..20 {
+        sim.nodes[j].peer.leave();
+        sim.run();
+        j = sim.add(joiner.clone());
+    }
+    let recorded = sim.relay.recorded_inits.clone();
+    assert!(recorded.len() > 20);
+    sim.send(j, b"one").unwrap();
+    sim.send(j, b"two").unwrap();
+    // a has them, unacknowledged, when the relay replays every INIT and cuts
+    // the joiner off.
+    let a_socket = sim.nodes[a].socket.unwrap();
+    for init in recorded {
+        sim.queue.push_back(Delivery::ToPeer(a, a_socket, Msg::Binary(init)));
+    }
+    let j_socket = sim.nodes[j].socket.unwrap();
+    sim.drop_socket(j_socket, None);
+    sim.queue.push_back(Delivery::Closed(j, j_socket, None));
+    sim.run();
+    sim.advance(60_000);
+    assert_eq!(sim.messages(a), vec![b"one".to_vec(), b"two".to_vec()]);
+    assert_eq!(sim.nodes[j].peer.queued(), 0);
+}
+
+#[test]
+fn a_closer_that_drops_before_the_acknowledgement_still_finishes() {
+    let mut sim = Sim::new();
+    let (a, b, ..) = pair(&mut sim);
+    sim.relay.cut_sender_after_next = Some(a); // a's CLOSE goes out, a's connection drops
+    sim.nodes[a].peer.close();
+    sim.run();
+    assert_ne!(sim.state(a), State::Closed(CloseReason::Closed));
+    // a comes straight back; b is still there to say it has the CLOSE.
+    sim.advance(10_000);
+    assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
+    assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
 }
