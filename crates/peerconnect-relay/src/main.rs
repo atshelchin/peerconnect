@@ -4,6 +4,10 @@
 //!
 //! - `PEERCONNECT_LISTEN` — address to listen on (default `0.0.0.0:8080`)
 //! - `PEERCONNECT_MAX_CONNECTIONS` — concurrent WebSockets (default 10000)
+//! - `PEERCONNECT_MAX_PER_ADDRESS` — concurrent WebSockets per client
+//!   address, IPv6 counted per /64 (default 64)
+//! - `PEERCONNECT_TRUST_PROXY=1` — take the client address from the last
+//!   `X-Forwarded-For` entry (only behind a proxy that sets it)
 //!
 //! It speaks plain `ws://`; put a TLS-terminating proxy in front of it for
 //! `wss://`. `peerconnect-relay healthcheck` exits successfully if a relay
@@ -26,15 +30,21 @@ async fn main() -> ExitCode {
         return healthcheck(&listen);
     }
     let mut config = Config::default();
-    if let Ok(max) = env::var("PEERCONNECT_MAX_CONNECTIONS") {
-        match max.parse() {
-            Ok(max) => config.max_connections = max,
-            Err(_) => {
-                eprintln!("PEERCONNECT_MAX_CONNECTIONS must be a number, got {max:?}");
-                return ExitCode::FAILURE;
+    for (name, value) in [
+        ("PEERCONNECT_MAX_CONNECTIONS", &mut config.max_connections),
+        ("PEERCONNECT_MAX_PER_ADDRESS", &mut config.max_per_address),
+    ] {
+        if let Ok(text) = env::var(name) {
+            match text.parse() {
+                Ok(number) => *value = number,
+                Err(_) => {
+                    eprintln!("{name} must be a number, got {text:?}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
+    config.trust_proxy = env::var("PEERCONNECT_TRUST_PROXY").is_ok_and(|v| v == "1" || v == "true");
     let listener = match TcpListener::bind(&listen).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -43,10 +53,12 @@ async fn main() -> ExitCode {
         }
     };
     eprintln!(
-        "peerconnect relay {} listening on {} (max {} connections)",
+        "peerconnect relay {} listening on {} (max {} connections, {} per address{})",
         env!("CARGO_PKG_VERSION"),
         listener.local_addr().map_or(listen, |a| a.to_string()),
-        config.max_connections
+        config.max_connections,
+        config.max_per_address,
+        if config.trust_proxy { ", client address from X-Forwarded-For" } else { "" }
     );
 
     let mut term = signal(SignalKind::terminate()).expect("signal handler");

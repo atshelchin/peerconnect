@@ -33,6 +33,10 @@ pub const PRESENCE_LEN: usize = 2;
 pub const MAX_FRAME_LEN: usize = 1 + crate::noise::MAX_MESSAGE_LEN;
 /// Largest application message (it travels in as many frames as needed).
 pub const MAX_MESSAGE_LEN: usize = 16 << 20;
+/// Bytes a sender keeps in flight, sent but not acknowledged, at most (a
+/// single message may overrun it). This, not the relay, bounds what is
+/// buffered between two peers.
+pub const WINDOW: usize = 4 << 20;
 
 /// Domain separator for the `JOIN` signature.
 pub const JOIN_CONTEXT: &[u8] = b"peerconnect/v1 join";

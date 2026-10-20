@@ -6,9 +6,9 @@
 //! chat open <room-file>               reconnect to a saved room
 //! ```
 //!
-//! Lines typed are sent to the peer; the peer's messages are printed. The
-//! room is saved to `<room-file>` (a secret!) so it can be reopened later.
-//! `/close` ends the room for both sides.
+//! Lines typed are sent to the peer, queued while it is away; the peer's
+//! messages are printed. The room is saved to `<room-file>` (a secret!) so
+//! it can be reopened later. `/close` ends the room for both sides.
 //!
 //! Run with `cargo run -p peerconnect --features client --example chat -- …`.
 
@@ -39,10 +39,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             event = conn.next() => match event {
                 Some(Event::Message(data)) => println!("< {}", String::from_utf8_lossy(&data)),
-                Some(Event::Paired) => fs::write(file, conn.room().to_string())?,
+                Some(Event::Paired) => {
+                    eprintln!("* paired");
+                    fs::write(file, conn.room().to_string())?;
+                }
                 Some(Event::Replaced) => eprintln!("* this room was opened elsewhere; retrying in a minute"),
+                Some(Event::Delivered(_)) => {}
                 Some(Event::State(State::Closed(reason))) => {
                     eprintln!("* closed: {reason:?}");
+                    if reason != peerconnect::CloseReason::Left {
+                        let _ = fs::remove_file(file);
+                    }
                     return Ok(());
                 }
                 Some(Event::State(state)) => eprintln!("* {state:?}"),
@@ -50,9 +57,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             },
             line = lines.next_line() => match line? {
                 Some(line) if line == "/close" => {
-                    conn.close().await;
-                    fs::remove_file(file)?;
-                    return Ok(());
+                    conn.close(); // finishes when the peer has been told
+                    fs::write(file, conn.room().to_string())?;
                 }
                 Some(line) => {
                     if let Err(err) = conn.send(line).await {

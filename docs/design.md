@@ -22,22 +22,29 @@ Consequences:
 - The draft's room states (CREATED / ACTIVE / WAITING / CLOSED) disappear from the relay. What remains is two seats, each empty or not. Room lifecycle is a matter between the peers.
 - The challenge costs no round trip: the relay sends `HELLO` in the same flight as the `101 Switching Protocols`, and the client could not have sent anything earlier anyway.
 
-## 2. One handshake, with pinning, instead of a second room
+## 2. One handshake, pinning, and a second room ID
 
-The relay credential is derived from the invite, so whoever holds the invite can always enter the room on the relay. What about the end-to-end channel? The obvious ideas both fail:
+The relay credential is derived from the invite, so whoever holds the invite can enter the room at its invite ID. What about the end-to-end channel? The obvious ideas both fail:
 
 - **Use the invite secret alone (e.g. `NNpsk0`) forever.** Then an invite leaked later lets a malicious relay man-in-the-middle every future session. Unacceptable.
-- **Pair once, then move both peers to a fresh room derived from the handshake.** This makes the invite truly single-use, but the move is a two-generals problem. If the last handshake message is lost, one peer moves and the other does not, and with no relay state there is nobody to reconcile them. Fixing that needs dual connections and timeouts: much more mechanism for a corner case.
+- **Pair once, then switch both peers to a key derived from the handshake.** The switch is a two-generals problem: if the last handshake message is lost, one peer switches and the other does not, and with no relay state there is nobody to reconcile them.
 
-**Now:** every handshake, the first and every reconnection, is `Noise_IKpsk1_25519_ChaChaPoly_SHA256`:
+**Every handshake is `Noise_IKpsk1_25519_ChaChaPoly_SHA256`,** the first one and every reconnection:
 
 - the joiner knows the inviter's static key from the invite;
 - the joiner's static key travels encrypted in message 1;
 - both prove knowledge of the room secret through the psk.
 
-The inviter **pins** the joiner's key the first time and refuses any other afterwards. Because the joiner's key is fixed *before* it ever speaks, pinning is idempotent: if the reply is lost, the joiner retries with the same key and nothing is out of sync. There is no confirmation round and no two-generals problem.
+The inviter **pins** the joiner's key and refuses any other afterwards. Because the joiner's key is fixed *before* it ever speaks, pinning is idempotent: if anything is lost, the joiner retries with the same key and nothing is out of sync. After pairing, a leaked invite can no longer read, forge or impersonate.
 
-Result: after pairing, a leaked invite can no longer read, forge or impersonate. What remains is relay access: the ability to occupy either seat, which is denial of service, the same power the relay itself always has. That is the honest limit of a stateless relay (it cannot remember that an invite was used), and the spec says so (§8.3).
+That still left relay access: anyone with the invite could take either seat at the invite ID and knock a peer off. A stateless relay cannot remember that an invite was used, so the room has to **move**. Once paired, the peers meet at a **pair ID** whose key is derived from the room secret *and* the Diffie-Hellman of their two identities. Only they can compute it; the invite does not lead there, even to someone who has learned both public keys.
+
+The move is exactly the two-generals situation the first design avoided, so it is built to tolerate any loss:
+
+- The inviter moves when pairing completes, which is when it first receives an authenticated message from the joiner. The joiner acknowledges at once on every new session.
+- An unpaired joiner does not try to know whether the inviter has moved. It alternates between the two IDs: on every reconnection, after 20 s alone, and at once when the inviter leaves a session. Because the inviter is at exactly one of the two, the joiner finds it within one round.
+
+So there is no moment at which one side's lost message strands the other; the simulation drops the confirmation on purpose, and restarts the inviter mid-pairing, to show it. In practice the invite ID carries one round trip of traffic, and the room then lives where the invite cannot follow.
 
 `IK` over `XX`: one round trip instead of one and a half; the inviter's key is in the invite anyway; and the joiner gets assurance of the inviter's identity even if the invite was copied. `psk1` over `psk2`: the psk must be mixed into message 1, or the inviter could be made to pin a key from someone who never had the invite.
 
@@ -50,52 +57,68 @@ Result: after pairing, a leaked invite can no longer read, forge or impersonate.
 - A phone that switches networks reconnects at once, instead of waiting for its old, dead connection to time out.
 - There is no "room full": an extra connection always lands in its own seat.
 - Handshake initiation is never ambiguous: the joiner always initiates, triggered by `PRESENCE(1)`, which the relay sends whenever a *new* partner connection appears (including a replacement). Both sides drop any previous session on every `PRESENCE`.
-- A replaced client steps back for a minute and tells its application, which can let it leave (two tabs with the same room), instead of evicting the other in a tight loop. It does not stop for good. An earlier version did, until a review pointed out that a single forged 4409 (from a relay, or from anyone holding the room secret) would then knock a peer out permanently, which is a far worse outcome than any other relay misbehaviour.
+- A replaced client steps back for a minute and tells its application, which can let it leave (two tabs with the same room), instead of evicting the other in a tight loop. It does not stop for good. An earlier version did, until a review pointed out that a single forged 4409 would then knock a peer out permanently, which is a far worse outcome than any other relay misbehaviour.
 
 The relay guarantees an order: the partner sees `PRESENCE(1)` before any frame from the new connection, and never sees a frame from a replaced one after it. Stale frames that slip through before that point are recognisably stale (they fail authentication, or arrive with no session) and are ignored.
 
-## 4. Close is end-to-end; leave is just closing the socket
+## 4. A reliable stream, kept by the peers
+
+The draft promised no delivery across disconnections, because the relay keeps no messages. But the relay is not the only place a message can wait: the **sender** has it. So each peer numbers what it sends, keeps every message until the other acknowledges it, and on every new session resends from where the other says it got to. The relay stays stateless, and the sender's own memory is the offline queue.
+
+Details that keep it small:
+
+- **Resume state rides in the handshake payloads,** which Noise encrypts and authenticates and which were empty before: 32 bytes each way, so resuming costs no extra round trip.
+- **Message ids never travel.** Both sides compute the resume point from the two payloads; within a session, Noise's nonces already guarantee order.
+- **A random stream id per process start** tells a resumed stream from a new one. A peer that restarted lost its queue; its partner sees the new id and starts counting afresh, rather than discarding the new messages as duplicates.
+- **ACKs are cumulative and batched** (50 ms, or 32 messages, or 1 MiB).
+- **A 4 MiB window** caps what is unacknowledged in flight. That bounds what any relay has to hold, including Cloudflare's, which cannot apply backpressure.
+
+What it cannot do: survive the sender's own process ending. The queue is in memory, as any persistence would make the SDK opinionated about storage. Applications that need that keep their own copies until they see the message acknowledged.
+
+## 5. Close is end-to-end; leave is just closing the socket
 
 The draft lists `leave` and `close` as relay operations. But a stateless relay cannot *enforce* that a room is over: it would forget on restart, and either peer could simply rejoin. So:
 
 - **leave** = close the WebSocket. The partner sees `PRESENCE(0)`. Nothing is lost.
-- **close** = an encrypted `CLOSE` inside the session, which the partner trusts because it is authenticated, followed by leaving. Both peers delete their records.
+- **close** = a `CLOSE` at the end of the stream, which the partner trusts because it is authenticated. Being part of the stream, it is resent until acknowledged, and the record says "closing" so that even a restarted peer carries on.
 
-If the partner is offline at that moment it is never told. That is an inherent limit, stated in the spec, rather than something papered over with a "closed rooms" list the relay would lose anyway.
+A peer that is never online at the same time as the closer, after the closer gave up, is never told. That limit is inherent and stated in the spec, rather than papered over with a "closed rooms" list the relay would lose anyway.
 
-## 5. Wire format
+## 6. Wire format
 
 - **Binary frames, one type byte.** Types below `0x80` are *peer frames*: the relay forwards them byte for byte without parsing, so new peer-level features never require relay changes. Types from `0x80` up are relay frames. The draft's JSON control messages became three fixed-layout frames (`HELLO`, `JOIN`, `PRESENCE`).
 - **Text `ping`/`pong`.** This is the one text message, because Cloudflare can answer a fixed text message without waking a hibernating Durable Object. It costs nothing elsewhere and makes keepalives free on Cloudflare.
 - **Errors are WebSocket close codes.** Every relay error ends the connection anyway, so a separate error frame would add nothing.
-- **No sequence numbers on the wire.** Noise transport nonces are implicit counters. Over an ordered channel this detects replay, reordering and loss, for free. Any decryption failure means the relay misbehaved; the peer reconnects, which resets everything.
-- **64 KiB frames, 16 MiB messages.** Each transport message stays within Noise's 65,535-byte limit, so any standard Noise library can implement the protocol, and relays need only small, bounded buffers. A one-byte kind (`FINAL`/`MORE`/`CLOSE`) inside the ciphertext chunks larger messages. Putting it inside the ciphertext means the relay cannot tamper with it.
+- **No sequence numbers on the wire.** Noise transport nonces are implicit counters. Over an ordered channel this detects replay, reordering and loss within a session, for free; message ids across sessions are derived from the handshake (§4). Any decryption failure means the relay misbehaved; the peer reconnects, and the stream resumes.
+- **64 KiB frames, 16 MiB messages.** Each transport message stays within Noise's 65,535-byte limit, so any standard Noise library can implement the protocol, and relays need only small, bounded buffers. A one-byte kind (`FINAL`/`MORE`/`CLOSE`/`ACK`) inside the ciphertext chunks larger messages and carries the stream's control. Putting it inside the ciphertext means the relay cannot tamper with it.
 
-## 6. Flow control
+## 7. Flow control
 
 Every buffer is bounded except where unbounded is safe, and no wait is unbounded:
 
 - **Relay outboxes are byte budgets** (256 KiB per connection), not frame counts. A sender whose partner is slow is held back through TCP.
 - **A receiver that accepts nothing for 30 s is closed**, so a stalled or malicious peer cannot hold its partner hostage.
 - **Writing never blocks reading**, in the relay and in the clients alike. In the Rust client a writer task owns the socket's write half, and incoming events queue without bound, as a browser WebSocket does. Otherwise two peers that send each other 16 MiB at once deadlock: each waits to write, so neither reads. An earlier version did exactly that; the review that found it is why these tests exist.
-- **`send` paces the application**: it waits while more than 1 MiB is queued. Keepalives jump that queue, and leaving never waits for it. Ending a room does wait, up to 30 s, because the message that ends it must follow everything already queued: it is encrypted with the next nonce.
+- **The window and the outbox pace the application.** At most 4 MiB is unacknowledged on the wire; at most 64 MiB is queued, beyond which `send` waits (Rust) or throws (JavaScript). Keepalives jump the socket's queue, and leaving never waits for anything.
 - **The relay keeps a backpressured connection alive.** A relay holding back a sender cannot read its pings in the meantime, so after 30 s of silence towards a connection it sends `pong` unprompted. Without this, a large upload to a slow reader would look like a dead connection after 60 s.
 
-## 7. Liveness
+## 8. Liveness
 
 Peers ping every 25 s, unconditionally; relays may drop connections silent for 90 s; peers give up on a connection that has been silent for 60 s. Pinging unconditionally, rather than only when idle, lets a relay judge liveness from pings alone. That is exactly what Cloudflare's auto-response timestamp provides.
 
-## 8. What was left out on purpose
+## 9. What was left out on purpose
 
 | Not included | Why |
 |---|---|
-| Offline queue | Requires relay storage; the draft excludes it. |
+| Relay-side offline storage | The draft excludes it; senders queue instead (§4). |
+| Persistent outgoing queue | The SDK would have to own storage; applications keep copies until acknowledged. |
+| Several relays per room | Both peers must meet on the same one; failover without coordination needs more than a URL list. Peers can move a room by agreeing on a new relay URL. |
 | In-session rekeying | Sessions end at every reconnect; long-lived ones are noted in §8.5 of the spec. |
-| Relay-side rate limiting per IP | Deployment concern (proxy, firewall, Cloudflare); documented. |
+| Rate limiting beyond connection counts | The Linux relay limits connections per address (IPv6 per /64); request-rate limits belong to the proxy or Cloudflare rules. |
 | Out-of-band fingerprint UI | Both identity keys are exposed by the SDKs; comparing them is an application choice. |
 | More than two peers, RPC, pub/sub | Out of scope, as in the draft. |
 
-## 9. Implementation architecture
+## 10. Implementation architecture
 
 One Rust crate, `peerconnect`, holds the whole protocol **without I/O**:
 

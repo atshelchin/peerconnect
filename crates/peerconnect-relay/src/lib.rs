@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,6 +47,13 @@ const BATCH: usize = 256 << 10;
 pub struct Config {
     /// Connections beyond this are refused with HTTP 503.
     pub max_connections: usize,
+    /// Connections from one client address (an IPv6 /64 counts as one)
+    /// beyond this are refused with HTTP 429.
+    pub max_per_address: usize,
+    /// Take the client address from the last `X-Forwarded-For` entry, as
+    /// appended by a proxy in front of the relay. Only enable this behind
+    /// such a proxy: clients could otherwise claim any address.
+    pub trust_proxy: bool,
     /// Bytes queued towards one connection before its partner is held back.
     /// Worst-case buffer memory is about `max_connections × queue_bytes`.
     pub queue_bytes: usize,
@@ -53,7 +61,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_connections: 10_000, queue_bytes: 256 << 10 }
+        Config { max_connections: 10_000, max_per_address: 64, trust_proxy: false, queue_bytes: 256 << 10 }
     }
 }
 
@@ -62,6 +70,7 @@ impl Default for Config {
 pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<Output = ()>) {
     let relay = Arc::new(Relay {
         rooms: Mutex::new(HashMap::new()),
+        addresses: Arc::new(Mutex::new(HashMap::new())),
         slots: Arc::new(Semaphore::new(config.max_connections)),
         next_id: AtomicU64::new(0),
         stop: watch::channel(false).0,
@@ -71,9 +80,9 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+                let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(relay.clone().http(stream));
+                tokio::spawn(relay.clone().http(stream, peer.ip()));
             }
             () = &mut shutdown => break,
         }
@@ -85,6 +94,8 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
 
 struct Relay {
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
+    /// Open WebSockets per client address.
+    addresses: Arc<Mutex<HashMap<IpAddr, usize>>>,
     slots: Arc<Semaphore>,
     next_id: AtomicU64,
     stop: watch::Sender<bool>,
@@ -156,10 +167,10 @@ impl Outbox {
 type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 impl Relay {
-    async fn http(self: Arc<Self>, stream: tokio::net::TcpStream) {
+    async fn http(self: Arc<Self>, stream: tokio::net::TcpStream, peer: IpAddr) {
         let service = hyper::service::service_fn(move |req| {
             let relay = self.clone();
-            async move { Ok::<_, Infallible>(relay.route(req)) }
+            async move { Ok::<_, Infallible>(relay.route(req, peer)) }
         });
         // A connection that never finishes its request must not linger.
         let conn = hyper::server::conn::http1::Builder::new()
@@ -170,7 +181,7 @@ impl Relay {
         let _ = conn.await;
     }
 
-    fn route(self: Arc<Self>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+    fn route(self: Arc<Self>, req: Request<Incoming>, peer: IpAddr) -> Response<Full<Bytes>> {
         let path = req.uri().path();
         if path == "/" || path == "/healthz" {
             return text(StatusCode::OK, "peerconnect relay\n");
@@ -180,6 +191,10 @@ impl Relay {
         };
         let Some(key) = websocket_key(&req) else {
             return text(StatusCode::UPGRADE_REQUIRED, "expected a WebSocket upgrade\n");
+        };
+        let address = if self.config.trust_proxy { forwarded_for(&req).unwrap_or(peer) } else { peer };
+        let Some(per_address) = self.admit(address) else {
+            return text(StatusCode::TOO_MANY_REQUESTS, "too many connections from this address\n");
         };
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             return text(StatusCode::SERVICE_UNAVAILABLE, "relay full\n");
@@ -196,6 +211,7 @@ impl Relay {
                 .max_frame_size(Some(wire::MAX_FRAME_LEN));
             let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
             self.connection(room, ws, slot).await;
+            drop(per_address);
         });
         let mut res = Response::new(Full::default());
         *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -257,6 +273,18 @@ impl Relay {
         }
         outbox.close(close::NORMAL);
         let _ = writer.await;
+    }
+
+    /// Counts a connection against its client address, if under the limit.
+    fn admit(&self, address: IpAddr) -> Option<AddressSlot> {
+        let key = address_key(address);
+        let mut addresses = self.addresses.lock().unwrap();
+        let count = addresses.entry(key).or_default();
+        if *count >= self.config.max_per_address {
+            return None;
+        }
+        *count += 1;
+        Some(AddressSlot { addresses: self.addresses.clone(), key })
     }
 
     /// Forgets a room once nobody sits in it or is about to.
@@ -403,6 +431,42 @@ fn holds(seats: &[Option<Seat>; 2], role: Role, id: u64) -> bool {
     seats[role.index()].as_ref().is_some_and(|s| s.id == id)
 }
 
+/// Releases a connection's count against its address.
+struct AddressSlot {
+    addresses: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    key: IpAddr,
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut addresses = self.addresses.lock().unwrap();
+        if let Some(count) = addresses.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                addresses.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// IPv4 addresses count individually; IPv6 ones by /64, which one client
+/// usually controls whole.
+fn address_key(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+        },
+        v4 => v4,
+    }
+}
+
+/// The address the nearest proxy saw: the last `X-Forwarded-For` entry.
+fn forwarded_for(req: &Request<Incoming>) -> Option<IpAddr> {
+    let last = req.headers().get_all("x-forwarded-for").iter().next_back()?;
+    last.to_str().ok()?.rsplit(',').next()?.trim().parse().ok()
+}
+
 fn websocket_key(req: &Request<Incoming>) -> Option<&str> {
     let headers = req.headers();
     let has = |name, value: &str| {
@@ -422,4 +486,19 @@ fn text(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
     let mut res = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
     *res.status_mut() = status;
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses_are_counted_per_host_or_ipv6_64() {
+        let key = |s: &str| address_key(s.parse().unwrap());
+        assert_eq!(key("192.0.2.7"), key("192.0.2.7"));
+        assert_ne!(key("192.0.2.7"), key("192.0.2.8"));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:192.0.2.7"), key("192.0.2.7"));
+    }
 }

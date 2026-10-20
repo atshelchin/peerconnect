@@ -29,6 +29,7 @@ pub const MAX_MESSAGE_LEN: usize = 65535;
 /// Largest plaintext a single transport message can carry.
 pub const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
 
+/// Length of handshake message 1 and 2 with an empty payload.
 pub const INIT_LEN: usize = KEY_LEN + (KEY_LEN + TAG_LEN) + TAG_LEN;
 pub const REPLY_LEN: usize = KEY_LEN + TAG_LEN;
 
@@ -45,8 +46,15 @@ pub struct Initiator {
 }
 
 impl Initiator {
-    /// Starts a handshake towards `rs`, returning the state and the first message.
-    pub fn start(s: &StaticSecret, rs: &PublicKey, psk: &[u8; 32], e: StaticSecret) -> Result<(Self, Vec<u8>), Error> {
+    /// Starts a handshake towards `rs`, returning the state and the first
+    /// message, which carries `payload`.
+    pub fn start(
+        s: &StaticSecret,
+        rs: &PublicKey,
+        psk: &[u8; 32],
+        e: StaticSecret,
+        payload: &[u8],
+    ) -> Result<(Self, Vec<u8>), Error> {
         let mut st = SymmetricState::new();
         st.mix_hash(rs.as_bytes());
 
@@ -59,14 +67,15 @@ impl Initiator {
         st.encrypt_and_hash(PublicKey::from(s).as_bytes(), &mut msg)?;
         st.mix_key(&dh(s, rs)?);
         st.mix_key_and_hash(psk);
-        st.encrypt_and_hash(&[], &mut msg)?;
+        st.encrypt_and_hash(payload, &mut msg)?;
 
         Ok((Initiator { state: st, e, s: s.clone() }, msg))
     }
 
-    /// Processes the responder's reply. On failure the state is left untouched,
-    /// so a stray or forged reply does not spoil a handshake in progress.
-    pub fn finish(&self, msg: &[u8]) -> Result<Transport, Error> {
+    /// Processes the responder's reply, returning the session and the
+    /// reply's payload. On failure the state is left untouched, so a stray
+    /// or forged reply does not spoil a handshake in progress.
+    pub fn finish(&self, msg: &[u8]) -> Result<(Transport, Vec<u8>), Error> {
         if msg.len() < REPLY_LEN {
             return Err(Error);
         }
@@ -76,9 +85,9 @@ impl Initiator {
         st.mix_key(re.as_bytes());
         st.mix_key(&dh(&self.e, &re)?);
         st.mix_key(&dh(&self.s, &re)?);
-        st.decrypt_and_hash(&msg[KEY_LEN..])?;
+        let payload = st.decrypt_and_hash(&msg[KEY_LEN..])?;
         let (send, recv) = st.split();
-        Ok(Transport { send, recv })
+        Ok((Transport { send, recv }, payload))
     }
 }
 
@@ -86,13 +95,22 @@ impl Initiator {
 pub struct Response {
     /// The initiator's static public key, authenticated by the handshake.
     pub peer: PublicKey,
+    /// The payload of the initiator's first message.
+    pub payload: Vec<u8>,
     /// The reply to send back.
     pub reply: Vec<u8>,
     pub transport: Transport,
 }
 
-/// Responder side: reads the first message and immediately produces the reply.
-pub fn respond(s: &StaticSecret, psk: &[u8; 32], msg: &[u8], e: StaticSecret) -> Result<Response, Error> {
+/// Responder side: reads the first message and immediately produces the
+/// reply, which carries `payload`.
+pub fn respond(
+    s: &StaticSecret,
+    psk: &[u8; 32],
+    msg: &[u8],
+    e: StaticSecret,
+    payload: &[u8],
+) -> Result<Response, Error> {
     if msg.len() < INIT_LEN {
         return Err(Error);
     }
@@ -107,7 +125,7 @@ pub fn respond(s: &StaticSecret, psk: &[u8; 32], msg: &[u8], e: StaticSecret) ->
     let rs = PublicKey::from(<[u8; 32]>::try_from(rs.as_slice()).unwrap());
     st.mix_key(&dh(s, &rs)?);
     st.mix_key_and_hash(psk);
-    st.decrypt_and_hash(&msg[KEY_LEN * 2 + TAG_LEN..])?;
+    let initiator_payload = st.decrypt_and_hash(&msg[KEY_LEN * 2 + TAG_LEN..])?;
 
     let mut reply = Vec::with_capacity(REPLY_LEN);
     let e_pub = PublicKey::from(&e);
@@ -116,10 +134,10 @@ pub fn respond(s: &StaticSecret, psk: &[u8; 32], msg: &[u8], e: StaticSecret) ->
     st.mix_key(e_pub.as_bytes());
     st.mix_key(&dh(&e, &re)?);
     st.mix_key(&dh(&e, &rs)?);
-    st.encrypt_and_hash(&[], &mut reply)?;
+    st.encrypt_and_hash(payload, &mut reply)?;
 
     let (recv, send) = st.split();
-    Ok(Response { peer: rs, reply, transport: Transport { send, recv } })
+    Ok(Response { peer: rs, payload: initiator_payload, reply, transport: Transport { send, recv } })
 }
 
 /// The pair of cipher states produced by a completed handshake.
@@ -312,18 +330,20 @@ mod tests {
             .build_responder()
             .unwrap();
 
-        let (ours_i, msg1) = Initiator::start(&si, &sr_pub, &psk, ei).unwrap();
+        let (ours_i, msg1) = Initiator::start(&si, &sr_pub, &psk, ei, b"first payload").unwrap();
         let mut buf = [0u8; 4096];
-        let n = snow_i.write_message(&[], &mut buf).unwrap();
+        let n = snow_i.write_message(b"first payload", &mut buf).unwrap();
         assert_eq!(msg1, &buf[..n]);
 
-        let resp = respond(&sr, &psk, &msg1, er).unwrap();
+        let resp = respond(&sr, &psk, &msg1, er, b"second").unwrap();
         snow_r.read_message(&msg1, &mut buf).unwrap();
-        let n = snow_r.write_message(&[], &mut buf).unwrap();
+        let n = snow_r.write_message(b"second", &mut buf).unwrap();
         assert_eq!(resp.reply, &buf[..n]);
         assert_eq!(resp.peer.as_bytes(), PublicKey::from(&si).as_bytes());
+        assert_eq!(resp.payload, b"first payload");
 
-        let mut ours_i = ours_i.finish(&resp.reply).unwrap();
+        let (mut ours_i, payload) = ours_i.finish(&resp.reply).unwrap();
+        assert_eq!(payload, b"second");
         snow_i.read_message(&resp.reply, &mut buf).unwrap();
         let mut ours_r = resp.transport;
         let mut snow_i = snow_i.into_transport_mode().unwrap();
@@ -348,19 +368,19 @@ mod tests {
     fn rejects_wrong_psk_wrong_key_and_tampering() {
         let (si, sr, psk) = (key(1), key(2), [5u8; 32]);
         let sr_pub = PublicKey::from(&sr);
-        let (_, msg1) = Initiator::start(&si, &sr_pub, &psk, key(3)).unwrap();
+        let (_, msg1) = Initiator::start(&si, &sr_pub, &psk, key(3), &[]).unwrap();
 
-        assert!(respond(&sr, &[6u8; 32], &msg1, key(4)).is_err(), "wrong psk");
-        assert!(respond(&key(9), &psk, &msg1, key(4)).is_err(), "wrong responder");
+        assert!(respond(&sr, &[6u8; 32], &msg1, key(4), &[]).is_err(), "wrong psk");
+        assert!(respond(&key(9), &psk, &msg1, key(4), &[]).is_err(), "wrong responder");
         for i in 0..msg1.len() {
             let mut bad = msg1.clone();
             bad[i] ^= 1;
-            assert!(respond(&sr, &psk, &bad, key(4)).is_err(), "flipped byte {i}");
+            assert!(respond(&sr, &psk, &bad, key(4), &[]).is_err(), "flipped byte {i}");
         }
-        assert!(respond(&sr, &psk, &msg1[..msg1.len() - 1], key(4)).is_err());
+        assert!(respond(&sr, &psk, &msg1[..msg1.len() - 1], key(4), &[]).is_err());
 
-        let (init, msg1) = Initiator::start(&si, &sr_pub, &psk, key(3)).unwrap();
-        let resp = respond(&sr, &psk, &msg1, key(4)).unwrap();
+        let (init, msg1) = Initiator::start(&si, &sr_pub, &psk, key(3), &[]).unwrap();
+        let resp = respond(&sr, &psk, &msg1, key(4), &[]).unwrap();
         let mut bad = resp.reply.clone();
         bad[40] ^= 1;
         assert!(init.finish(&bad).is_err());
@@ -371,9 +391,9 @@ mod tests {
     #[test]
     fn transport_rejects_replay_and_reorder() {
         let (si, sr, psk) = (key(1), key(2), [5u8; 32]);
-        let (init, msg1) = Initiator::start(&si, &PublicKey::from(&sr), &psk, key(3)).unwrap();
-        let resp = respond(&sr, &psk, &msg1, key(4)).unwrap();
-        let mut a = init.finish(&resp.reply).unwrap();
+        let (init, msg1) = Initiator::start(&si, &PublicKey::from(&sr), &psk, key(3), &[]).unwrap();
+        let resp = respond(&sr, &psk, &msg1, key(4), &[]).unwrap();
+        let (mut a, _) = init.finish(&resp.reply).unwrap();
         let mut b = resp.transport;
 
         let (mut m1, mut m2) = (Vec::new(), Vec::new());
@@ -389,6 +409,6 @@ mod tests {
         let (sr, psk) = (key(2), [5u8; 32]);
         let mut msg1 = vec![0u8; INIT_LEN];
         msg1[0] = 1; // the point u=1 has order 4
-        assert_eq!(respond(&sr, &psk, &msg1, key(4)).err(), Some(Error));
+        assert_eq!(respond(&sr, &psk, &msg1, key(4), &[]).err(), Some(Error));
     }
 }

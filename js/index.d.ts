@@ -14,8 +14,10 @@ export class Room {
   readonly id: string;
   readonly role: "inviter" | "joiner";
   readonly relay: string;
-  /** Whether the other peer's identity is known (always, for a joiner). */
+  /** Whether pairing is complete: the room has moved to its pair ID, out of the invite's reach. */
   readonly paired: boolean;
+  /** Whether the room is being ended. */
+  readonly closing: boolean;
   readonly publicKey: Uint8Array;
   readonly peerKey: Uint8Array | undefined;
   /** Releases the WebAssembly memory now rather than at garbage collection. */
@@ -28,9 +30,11 @@ export type CloseReason = "left" | "closed" | "closed-by-peer";
 export interface ConnectionEventMap {
   /** `state` (and `reason`) changed. */
   state: Event;
-  /** A message from the peer, authenticated and decrypted; `data` is a Uint8Array. */
+  /** A message from the peer, authenticated, decrypted and in order; `data` is a Uint8Array. */
   message: MessageEvent<Uint8Array>;
-  /** The inviter learned the joiner's identity: save `room.toString()` again. */
+  /** The peer has received every message whose id is below `detail`. */
+  delivered: CustomEvent<number>;
+  /** Pairing is complete and the room has moved to its pair ID: save `room.toString()` again. */
   paired: Event;
   /**
    * Another connection took this peer's seat, most likely the same room opened
@@ -52,13 +56,21 @@ export class Connection extends EventTarget {
   readonly reason: CloseReason | undefined;
   /** The room as it stands now. */
   readonly room: Room;
-  /** Bytes handed to the WebSocket but not yet sent; pace large transfers by it. */
-  readonly bufferedAmount: number;
-  /** Sends a message (strings as UTF-8), up to 16 MiB. Throws unless connected. */
-  send(data: Uint8Array | ArrayBuffer | string): void;
-  /** Disconnects, keeping the room for later. */
+  /** Bytes of messages waiting to be acknowledged by the peer. */
+  readonly queued: number;
+  /**
+   * Queues a message (strings as UTF-8), up to 16 MiB, and returns its id. It
+   * is delivered as soon as the peer is reachable. Throws when 64 MiB already
+   * await acknowledgement, or once the room is closed or closing.
+   */
+  send(data: Uint8Array | ArrayBuffer | string): number;
+  /** Disconnects, keeping the room for later. Unacknowledged messages are dropped. */
   leave(): void;
-  /** Ends the room for both peers. Delete the saved room afterwards. */
+  /**
+   * Ends the room for both peers: the connection carries on until the peer has
+   * been told, then closes with reason "closed". Save `room` (it is now closing)
+   * so that connecting with it later finishes the job; delete it once closed.
+   */
   close(): void;
 
   addEventListener<K extends keyof ConnectionEventMap>(

@@ -25,7 +25,7 @@ mod vectors;
 #[cfg(feature = "client")]
 pub mod client;
 
-pub use peer::{CloseReason, Event, Output, Peer, SendError, State};
+pub use peer::{CloseReason, Event, OUTBOX_LIMIT, Output, Peer, SendError, State};
 pub use room::{Invite, Room, RoomId};
 pub use wire::Role;
 

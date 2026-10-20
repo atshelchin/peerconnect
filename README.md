@@ -1,8 +1,8 @@
 # PeerConnect
 
-**Two peers, one room, end-to-end encryption over an untrusted, stateless WebSocket relay.**
+**Two peers, one room, end-to-end encryption and reliable delivery over an untrusted, stateless WebSocket relay.**
 
-PeerConnect connects two applications — a phone and a laptop, a web app and a wallet, two services in different networks — through a relay that cannot read, forge or replay what they say, and that needs no database. One side creates a room and hands the other an invite (a QR code, a link); from then on the two can reconnect whenever they like, from wherever they are.
+PeerConnect connects two applications — a phone and a laptop, a web app and a wallet, two services in different networks — through a relay that cannot read, forge or replay what they say, and that needs no database. One side creates a room and hands the other an invite (a QR code, a link); from then on the two can reconnect whenever they like, from wherever they are, and messages sent while one of them is away arrive when it comes back.
 
 ```
   App A ── PeerConnect ─┐                      ┌─ PeerConnect ── App B
@@ -15,6 +15,8 @@ PeerConnect connects two applications — a phone and a laptop, a web app and a 
 - **Small protocol.** Six frame types, one handshake, seven close codes. The [specification](SPEC.md) fits on a few pages.
 - **Untrusted relay.** Messages are encrypted and authenticated end to end with the Noise handshake `IKpsk1`. The relay sees sizes and timing, never contents or identities.
 - **Stateless relay.** A room exists on a relay only while someone is connected. A relay can restart, or be replaced by another one, and peers simply reconnect: the room is defined by keys the peers hold, not by anything stored on the server.
+- **Reliable, in order, exactly once.** Messages are numbered and kept by their sender until acknowledged, then resent after any disconnection, so nothing is lost or duplicated while both peers keep running. The sender is the offline queue; the relay stores nothing.
+- **Invites expire by design.** Once paired, the peers move to a room ID derived from their two identities. A leaked invite reaches nobody.
 - **One codebase.** A Rust core with no I/O runs the Linux relay, the Cloudflare relay, the Rust client and, compiled to WebAssembly, the JavaScript client.
 
 ## Quick start
@@ -37,7 +39,7 @@ cargo install worker-build
 cd crates/peerconnect-worker && npx wrangler deploy
 ```
 
-**Binary**: `cargo run --release -p peerconnect-relay` (configured with `PEERCONNECT_LISTEN` and `PEERCONNECT_MAX_CONNECTIONS`).
+**Binary**: `cargo run --release -p peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 64, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`.
 
 ### JavaScript (browsers, Node.js 22+, Deno, Bun)
 
@@ -57,12 +59,15 @@ conn.addEventListener("message", (e) => console.log(new TextDecoder().decode(e.d
 const joined = Room.join(scannedInvite);
 save(joined.toString());
 const connB = connect(joined);
-connB.addEventListener("state", () => connB.state === "connected" && connB.send("hello"));
+connB.addEventListener("paired", () => save(connB.room.toString()));
+connB.send("hello");                  // queued; delivered as soon as A is reachable
+connB.addEventListener("delivered", (e) => console.log("A has everything below", e.detail));
 
 // Later, after a restart: connect(savedString) and carry on. Both sides reconnect on their own.
+// To end the room: conn.close(), save conn.room (it is now "closing"), delete it once closed.
 ```
 
-Build the package with `sh js/scripts/build.sh` (needs `wasm-bindgen-cli`); the WebAssembly is inlined, so it loads without bundler configuration. 43 KB gzipped.
+Build the package with `sh js/scripts/build.sh` (needs `wasm-bindgen-cli`); the WebAssembly is inlined, so it loads without bundler configuration. 46 KB gzipped.
 
 ### Rust
 
@@ -74,11 +79,14 @@ peerconnect = { version = "1", features = ["client"] }
 use peerconnect::{client, Event, Room, State};
 
 let room = Room::join(&invite.parse()?);
+save(&room.to_string());               // before connecting: it holds the identity the inviter pins
 let mut conn = client::connect(room);
+conn.send(b"hello").await?;            // queued until the inviter is reachable
 while let Some(event) = conn.next().await {
     match event {
-        Event::State(State::Connected) => conn.send(b"hello").await?,
         Event::Message(data) => println!("{}", String::from_utf8_lossy(&data)),
+        Event::Paired => save(&conn.room().to_string()),
+        Event::State(State::Closed(_)) => break,
         _ => {}
     }
 }
@@ -93,11 +101,12 @@ cargo run -p peerconnect --features client --example chat -- join '<invite>' roo
 
 ## How it works
 
-1. **Room.** The inviter draws a random 32-byte room secret. From it derive the *room key* (Ed25519), whose public half is the room ID, and a pre-shared key for the handshake. The invite is `relay URL # base64url(secret ‖ inviter's public key)`.
-2. **Joining the relay.** A peer connects to `<relay>/v1/<room id>`, receives a random challenge and answers with a signature by the room key. The relay checks the signature against the room ID itself; it stores nothing and never sees the secret. Each room has two seats, inviter and joiner; a newer connection to a seat replaces the older one, and the relay tells each side whether the other is present.
-3. **Handshake.** Whenever both seats are filled, the joiner starts a Noise `IKpsk1` handshake. It authenticates both identities, requires the room secret, and gives forward secrecy. The first time, the inviter learns and **pins** the joiner's identity; from then on nobody else can connect as the joiner, even with the invite.
-4. **Messages.** ChaCha20-Poly1305 with counter nonces, so the relay cannot reorder, replay or drop messages unnoticed. Messages of up to 16 MiB are split into 64 KiB frames.
-5. **Reconnection.** Any failure (network, relay restart, timeout, tampering) leads to reconnecting with backoff and a fresh handshake. Peers keep pinging the relay every 25 s so dead connections are noticed on both sides.
+1. **Room.** The inviter draws a random 32-byte room secret. From it derive an Ed25519 key whose public half is the **invite ID**, and a pre-shared key for the handshake. The invite is `relay URL # base64url(secret ‖ inviter's public key)`.
+2. **Joining the relay.** A peer connects to `<relay>/v1/<room id>`, receives a random challenge and answers with a signature by that ID's key. The relay checks the signature against the ID itself; it stores nothing and never sees the secret. Each room ID has two seats, inviter and joiner; a newer connection to a seat replaces the older one, and the relay tells each side whether the other is present.
+3. **Handshake.** Whenever both seats are filled, the joiner starts a Noise `IKpsk1` handshake. It authenticates both identities, requires the room secret, and gives forward secrecy. The first time, the inviter **pins** the joiner's identity.
+4. **Pairing.** As soon as the joiner's first message arrives, both peers move to the **pair ID**, whose key comes from the room secret and the Diffie-Hellman of their identities. Nobody else can compute it, so the invite now leads nowhere. The move tolerates any lost message: an unpaired joiner simply looks at both IDs in turn.
+5. **Messages.** A reliable stream. Messages are numbered, encrypted with ChaCha20-Poly1305, acknowledged, and resent after reconnection from where the other side says it got to, with resume state carried inside the handshake. At most 4 MiB is unacknowledged in flight. Messages of up to 16 MiB are split into 64 KiB frames.
+6. **Reconnection.** Any failure (network, relay restart, timeout, tampering) leads to reconnecting with backoff, a fresh handshake, and resuming the stream. Peers ping the relay every 25 s so dead connections are noticed on both sides.
 
 The design decisions, and how they differ from the original draft, are explained in [docs/design.md](docs/design.md).
 
@@ -126,7 +135,12 @@ What is covered:
 
 - **Noise.** The handshake and transport are byte-identical to the [`snow`](https://github.com/mcginty/snow) library.
 - **Test vectors.** Every value and wire byte is reproduced by an independent implementation built only from `SPEC.md` (`test-vectors/verify.mjs`).
-- **Simulation.** A deterministic simulation drives two peers and a relay through pairing, relay restarts, replacement, keepalive loss, lost handshakes, tampering and reconnection storms.
+- **Simulation.** A deterministic simulation drives two peers and a relay through:
+  - pairing and the move to the pair ID, including a lost confirmation and an inviter restarted mid-pairing;
+  - messages queued while apart, and no loss or duplication when connections are cut every few frames;
+  - the window and the outbox limit;
+  - closing a room while the other peer is away;
+  - relay restarts, replacement, keepalive loss, lost handshakes, tampering and reconnection storms.
 - **Flow control.** Regression tests send 16 MiB both ways at once, echo from inside the event loop, starve a sender with a peer that stops reading, and (opt-in, 80 s) trickle 16 MiB to a slow reader.
 - **End-to-end suite.** The same tests pass against the Linux relay and against the Cloudflare Worker running in local `workerd`, including a long idle test that confirms Durable Object hibernation and recovery.
 - **JavaScript SDK.** Tested in Node 22, Deno 2.7, Bun 1.4 and headless Chrome 155, against both relays, and talking to the Rust client.
@@ -143,23 +157,24 @@ Linux relay, release build, measured on one Apple M2 Pro (12 cores) with the loa
 | Forwarding, 64 KB frames, 1 room | 3.1 GB/s |
 | New connections (TCP + WebSocket + Ed25519 check) | 16,000 /s, p50 3.7 ms |
 | Memory per idle connection | 8 KB (82 MB for 10,000) |
-| End-to-end encrypted round trip, 1 room | p50 76 µs |
-| Pairing (both connect, join, handshake) | p50 0.7 ms |
-| End-to-end encrypted bulk transfer, 1 room | 640 MB/s |
+| End-to-end encrypted round trip, 1 room | p50 65 µs |
+| End-to-end round trips, 100 rooms concurrently | 76,000 /s, p50 1.3 ms |
+| Pairing (both connect, join, handshake) | p50 0.9 ms |
+| End-to-end reliable bulk transfer, 1 room (1 MiB messages) | 430 MB/s |
 
-These are loopback numbers: they show the relay's own overhead, which is far below any real network's. Reproduce with `cargo run --release -p peerconnect-relay --example bench -- ws://127.0.0.1:8080 <scenario>`.
+These are loopback numbers: they show the protocol's and the relay's own overhead, which is far below any real network's. Over a real network, one room's throughput is at most the 4 MiB window per round trip (40 MB/s at 100 ms). Reproduce with `cargo run --release -p peerconnect-relay --example bench -- ws://127.0.0.1:8080 <scenario>` (raise `PEERCONNECT_MAX_PER_ADDRESS` first: the load comes from one address).
 
 ## Limitations
 
-- **No offline delivery.** Messages flow only while both peers are connected: `send` fails while the other peer is away, and a message in flight when it drops is lost. Acknowledgement and retry belong to the application.
-- **Ending a room is best effort.** If the other peer is offline when you close a room, it is never told, because the relay keeps no state. It simply finds the room empty from then on.
-- **A leaked invite still allows denial of service.** After pairing it cannot read, forge or impersonate anything, but whoever holds it can take either seat on the relay and knock a peer off for as long as they keep at it. Treat invites as secrets and discard them once paired.
-- **Availability depends on the relay.** Rate limiting per client address is left to the deployment (proxy, firewall, Cloudflare).
+- **The queue lives in the sender's memory.** Messages survive disconnections, relay restarts and any number of reconnections, but not the sending process: messages not yet acknowledged when it stops are lost. Applications that need delivery across restarts keep a copy until they see `Delivered`.
+- **Ending a room needs both peers online once more.** `close()` keeps trying (and a closing record resumes after a restart) until the other peer acknowledges. A peer that never comes back while the closer is still trying is never told.
+- **Before pairing, the invite is a bearer credential.** Whoever uses it first pairs; the race is visible, since the rightful joiner never connects, but it is not prevented. Send invites over a private channel. After pairing they are useless.
+- **One relay per room.** If it is down, peers wait. They can move a room to another relay by agreeing on a new URL; there is no automatic failover.
 - **Cloudflare relay.**
   - It enforces the idle timeout lazily (when a room next wakes up), to keep hibernating rooms free.
-  - It cannot apply backpressure: the runtime buffers outgoing messages and does not say how much. A peer that floods a partner who never reads can exhaust its own room's Durable Object, which resets that room only.
-  - Throughput per room is about 40,000 frames/s under local `workerd`, bounded by the single-threaded Durable Object, which is ample for two peers.
+  - It cannot apply backpressure (the runtime does not say how much it buffers). The 4 MiB window bounds honest peers; a dishonest one can at worst exhaust its own room's Durable Object.
   - Unjoined connections are capped per client address (4) and per room (64). Someone who knows a room ID and controls many addresses can still delay the room's peers; add Cloudflare rate-limiting rules if that matters.
+- **Not yet independently audited.** The design has had two rounds of adversarial review, and its vectors are reproduced by a second implementation written from the spec. Neither replaces an external cryptographic audit.
 
 ## License
 

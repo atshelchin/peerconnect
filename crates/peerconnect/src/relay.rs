@@ -80,12 +80,12 @@ mod tests {
         assert_eq!(hello[0], wire::HELLO);
         let Conn::Pending(nonce) = pending else { unreachable!() };
 
-        let join = room.join_frame(&nonce);
+        let join = room.join_frame(crate::room::Rendezvous::Invite, &nonce);
         assert_eq!(pending.receive(&id, Incoming::Binary(&join)), Action::Join(Role::Inviter));
         assert_eq!(pending.receive(&id, Incoming::Text("ping")), Action::Pong);
         assert_eq!(pending.receive(&id, Incoming::Binary(&[wire::MESSAGE, 1])), Action::Close(close::PROTOCOL_ERROR));
         assert_eq!(
-            pending.receive(&id, Incoming::Binary(&room.join_frame(&[0; 32]))),
+            pending.receive(&id, Incoming::Binary(&room.join_frame(crate::room::Rendezvous::Invite, &[0; 32]))),
             Action::Close(close::UNAUTHORIZED)
         );
 

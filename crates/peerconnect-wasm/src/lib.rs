@@ -59,9 +59,16 @@ impl Room {
         self.0.relay().into()
     }
 
+    /// Whether pairing is complete (the room has moved to its pair ID).
     #[wasm_bindgen(getter)]
     pub fn paired(&self) -> bool {
         self.0.is_paired()
+    }
+
+    /// Whether the room is being ended.
+    #[wasm_bindgen(getter)]
+    pub fn closing(&self) -> bool {
+        self.0.is_closing()
     }
 
     #[wasm_bindgen(getter, js_name = publicKey)]
@@ -89,6 +96,12 @@ impl Peer {
 
     pub fn room(&self) -> Room {
         Room(self.0.room().clone())
+    }
+
+    /// Bytes of messages waiting to be acknowledged by the peer.
+    #[wasm_bindgen(getter)]
+    pub fn queued(&self) -> f64 {
+        self.0.queued() as f64
     }
 
     #[wasm_bindgen(js_name = handleOpen)]
@@ -123,7 +136,8 @@ impl Peer {
 
     /// The next output as `{ type, ... }`, or `undefined`:
     /// `connect {url}`, `send {data}`, `ping`, `disconnect`,
-    /// `state {state, reason?}`, `message {data}`, `paired`, `replaced`.
+    /// `state {state, reason?}`, `message {data}`, `delivered {id}`,
+    /// `paired`, `replaced`.
     #[wasm_bindgen(js_name = pollOutput)]
     pub fn poll_output(&mut self) -> JsValue {
         let Some(output) = self.0.poll_output() else { return JsValue::UNDEFINED };
@@ -146,6 +160,10 @@ impl Peer {
                 set("type", "message".into());
                 set("data", Uint8Array::from(data.as_slice()).into());
             }
+            Output::Event(Event::Delivered(id)) => {
+                set("type", "delivered".into());
+                set("id", (id as f64).into());
+            }
             Output::Event(Event::Paired) => set("type", "paired".into()),
             Output::Event(Event::Replaced) => set("type", "replaced".into()),
             Output::Event(Event::State(state)) => {
@@ -165,10 +183,10 @@ impl Peer {
         out.into()
     }
 
-    /// Sends a message; throws if the peer is not connected or the message
-    /// is over 16 MiB.
-    pub fn send(&mut self, data: &[u8]) -> Result<(), JsError> {
-        Ok(self.0.send(data)?)
+    /// Queues a message and returns its id; throws if it is over 16 MiB,
+    /// if too much is unacknowledged, or if the room is closed or closing.
+    pub fn send(&mut self, data: &[u8]) -> Result<f64, JsError> {
+        Ok(self.0.send(data)? as f64)
     }
 
     pub fn leave(&mut self) {

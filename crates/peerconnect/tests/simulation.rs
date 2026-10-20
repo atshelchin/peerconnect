@@ -1,7 +1,8 @@
 //! Deterministic simulation: peers and an in-memory relay exchanging
 //! messages on a virtual clock. Exercises the peer state machine end to end
-//! (pairing, reconnection, replacement, keepalive, tampering) through its
-//! public API only.
+//! (pairing and the move to the pair ID, reliable delivery across
+//! reconnections, flow control, replacement, closing, keepalive, tampering)
+//! through its public API only.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -51,6 +52,14 @@ struct Relay {
     drop_init: bool,
     /// Close every connection right after it joins.
     kick_after_join: bool,
+    /// Cut the joiner's connection right after delivering a REPLY to it.
+    kick_after_reply: bool,
+    /// Cut the receiving connection after this many forwarded MESSAGE frames.
+    cut_every: Option<u32>,
+    forwarded: u32,
+    /// Hold every frame for this node instead of delivering it.
+    hold_for: Option<usize>,
+    held: Vec<(usize, SocketId, Vec<u8>)>,
     /// Connections accepted so far.
     connects: u32,
 }
@@ -135,8 +144,17 @@ impl Sim {
                 self.nodes[i].peer.handle_open(now);
                 self.queue.push_back(Delivery::ToPeer(i, id, Msg::Binary(hello.to_vec())));
             }
-            Output::Send(frame) => self.queue.push_back(Delivery::ToRelay(socket.unwrap(), Msg::Binary(frame))),
-            Output::Ping => self.queue.push_back(Delivery::ToRelay(socket.unwrap(), Msg::Text("ping".into()))),
+            // Writing to a socket that has already closed goes nowhere.
+            Output::Send(frame) => {
+                if let Some(socket) = socket {
+                    self.queue.push_back(Delivery::ToRelay(socket, Msg::Binary(frame)));
+                }
+            }
+            Output::Ping => {
+                if let Some(socket) = socket {
+                    self.queue.push_back(Delivery::ToRelay(socket, Msg::Text("ping".into())));
+                }
+            }
             Output::Disconnect => {
                 if let Some(id) = self.nodes[i].socket.take() {
                     self.queue.push_back(Delivery::Hangup(id));
@@ -189,7 +207,26 @@ impl Sim {
                         }
                         if let Some(p) = partner {
                             let node = self.relay.sockets[&p].node;
+                            let kind = frame[0];
+                            if self.relay.hold_for == Some(node) {
+                                self.relay.held.push((node, p, frame));
+                                return;
+                            }
                             self.queue.push_back(Delivery::ToPeer(node, p, Msg::Binary(frame)));
+                            if kind == wire::REPLY && self.relay.kick_after_reply {
+                                self.relay.kick_after_reply = false;
+                                self.queue.push_back(Delivery::Hangup(p));
+                                self.queue.push_back(Delivery::Closed(node, p, None));
+                            }
+                            if kind == wire::MESSAGE
+                                && let Some(n) = self.relay.cut_every
+                            {
+                                self.relay.forwarded += 1;
+                                if self.relay.forwarded.is_multiple_of(n) {
+                                    self.queue.push_back(Delivery::Hangup(p));
+                                    self.queue.push_back(Delivery::Closed(node, p, None));
+                                }
+                            }
                         }
                     }
                     Action::Close(code) => self.drop_socket(id, Some(code)),
@@ -244,10 +281,24 @@ impl Sim {
         self.run();
     }
 
-    fn send(&mut self, i: usize, data: &[u8]) -> Result<(), SendError> {
+    fn send(&mut self, i: usize, data: &[u8]) -> Result<u64, SendError> {
         let result = self.nodes[i].peer.send(data);
         self.run();
         result
+    }
+
+    /// Lets the frames held for a node through.
+    fn release(&mut self) {
+        self.relay.hold_for = None;
+        for (node, socket, frame) in std::mem::take(&mut self.relay.held) {
+            self.queue.push_back(Delivery::ToPeer(node, socket, Msg::Binary(frame)));
+        }
+        self.run();
+    }
+
+    /// The room ID a node is connected at, if any.
+    fn at(&self, i: usize) -> Option<RoomId> {
+        self.relay.sockets.get(&self.nodes[i].socket?).map(|s| s.room)
     }
 
     fn state(&self, i: usize) -> State {
@@ -278,34 +329,47 @@ fn role_of(socket: &Socket) -> Role {
     }
 }
 
+/// Pairs two peers. Returns their nodes and their paired room records.
 fn pair(sim: &mut Sim) -> (usize, usize, Room, Room) {
     let inviter = Room::create("wss://relay.test").unwrap();
+    let invite_id = inviter.id();
     let invite: Invite = inviter.invite().unwrap().to_string().parse().unwrap();
     let joiner = Room::join(&invite);
     let a = sim.add(inviter);
     assert_eq!(sim.state(a), State::Waiting);
-    let b = sim.add(joiner.clone());
-    assert_eq!(sim.state(a), State::Connected);
-    assert_eq!(sim.state(b), State::Connected);
-    let paired = sim.nodes[a].peer.room().clone();
-    (a, b, paired, joiner)
+    let b = sim.add(joiner);
+    assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
+    // Pairing moved both to the pair ID, where the invite does not reach.
+    let (ra, rb) = (sim.nodes[a].peer.room().clone(), sim.nodes[b].peer.room().clone());
+    assert!(ra.is_paired() && rb.is_paired());
+    assert_eq!(ra.id(), rb.id());
+    assert_ne!(ra.id(), invite_id);
+    assert_eq!((sim.at(a), sim.at(b)), (Some(ra.id()), Some(ra.id())));
+    (a, b, ra, rb)
+}
+
+fn count(events: &[Event], what: &Event) -> usize {
+    events.iter().filter(|e| *e == what).count()
 }
 
 #[test]
-fn pairs_and_exchanges_messages() {
+fn pairs_moves_to_the_pair_id_and_exchanges_messages() {
     let mut sim = Sim::new();
-    let (a, b, inviter, _) = pair(&mut sim);
+    let (a, b, inviter, joiner) = pair(&mut sim);
+    assert_eq!(count(&sim.events(a), &Event::Paired), 1);
+    assert_eq!(count(&sim.events(b), &Event::Paired), 1);
+    assert_eq!(inviter.peer_key(), Some(joiner.public_key()));
+    assert_eq!(joiner.peer_key(), Some(inviter.public_key()));
 
-    let events = sim.events(a);
-    assert!(events.contains(&Event::Paired));
-    assert_eq!(events.last(), Some(&Event::State(State::Connected)));
-    assert_eq!(inviter.peer_key(), Some(sim.nodes[b].peer.room().public_key()));
-
-    sim.send(a, b"hello").unwrap();
-    sim.send(b, b"").unwrap();
-    sim.send(b, b"world").unwrap();
+    assert_eq!(sim.send(a, b"hello"), Ok(0));
+    assert_eq!(sim.send(b, b""), Ok(0));
+    assert_eq!(sim.send(b, b"world"), Ok(1));
     assert_eq!(sim.messages(b), vec![b"hello".to_vec()]);
     assert_eq!(sim.messages(a), vec![b"".to_vec(), b"world".to_vec()]);
+    sim.advance(100); // acknowledgements are batched briefly
+    assert!(sim.events(a).contains(&Event::Delivered(1)));
+    assert!(sim.events(b).contains(&Event::Delivered(2)));
+    assert_eq!(sim.nodes[a].peer.queued(), 0);
 }
 
 #[test]
@@ -315,8 +379,11 @@ fn either_peer_may_arrive_first() {
     let joiner = Room::join(&inviter.invite().unwrap());
     let b = sim.add(joiner);
     assert_eq!(sim.state(b), State::Waiting);
+    sim.advance(5_000);
     let a = sim.add(inviter);
+    sim.advance(25_000); // the joiner may be looking at the pair ID meanwhile
     assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
+    assert!(sim.nodes[a].peer.room().is_paired() && sim.nodes[b].peer.room().is_paired());
 }
 
 #[test]
@@ -340,7 +407,7 @@ fn splits_and_reassembles_large_messages() {
 }
 
 #[test]
-fn survives_relay_restart_without_repairing() {
+fn messages_sent_while_apart_arrive_after_reconnecting() {
     let mut sim = Sim::new();
     let (a, b, ..) = pair(&mut sim);
     sim.events(a);
@@ -348,16 +415,68 @@ fn survives_relay_restart_without_repairing() {
     sim.relay.down = true;
     sim.restart_relay();
     assert_eq!((sim.state(a), sim.state(b)), (State::Offline, State::Offline));
-    assert_eq!(sim.send(a, b"lost"), Err(SendError::NotConnected));
+    // Sending while apart queues the messages.
+    for i in 0..5u8 {
+        sim.send(a, &[i]).unwrap();
+    }
+    sim.send(b, b"from b").unwrap();
+    assert!(sim.nodes[a].peer.queued() > 0);
 
     sim.advance(5_000); // retries fail while the relay is down, backing off
     sim.relay.down = false;
     sim.advance(10_000);
     assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
+    assert_eq!(sim.messages(b), (0..5u8).map(|i| vec![i]).collect::<Vec<_>>());
+    assert_eq!(sim.messages(a), vec![b"from b".to_vec()]);
     assert!(!sim.events(a).contains(&Event::Paired), "pairing happens once");
+    sim.advance(100);
+    assert_eq!(sim.nodes[a].peer.queued(), 0);
+}
 
-    sim.send(b, b"back").unwrap();
-    assert_eq!(sim.messages(a), vec![b"back".to_vec()]);
+#[test]
+fn nothing_is_lost_or_duplicated_however_often_connections_drop() {
+    let mut sim = Sim::new();
+    let (a, b, ..) = pair(&mut sim);
+    sim.relay.cut_every = Some(7); // cut the receiving connection every 7 frames
+    let mut sent = Vec::new();
+    for round in 0..40u32 {
+        for i in 0..10u32 {
+            let message = (round * 10 + i).to_be_bytes().to_vec();
+            if sim.send(a, &message).is_ok() {
+                sent.push(message);
+            }
+        }
+        sim.send(b, &round.to_be_bytes()).unwrap();
+        sim.advance(2_000);
+    }
+    sim.relay.cut_every = None;
+    sim.advance(60_000);
+    assert_eq!(sim.messages(b), sent);
+    assert_eq!(sim.messages(a), (0..40u32).map(|r| r.to_be_bytes().to_vec()).collect::<Vec<_>>());
+    assert_eq!(sim.nodes[a].peer.queued(), 0);
+}
+
+#[test]
+fn senders_respect_the_window_and_the_outbox_limit() {
+    let mut sim = Sim::new();
+    let (a, b, ..) = pair(&mut sim);
+    sim.relay.hold_for = Some(b); // b receives nothing, so acknowledges nothing
+    let chunk = vec![9u8; 1 << 20];
+    let mut accepted = 0;
+    while sim.send(a, &chunk).is_ok() {
+        accepted += 1;
+    }
+    assert_eq!(accepted, peerconnect::OUTBOX_LIMIT / chunk.len());
+    assert_eq!(sim.send(a, &chunk), Err(SendError::Full));
+    // Only about a window's worth went onto the wire.
+    let held: usize = sim.relay.held.iter().map(|(_, _, f)| f.len()).sum();
+    assert!(held >= wire::WINDOW && held < wire::WINDOW + 2 * chunk.len(), "{held}");
+    // Once b catches up, everything flows and the outbox drains.
+    sim.release();
+    sim.advance(10_000);
+    assert_eq!(sim.messages(b).len(), accepted);
+    assert_eq!(sim.nodes[a].peer.queued(), 0);
+    assert!(sim.send(a, &chunk).is_ok());
 }
 
 #[test]
@@ -403,12 +522,41 @@ fn newer_connection_replaces_older_one() {
 fn closing_ends_the_room_on_both_sides() {
     let mut sim = Sim::new();
     let (a, b, ..) = pair(&mut sim);
+    sim.send(a, b"last words").unwrap();
     sim.nodes[a].peer.close();
+    assert!(sim.nodes[a].peer.room().is_closing());
+    assert_eq!(sim.nodes[a].peer.send(b"too late"), Err(SendError::Closed));
     sim.run();
+    assert_eq!(sim.messages(b), vec![b"last words".to_vec()]);
     assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
     assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
     sim.advance(120_000);
     assert!(sim.nodes.iter().all(|n| n.socket.is_none() && n.peer.poll_timeout().is_none()));
+}
+
+#[test]
+fn closing_reaches_a_peer_that_was_away() {
+    let mut sim = Sim::new();
+    let (a, b, ..) = pair(&mut sim);
+    sim.nodes[b].peer.leave();
+    sim.run();
+    sim.nodes[a].peer.close();
+    sim.run();
+    sim.advance(60_000);
+    assert_ne!(sim.state(a), State::Closed(CloseReason::Closed), "nobody has been told yet");
+
+    // a stops and restarts from its saved record, which says it is closing.
+    let saved: Room = sim.nodes[a].peer.room().to_string().parse().unwrap();
+    assert!(saved.is_closing());
+    sim.nodes[a].peer.leave();
+    sim.run();
+    let a2 = sim.add(saved);
+    // b comes back, and is told.
+    let b_saved = sim.nodes[b].peer.room().clone();
+    let b2 = sim.add(b_saved);
+    sim.advance(1_000);
+    assert_eq!(sim.state(b2), State::Closed(CloseReason::ClosedByPeer));
+    assert_eq!(sim.state(a2), State::Closed(CloseReason::Closed));
 }
 
 #[test]
@@ -424,27 +572,53 @@ fn leaving_keeps_the_room() {
 }
 
 #[test]
-fn leaked_invite_is_useless_after_pairing() {
+fn a_leaked_invite_reaches_nobody_after_pairing() {
     let mut sim = Sim::new();
     let inviter = Room::create("wss://relay.test").unwrap();
     let invite = inviter.invite().unwrap();
     let (a, b) = (sim.add(inviter), sim.add(Room::join(&invite)));
-    assert_eq!(sim.state(a), State::Connected);
-
-    // A stranger with the invite takes the joiner's seat but cannot get in.
-    let stranger = sim.add(Room::join(&invite));
-    assert!(sim.events(b).contains(&Event::Replaced));
-    assert_eq!(sim.state(a), State::Waiting);
-    sim.advance(50_000);
-    assert_ne!(sim.state(stranger), State::Connected);
-    assert_ne!(sim.state(a), State::Connected);
-    assert!(sim.messages(a).is_empty());
-
-    // The real joiner comes back on its own and is the only one let in.
-    sim.nodes[stranger].peer.leave();
-    sim.run();
-    sim.advance(30_000);
     assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
+
+    // A stranger with the invite finds an empty room: the peers have moved.
+    let stranger = sim.add(Room::join(&invite));
+    sim.advance(120_000);
+    assert_ne!(sim.state(stranger), State::Connected);
+    assert!(sim.events(a).iter().chain(sim.events(b).iter()).all(|e| *e != Event::Replaced));
+    assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
+    sim.send(a, b"still private").unwrap();
+    assert_eq!(sim.messages(b), vec![b"still private".to_vec()]);
+    assert!(sim.messages(stranger).is_empty());
+}
+
+#[test]
+fn pairing_completes_even_if_its_confirmation_is_lost() {
+    let mut sim = Sim::new();
+    sim.relay.kick_after_reply = true; // the joiner's confirmation never arrives
+    let inviter = Room::create("wss://relay.test").unwrap();
+    let joiner = Room::join(&inviter.invite().unwrap());
+    let (a, b) = (sim.add(inviter), sim.add(joiner));
+    assert!(!sim.nodes[a].peer.room().is_paired());
+    // The joiner looks at both IDs in turn until it finds the inviter again.
+    sim.advance(90_000);
+    assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
+    assert!(sim.nodes[a].peer.room().is_paired() && sim.nodes[b].peer.room().is_paired());
+    assert_eq!(sim.at(a), Some(sim.nodes[a].peer.room().id()));
+}
+
+#[test]
+fn an_inviter_restarted_before_pairing_completes_still_pairs() {
+    let mut sim = Sim::new();
+    sim.relay.kick_after_reply = true;
+    let inviter = Room::create("wss://relay.test").unwrap();
+    let record = inviter.to_string(); // saved before pairing
+    let joiner = Room::join(&inviter.invite().unwrap());
+    let (a, b) = (sim.add(inviter), sim.add(joiner));
+    sim.nodes[a].peer.leave(); // a forgets its tentative pin
+    sim.run();
+    let a2 = sim.add(record.parse().unwrap());
+    sim.advance(90_000);
+    assert_eq!((sim.state(a2), sim.state(b)), (State::Connected, State::Connected));
+    assert_eq!(sim.nodes[a2].peer.room().peer_key(), Some(sim.nodes[b].peer.room().public_key()));
 }
 
 #[test]
@@ -473,22 +647,23 @@ fn unanswered_handshake_is_retried() {
     sim.advance(wire::HANDSHAKE_TIMEOUT.as_millis() as u64 + 1);
     assert_eq!(sim.state(b), State::Offline);
     sim.relay.drop_init = false;
-    sim.advance(5_000);
+    sim.advance(60_000);
     assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
 }
 
 #[test]
-fn tampering_breaks_the_session_but_not_the_room() {
+fn tampering_breaks_the_session_but_loses_nothing() {
     let mut sim = Sim::new();
     let (a, b, ..) = pair(&mut sim);
     sim.relay.tamper = true;
-    sim.send(a, b"forged?").unwrap();
+    sim.send(a, b"original").unwrap();
     assert!(sim.messages(b).is_empty());
     assert_eq!(sim.state(b), State::Offline);
+    sim.send(a, b"next").unwrap();
     sim.advance(5_000);
     assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected));
-    sim.send(a, b"intact").unwrap();
-    assert_eq!(sim.messages(b), vec![b"intact".to_vec()]);
+    // The tampered copy was rejected, and the real one resent.
+    assert_eq!(sim.messages(b), vec![b"original".to_vec(), b"next".to_vec()]);
 }
 
 #[test]

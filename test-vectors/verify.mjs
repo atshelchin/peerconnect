@@ -1,6 +1,6 @@
 // An independent check of v1.json, written from SPEC.md alone with nothing
-// but node:crypto: room derivation, invite, JOIN signatures, the Noise
-// IKpsk1 handshake and transport messages, byte for byte.
+// but node:crypto: room IDs, invite, JOIN signatures, the Noise IKpsk1
+// handshake with its resume payloads, and transport messages, byte for byte.
 //
 //   node test-vectors/verify.mjs
 
@@ -36,28 +36,46 @@ const dh = (raw, publicRaw) => {
 
 // §3.1 Room secret and derived values.
 const S = hex(v.room_secret);
-const seed = hmac(S, ascii("peerconnect/v1 room"));
-assert.deepEqual(seed, hex(v.room_seed));
-const roomKey = ed25519Private(seed);
-const roomId = rawPublic(roomKey);
-assert.deepEqual(roomId, hex(v.room_id));
-assert.equal(roomId.toString("base64url"), v.room_id_text);
+const inviteSeed = hmac(S, ascii("peerconnect/v1 room"));
+assert.deepEqual(inviteSeed, hex(v.invite_seed));
+const inviteKey = ed25519Private(inviteSeed);
+const inviteId = rawPublic(inviteKey);
+assert.deepEqual(inviteId, hex(v.invite_id));
+assert.equal(inviteId.toString("base64url"), v.invite_id_text);
 const psk = hmac(S, ascii("peerconnect/v1 psk"));
 assert.deepEqual(psk, hex(v.psk));
-assert.equal(v.endpoint, `${v.relay_url}/v1/${v.room_id_text}`);
+assert.equal(v.invite_endpoint, `${v.relay_url}/v1/${v.invite_id_text}`);
 
 // §3.3 Invite.
 const inviterPublic = rawPublic(x25519Private(hex(v.inviter_identity_private)));
 assert.deepEqual(inviterPublic, hex(v.inviter_identity_public));
 assert.equal(v.invite, `${v.relay_url}#${cat(S, inviterPublic).toString("base64url")}`);
 
+// §3.1 The pair ID: from the secret and the identities' Diffie-Hellman.
+const joinerPublic = rawPublic(x25519Private(hex(v.joiner_identity_private)));
+assert.deepEqual(joinerPublic, hex(v.joiner_identity_public));
+const shared = dh(hex(v.inviter_identity_private), joinerPublic);
+assert.deepEqual(dh(hex(v.joiner_identity_private), inviterPublic), shared);
+assert.deepEqual(shared, hex(v.identity_dh));
+const pairSeed = hmac(S, ascii("peerconnect/v1 pair"), shared);
+assert.deepEqual(pairSeed, hex(v.pair_seed));
+const pairKey = ed25519Private(pairSeed);
+assert.deepEqual(rawPublic(pairKey), hex(v.pair_id));
+assert.equal(rawPublic(pairKey).toString("base64url"), v.pair_id_text);
+
 // §4.3 HELLO and JOIN (Ed25519 signatures are deterministic).
 const nonce = hex(v.hello_nonce);
 assert.deepEqual(hex(v.hello_frame), cat([0x80], nonce));
-for (const [role, frame] of [[0, v.join_frame_inviter], [1, v.join_frame_joiner]]) {
+const joins = [
+  [inviteKey, 0, v.join_frame_invite_inviter],
+  [inviteKey, 1, v.join_frame_invite_joiner],
+  [pairKey, 0, v.join_frame_pair_inviter],
+  [pairKey, 1, v.join_frame_pair_joiner],
+];
+for (const [key, role, frame] of joins) {
   const signed = cat(ascii("peerconnect/v1 join"), nonce, [role]);
-  assert.deepEqual(hex(frame), cat([0x81, role], crypto.sign(null, signed, roomKey)));
-  assert.ok(crypto.verify(null, signed, crypto.createPublicKey(roomKey), hex(frame).subarray(2)));
+  assert.deepEqual(hex(frame), cat([0x81, role], crypto.sign(null, signed, key)));
+  assert.ok(crypto.verify(null, signed, crypto.createPublicKey(key), hex(frame).subarray(2)));
 }
 
 // §5.1 Noise_IKpsk1_25519_ChaChaPoly_SHA256, written out token by token.
@@ -130,8 +148,10 @@ const joinerS = hex(v.joiner_identity_private);
 const joinerE = hex(v.joiner_ephemeral_private);
 const inviterS = hex(v.inviter_identity_private);
 const inviterE = hex(v.inviter_ephemeral_private);
-const joinerPublic = rawPublic(x25519Private(joinerS));
-assert.deepEqual(joinerPublic, hex(v.joiner_identity_public));
+// §5.1 The payloads: stream, base, seen stream, seen next (big-endian u64s).
+const initPayload = hex(v.init_payload);
+const replyPayload = hex(v.reply_payload);
+const resume = (p) => [0, 8, 16, 24].map((at) => p.readBigUInt64BE(at));
 
 // Joiner writes message 1:  -> e, es, s, ss, psk
 const i = new SymmetricState();
@@ -143,7 +163,7 @@ i.mixKey(dh(joinerE, inviterPublic));
 const encryptedStatic = i.encryptAndHash(joinerPublic);
 i.mixKey(dh(joinerS, inviterPublic));
 i.mixKeyAndHash(psk);
-const message1 = cat(ie, encryptedStatic, i.encryptAndHash(Buffer.alloc(0)));
+const message1 = cat(ie, encryptedStatic, i.encryptAndHash(initPayload));
 assert.deepEqual(hex(v.init_frame), cat([0x01], message1), "INIT");
 
 // Inviter reads message 1 and writes message 2:  <- e, ee, se
@@ -157,13 +177,13 @@ const rs = r.decryptAndHash(message1.subarray(32, 80));
 assert.deepEqual(rs, joinerPublic, "the inviter learns the joiner's identity");
 r.mixKey(dh(inviterS, rs));
 r.mixKeyAndHash(psk);
-assert.equal(r.decryptAndHash(message1.subarray(80)).length, 0);
+assert.deepEqual(r.decryptAndHash(message1.subarray(80)), initPayload);
 const ee = rawPublic(x25519Private(inviterE));
 r.mixHash(ee);
 r.mixKey(ee);
 r.mixKey(dh(inviterE, re));
 r.mixKey(dh(inviterE, rs));
-const message2 = cat(ee, r.encryptAndHash(Buffer.alloc(0)));
+const message2 = cat(ee, r.encryptAndHash(replyPayload));
 assert.deepEqual(hex(v.reply_frame), cat([0x02], message2), "REPLY");
 
 // Joiner reads message 2.
@@ -171,34 +191,52 @@ i.mixHash(ee);
 i.mixKey(ee);
 i.mixKey(dh(joinerE, ee));
 i.mixKey(dh(joinerS, ee));
-assert.equal(i.decryptAndHash(message2.subarray(32)).length, 0);
+assert.deepEqual(i.decryptAndHash(message2.subarray(32)), replyPayload);
 assert.deepEqual(i.h, r.h, "handshake hashes agree");
 
-// §5.3 Transport: kind byte, chunks of at most 65,518 bytes.
+// §5.3 Where each side resumes: from the other's `seen next` if it knows
+// the stream, else from its own base.
+const [jStream, jBase, jSeenStream, jSeenNext] = resume(initPayload);
+const [iStream, iBase, iSeenStream, iSeenNext] = resume(replyPayload);
+const joinerFrom = iSeenStream === jStream ? (iSeenNext > jBase ? iSeenNext : jBase) : jBase;
+const inviterFrom = jSeenStream === iStream ? (jSeenNext > iBase ? jSeenNext : iBase) : iBase;
+assert.equal(joinerFrom, 5n);
+assert.equal(inviterFrom, 2n);
+
+// §5.3 Transport: a kind byte, then chunks of at most 65,518 bytes, ACKs
+// carrying a big-endian u64, and CLOSE.
 const [joinerToInviter, inviterToJoiner] = i.split();
 const sending = { "joiner->inviter": joinerToInviter, "inviter->joiner": inviterToJoiner };
 const [inviterReceives, joinerReceives] = r.split();
 const receiving = { "joiner->inviter": inviterReceives, "inviter->joiner": joinerReceives };
+const u64 = (n) => {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64BE(BigInt(n));
+  return b;
+};
 
 for (const m of v.messages) {
-  let data;
-  let kinds;
-  if (m.message === "CLOSE") {
-    data = [Buffer.alloc(0)];
-    kinds = [0x02];
+  let plaintexts;
+  const ack = /^ack (\d+)$/.exec(m.plaintext);
+  if (ack) {
+    plaintexts = [cat([0x03], u64(ack[1]))];
+  } else if (m.plaintext.endsWith(": close")) {
+    plaintexts = [Buffer.from([0x02])];
   } else {
-    const whole = m.message.startsWith("utf8:")
-      ? Buffer.from(m.message.slice(5))
-      : Buffer.from(Array.from({ length: 100_000 }, (_, i) => i % 251));
-    data = [];
-    for (let at = 0; at < whole.length || data.length === 0; at += 65518) data.push(whole.subarray(at, at + 65518));
-    kinds = data.map((_, i) => (i === data.length - 1 ? 0x00 : 0x01));
+    const whole = m.plaintext.includes("utf8 ")
+      ? Buffer.from(m.plaintext.split("utf8 ")[1])
+      : m.plaintext.endsWith("empty")
+        ? Buffer.alloc(0)
+        : Buffer.from(Array.from({ length: 100_000 }, (_, k) => k % 251));
+    const chunks = [];
+    for (let at = 0; at < whole.length || chunks.length === 0; at += 65518) chunks.push(whole.subarray(at, at + 65518));
+    plaintexts = chunks.map((chunk, n) => cat([n === chunks.length - 1 ? 0x00 : 0x01], chunk));
   }
-  const frames = data.map((chunk, n) => cat([0x03], sending[m.direction].encrypt(Buffer.alloc(0), cat([kinds[n]], chunk))));
-  if (m.frames) assert.deepEqual(frames.map((f) => f.toString("hex")), m.frames, m.message);
-  else assert.deepEqual(frames.map((f) => sha256(f).toString("hex")), m.frames_sha256, m.message);
+  const frames = plaintexts.map((p) => cat([0x03], sending[m.direction].encrypt(Buffer.alloc(0), p)));
+  if (m.frames) assert.deepEqual(frames.map((f) => f.toString("hex")), m.frames, m.plaintext);
+  else assert.deepEqual(frames.map((f) => sha256(f).toString("hex")), m.frames_sha256, m.plaintext);
   for (const [n, f] of frames.entries()) {
-    assert.deepEqual(receiving[m.direction].decrypt(Buffer.alloc(0), f.subarray(1)), cat([kinds[n]], data[n]));
+    assert.deepEqual(receiving[m.direction].decrypt(Buffer.alloc(0), f.subarray(1)), plaintexts[n]);
   }
 }
 

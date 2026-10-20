@@ -6,30 +6,37 @@
 //! [`Peer::poll_timeout`]. Time is milliseconds on any monotonic clock.
 //!
 //! The machine connects, authenticates to the relay, runs the Noise
-//! handshake whenever a partner connection appears, encrypts and splits
-//! outgoing messages, reassembles incoming ones, keeps the connection alive,
-//! and reconnects with backoff when anything goes wrong.
+//! handshake whenever a partner connection appears, and carries a reliable,
+//! ordered stream of messages across any number of connections: messages
+//! are numbered, acknowledged, kept until acknowledged and resent after a
+//! reconnection, so none is lost or duplicated while both peers keep their
+//! state. It also moves a new room from its invite ID to its pair ID, keeps
+//! the connection alive, and reconnects with backoff when anything fails.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use x25519_dalek::StaticSecret;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::noise::{self, Initiator, Transport};
-use crate::room::Room;
+use crate::room::{Rendezvous, Room};
 use crate::wire::{self, Role, close};
 
-/// Transport plaintext kinds (the first plaintext byte).
+/// Transport plaintext kinds (the first plaintext byte, SPEC §5.3).
 mod kind {
     /// The last (or only) chunk of a message.
     pub const FINAL: u8 = 0x00;
-    /// A chunk with more to follow.
+    /// A chunk of a message, more to follow.
     pub const MORE: u8 = 0x01;
-    /// The sender has ended the room.
+    /// The sender ends the room. Numbered like a message.
     pub const CLOSE: u8 = 0x02;
+    /// `next[8]`: the id of the next message expected from the receiver.
+    pub const ACK: u8 = 0x03;
 }
 
 const CHUNK_LEN: usize = noise::MAX_PLAINTEXT_LEN - 1;
+/// The handshake payload: `stream base seen_stream seen_next`, each a u64.
+const RESUME_LEN: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -37,6 +44,15 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STABLE: Duration = Duration::from_secs(30);
 /// How long to wait before reclaiming a seat another connection took.
 const REPLACED_DELAY: Duration = Duration::from_secs(60);
+/// An unpaired joiner alone at a rendezvous for this long tries the other one.
+const SEEK_INTERVAL: Duration = Duration::from_secs(20);
+/// Bytes of messages a peer holds until they are acknowledged.
+pub const OUTBOX_LIMIT: usize = 64 << 20;
+/// A receiver acknowledges after this many messages, this many bytes, or
+/// this long after an unacknowledged delivery, whichever comes first.
+const ACK_MESSAGES: u32 = 32;
+const ACK_BYTES: usize = 1 << 20;
+const ACK_DELAY: Duration = Duration::from_millis(50);
 
 /// What the machine asks of its driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +61,7 @@ pub enum Output {
     Connect(String),
     /// Send a binary message.
     Send(Vec<u8>),
-    /// Send the text message `ping`.
+    /// Send the text message `ping`, ahead of anything queued if possible.
     Ping,
     /// Close the WebSocket (code 1000) after flushing what was sent, then
     /// forget it: report nothing more about that socket.
@@ -58,10 +74,12 @@ pub enum Output {
 pub enum Event {
     /// The connection state changed.
     State(State),
-    /// A message from the peer, authenticated and decrypted.
+    /// A message from the peer, authenticated, decrypted and in order.
     Message(Vec<u8>),
-    /// The inviter has learned the joiner's identity. Persist the room
-    /// again: the new record is what lets it recognise the joiner later.
+    /// The peer has received every message with an id below this one.
+    Delivered(u64),
+    /// Pairing is complete: the room now meets at its pair ID, which the
+    /// invite does not reach. Persist the room again.
     Paired,
     /// Another connection took this peer's seat on the relay: most likely the
     /// same room opened elsewhere (another device, tab or process). The peer
@@ -86,7 +104,7 @@ pub enum State {
 pub enum CloseReason {
     /// [`Peer::leave`] was called. The room remains valid.
     Left,
-    /// [`Peer::close`] was called. The room is ended; delete it.
+    /// [`Peer::close`] was called and the peer has been told. Delete the room.
     Closed,
     /// The peer ended the room. Delete it.
     ClosedByPeer,
@@ -94,17 +112,21 @@ pub enum CloseReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
-    /// No end-to-end session right now. Nothing was sent.
-    NotConnected,
     /// The message exceeds [`wire::MAX_MESSAGE_LEN`].
     TooLarge,
+    /// [`OUTBOX_LIMIT`] bytes await acknowledgement. Try again after
+    /// [`Event::Delivered`].
+    Full,
+    /// The room is closed or being closed.
+    Closed,
 }
 
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            SendError::NotConnected => "not connected to the peer",
             SendError::TooLarge => "message too large",
+            SendError::Full => "too much unacknowledged data",
+            SendError::Closed => "the room is closed",
         })
     }
 }
@@ -118,6 +140,67 @@ pub struct Peer {
     output: VecDeque<Output>,
     /// Connection attempts since the last stable connection.
     failures: u32,
+    /// Where an unpaired joiner looks next; it alternates.
+    seek: Rendezvous,
+    /// Inviter, until pairing completes: the joiner it is pairing with.
+    tentative: Option<PublicKey>,
+    out: Outbox,
+    inbound: Inbound,
+}
+
+/// Messages we have sent, kept until the peer acknowledges them.
+struct Outbox {
+    /// Our stream's id, fresh for every `Peer`.
+    stream: u64,
+    /// The id of `messages[0]`; every lower id has been acknowledged.
+    base: u64,
+    messages: VecDeque<(u8, Vec<u8>)>,
+    bytes: usize,
+    /// The id of our CLOSE, once queued.
+    close: Option<u64>,
+}
+
+impl Outbox {
+    fn next_id(&self) -> u64 {
+        self.base + self.messages.len() as u64
+    }
+}
+
+/// Where we are in the peer's stream.
+struct Inbound {
+    /// The peer's stream id, 0 if unknown.
+    stream: u64,
+    /// The id of the next message expected.
+    next: u64,
+    /// Delivered since we last acknowledged.
+    unacked: u32,
+    unacked_bytes: usize,
+    ack_at: Option<u64>,
+}
+
+/// The state each side announces in its handshake message.
+#[derive(Clone, Copy)]
+struct Resume {
+    stream: u64,
+    base: u64,
+    seen_stream: u64,
+    seen_next: u64,
+}
+
+impl Resume {
+    fn encode(&self) -> [u8; RESUME_LEN] {
+        let mut out = [0; RESUME_LEN];
+        for (i, v) in [self.stream, self.base, self.seen_stream, self.seen_next].into_iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+
+    /// Reads the first 32 bytes; anything after is for future revisions.
+    fn decode(payload: &[u8]) -> Option<Resume> {
+        let field = |i: usize| Some(u64::from_be_bytes(payload.get(i * 8..i * 8 + 8)?.try_into().unwrap()));
+        Some(Resume { stream: field(0)?, base: field(1)?, seen_stream: field(2)?, seen_next: field(3)? })
+    }
 }
 
 #[allow(clippy::large_enum_variant)] // one per peer: boxing would buy nothing
@@ -128,6 +211,7 @@ enum Link {
     },
     /// Waiting for the socket to open.
     Connecting {
+        at: Rendezvous,
         deadline: u64,
     },
     Open(Open),
@@ -135,6 +219,7 @@ enum Link {
 }
 
 struct Open {
+    at: Rendezvous,
     phase: Phase,
     /// When the relay accepted our `JOIN`.
     joined_at: Option<u64>,
@@ -152,9 +237,12 @@ enum Phase {
     Joined(Session),
 }
 
+#[allow(clippy::large_enum_variant)] // one per peer: boxing would buy nothing
 enum Session {
-    /// No partner connection in the other seat.
-    Absent,
+    /// No partner connection in the other seat, since then.
+    Absent {
+        since: u64,
+    },
     /// Inviter, waiting for the joiner's handshake.
     AwaitingInit,
     /// Joiner, waiting for the inviter's reply.
@@ -162,22 +250,41 @@ enum Session {
         initiator: Initiator,
         deadline: u64,
     },
-    Established {
-        transport: Transport,
-        partial: Vec<u8>,
-    },
+    Established(Established),
+}
+
+struct Established {
+    transport: Transport,
+    /// A message being reassembled.
+    partial: Vec<u8>,
+    /// The id of the next message to transmit in this session.
+    sent: u64,
+    /// Bytes transmitted in this session and not yet acknowledged.
+    in_flight: usize,
 }
 
 impl Peer {
-    /// Starts the machine; the first output asks the driver to connect.
+    /// Starts the machine; the first output asks the driver to connect. A
+    /// room that is closing resumes telling the peer.
     pub fn new(room: Room, now: u64) -> Peer {
+        let mut stream = 0;
+        while stream == 0 {
+            stream = u64::from_le_bytes(crate::random());
+        }
         let mut peer = Peer {
             room,
             link: Link::Idle { retry_at: now },
             state: State::Offline,
             output: VecDeque::new(),
             failures: 0,
+            seek: Rendezvous::Invite,
+            tentative: None,
+            out: Outbox { stream, base: 0, messages: VecDeque::new(), bytes: 0, close: None },
+            inbound: Inbound { stream: 0, next: 0, unacked: 0, unacked_bytes: 0, ack_at: None },
         };
+        if peer.room.is_closing() {
+            peer.queue_close();
+        }
         peer.connect(now);
         peer
     }
@@ -190,6 +297,11 @@ impl Peer {
         self.state
     }
 
+    /// Bytes of messages waiting to be acknowledged by the peer.
+    pub fn queued(&self) -> usize {
+        self.out.bytes
+    }
+
     pub fn poll_output(&mut self) -> Option<Output> {
         self.output.pop_front()
     }
@@ -198,11 +310,13 @@ impl Peer {
     pub fn poll_timeout(&self) -> Option<u64> {
         match &self.link {
             Link::Idle { retry_at } => Some(*retry_at),
-            Link::Connecting { deadline } => Some(*deadline),
+            Link::Connecting { deadline, .. } => Some(*deadline),
             Link::Open(open) => {
                 let phase = match &open.phase {
                     Phase::Joining { deadline, .. } => Some(*deadline),
                     Phase::Joined(Session::AwaitingReply { deadline, .. }) => Some(*deadline),
+                    Phase::Joined(Session::Absent { since }) if self.seeking() => Some(since + ms(SEEK_INTERVAL)),
+                    Phase::Joined(Session::Established(_)) => self.inbound.ack_at,
                     Phase::Joined(_) => None,
                 };
                 [Some(open.receive_deadline), Some(open.next_ping), phase].into_iter().flatten().min()
@@ -212,20 +326,32 @@ impl Peer {
     }
 
     pub fn handle_timeout(&mut self, now: u64) {
+        let seeking = self.seeking();
         match &mut self.link {
             Link::Idle { retry_at } if now >= *retry_at => self.connect(now),
-            Link::Connecting { deadline } if now >= *deadline => self.reconnect(now),
+            Link::Connecting { deadline, .. } if now >= *deadline => self.reconnect(now),
             Link::Open(open) => {
                 let expired = match &open.phase {
                     Phase::Joining { deadline, .. } => now >= *deadline,
                     Phase::Joined(Session::AwaitingReply { deadline, .. }) => now >= *deadline,
                     Phase::Joined(_) => false,
                 };
+                let seek = seeking
+                    && matches!(open.phase, Phase::Joined(Session::Absent { since }) if now >= since + ms(SEEK_INTERVAL));
                 if expired || now >= open.receive_deadline {
                     self.reconnect(now);
-                } else if now >= open.next_ping {
-                    open.next_ping = now + ms(wire::PING_INTERVAL);
-                    self.output.push_back(Output::Ping);
+                } else if seek {
+                    // Nobody here: try the other rendezvous straight away.
+                    self.drop_socket(now, true);
+                    self.connect(now);
+                } else {
+                    if now >= open.next_ping {
+                        open.next_ping = now + ms(wire::PING_INTERVAL);
+                        self.output.push_back(Output::Ping);
+                    }
+                    if self.inbound.ack_at.is_some_and(|at| now >= at) {
+                        self.send_ack();
+                    }
                 }
             }
             _ => {}
@@ -234,8 +360,9 @@ impl Peer {
 
     /// The socket requested by [`Output::Connect`] is open.
     pub fn handle_open(&mut self, now: u64) {
-        if let Link::Connecting { .. } = self.link {
+        if let Link::Connecting { at, .. } = self.link {
             self.link = Link::Open(Open {
+                at,
                 phase: Phase::Joining { deadline: now + ms(wire::JOIN_TIMEOUT), joined: false },
                 joined_at: None,
                 receive_deadline: now + ms(wire::RECEIVE_TIMEOUT),
@@ -275,12 +402,12 @@ impl Peer {
         match &mut open.phase {
             Phase::Joining { joined: false, .. } if kind == wire::HELLO => {
                 let Ok(nonce) = body.try_into() else { return self.reconnect(now) };
-                let join = self.room.join_frame(nonce);
+                let join = self.room.join_frame(open.at, nonce);
                 self.output.push_back(Output::Send(join.to_vec()));
                 open.phase = Phase::Joining { deadline: now + ms(wire::JOIN_TIMEOUT), joined: true };
             }
             Phase::Joining { joined: true, .. } if kind == wire::PRESENCE => {
-                open.phase = Phase::Joined(Session::Absent);
+                open.phase = Phase::Joined(Session::Absent { since: now });
                 open.joined_at = Some(now);
                 self.set_state(State::Waiting);
                 self.presence(now, body == [1]);
@@ -297,45 +424,74 @@ impl Peer {
         }
     }
 
-    /// Sends a message to the peer, split into as many frames as needed.
-    pub fn send(&mut self, data: &[u8]) -> Result<(), SendError> {
+    /// Queues a message for the peer and returns its id. It is sent as soon
+    /// as there is a session, kept until the peer acknowledges it, and resent
+    /// after a reconnection if need be; [`Event::Delivered`] reports progress.
+    pub fn send(&mut self, data: &[u8]) -> Result<u64, SendError> {
+        if self.room.is_closing() || matches!(self.state, State::Closed(_)) {
+            return Err(SendError::Closed);
+        }
         if data.len() > wire::MAX_MESSAGE_LEN {
             return Err(SendError::TooLarge);
         }
-        let Some(transport) = self.transport() else { return Err(SendError::NotConnected) };
-        let mut chunks = data.chunks(CHUNK_LEN).peekable();
-        let mut frames = Vec::new();
-        loop {
-            let chunk = chunks.next().unwrap_or_default();
-            let more = chunks.peek().is_some();
-            frames.push(seal(transport, if more { kind::MORE } else { kind::FINAL }, chunk));
-            if !more {
-                break;
-            }
+        if self.out.bytes + data.len() > OUTBOX_LIMIT {
+            return Err(SendError::Full);
         }
-        self.output.extend(frames.into_iter().map(Output::Send));
-        Ok(())
+        let id = self.push(kind::FINAL, data.to_vec());
+        self.pump();
+        Ok(id)
     }
 
-    /// Disconnects and stops, keeping the room valid for later.
+    /// Disconnects and stops, keeping the room valid for later. Messages not
+    /// yet acknowledged are dropped.
     pub fn leave(&mut self) {
         self.finish(CloseReason::Left);
     }
 
-    /// Ends the room: tells the peer if it is connected, then stops. Both
-    /// sides should delete the room afterwards. A peer that is offline at
-    /// this moment is not told (the relay keeps no state to tell it later).
+    /// Ends the room: queued messages go first, then the peer is told, and
+    /// once it has acknowledged that the state becomes
+    /// [`CloseReason::Closed`]. The machine keeps reconnecting until then;
+    /// the room record now says it is closing (persist it), so that a peer
+    /// restarted from it carries on telling.
     pub fn close(&mut self) {
-        if let Some(transport) = self.transport() {
-            let frame = seal(transport, kind::CLOSE, &[]);
-            self.output.push_back(Output::Send(frame));
+        if !self.room.is_closing() && !matches!(self.state, State::Closed(_)) {
+            self.room.set_closing();
+            self.queue_close();
         }
-        self.finish(CloseReason::Closed);
+    }
+
+    fn queue_close(&mut self) {
+        self.out.close = Some(self.push(kind::CLOSE, Vec::new()));
+        self.pump();
+    }
+
+    fn push(&mut self, kind: u8, data: Vec<u8>) -> u64 {
+        let id = self.out.next_id();
+        self.out.bytes += data.len();
+        self.out.messages.push_back((kind, data));
+        id
+    }
+
+    /// Whether this is a joiner that has not found the pair ID yet.
+    fn seeking(&self) -> bool {
+        self.room.role() == Role::Joiner && !self.room.is_paired()
     }
 
     fn connect(&mut self, now: u64) {
-        self.link = Link::Connecting { deadline: now + ms(CONNECT_TIMEOUT) };
-        self.output.push_back(Output::Connect(self.room.endpoint()));
+        let at = if self.room.is_paired() {
+            Rendezvous::Pair
+        } else if self.room.role() == Role::Inviter {
+            Rendezvous::Invite
+        } else {
+            let at = self.seek;
+            self.seek = match at {
+                Rendezvous::Invite => Rendezvous::Pair,
+                Rendezvous::Pair => Rendezvous::Invite,
+            };
+            at
+        };
+        self.link = Link::Connecting { at, deadline: now + ms(CONNECT_TIMEOUT) };
+        self.output.push_back(Output::Connect(self.room.endpoint_at(at)));
     }
 
     /// Abandons the current socket and schedules another attempt.
@@ -358,6 +514,7 @@ impl Peer {
         if close && matches!(link, Link::Connecting { .. } | Link::Open(_)) {
             self.output.push_back(Output::Disconnect);
         }
+        self.inbound.ack_at = None;
     }
 
     /// The delay before the next attempt: exponential with jitter, between
@@ -398,10 +555,12 @@ impl Peer {
         }
     }
 
-    fn transport(&mut self) -> Option<&mut Transport> {
-        match self.session()? {
-            Session::Established { transport, .. } => Some(transport),
-            _ => None,
+    fn resume(&self) -> Resume {
+        Resume {
+            stream: self.out.stream,
+            base: self.out.base,
+            seen_stream: self.inbound.stream,
+            seen_next: self.inbound.next,
         }
     }
 
@@ -409,12 +568,21 @@ impl Peer {
     /// session with the previous one is over; a new arrival gets a fresh
     /// handshake, which the joiner starts.
     fn presence(&mut self, now: u64, present: bool) {
+        let was_established = matches!(self.session(), Some(Session::Established(_)));
+        if !present && was_established && self.seeking() {
+            // An inviter that leaves a working session before pairing is
+            // complete has most likely just completed it and moved to the
+            // pair ID: follow it there.
+            self.drop_socket(now, true);
+            return self.connect(now);
+        }
         let next = match (present, self.room.role()) {
-            (false, _) => Session::Absent,
+            (false, _) => Session::Absent { since: now },
             (true, Role::Inviter) => Session::AwaitingInit,
             (true, Role::Joiner) => {
-                let peer = self.room.peer().expect("a joiner always knows the inviter");
-                let started = Initiator::start(self.room.identity(), peer, self.room.psk(), ephemeral());
+                let inviter = self.room.peer().expect("a joiner always knows the inviter");
+                let payload = self.resume().encode();
+                let started = Initiator::start(self.room.identity(), inviter, self.room.psk(), ephemeral(), &payload);
                 let Ok((initiator, init)) = started else { return self.reconnect(now) };
                 self.output.push_back(Output::Send(frame(wire::INIT, &init)));
                 Session::AwaitingReply { initiator, deadline: now + ms(wire::HANDSHAKE_TIMEOUT) }
@@ -423,71 +591,218 @@ impl Peer {
         if let Some(session) = self.session() {
             *session = next;
         }
+        self.inbound.ack_at = None;
         self.set_state(State::Waiting);
     }
 
     fn handle_init(&mut self, body: &[u8]) {
         let accepting = self.room.role() == Role::Inviter
-            && matches!(self.session(), Some(Session::AwaitingInit | Session::Established { .. }));
+            && matches!(self.session(), Some(Session::AwaitingInit | Session::Established(_)));
         if !accepting {
             return;
         }
-        let Ok(response) = noise::respond(self.room.identity(), self.room.psk(), body, ephemeral()) else {
+        let payload = self.resume().encode();
+        let Ok(response) = noise::respond(self.room.identity(), self.room.psk(), body, ephemeral(), &payload) else {
             return;
         };
-        match self.room.peer() {
-            // Only the joiner this inviter paired with may connect.
-            Some(pinned) if pinned != &response.peer => return,
+        let Some(theirs) = Resume::decode(&response.payload) else { return };
+        // Only the joiner this inviter is pairing, or has paired, with may connect.
+        let known = if self.room.is_paired() { self.room.peer() } else { self.tentative.as_ref() };
+        match known {
+            Some(joiner) if joiner != &response.peer => return,
             Some(_) => {}
-            None => {
-                self.room.pin(response.peer);
-                self.output.push_back(Output::Event(Event::Paired));
-            }
+            None => self.tentative = Some(response.peer),
         }
         self.output.push_back(Output::Send(frame(wire::REPLY, &response.reply)));
-        self.establish(response.transport);
+        self.establish(response.transport, theirs);
     }
 
     fn handle_reply(&mut self, body: &[u8]) {
         let Some(Session::AwaitingReply { initiator, .. }) = self.session() else { return };
         // A reply that does not verify is stale or forged; keep waiting.
-        if let Ok(transport) = initiator.finish(body) {
-            self.establish(transport);
+        let Ok((transport, payload)) = initiator.finish(body) else { return };
+        let Some(theirs) = Resume::decode(&payload) else { return };
+        self.establish(transport, theirs);
+    }
+
+    /// Starts a session and picks the stream up where the peer left it.
+    fn establish(&mut self, transport: Transport, theirs: Resume) {
+        let Link::Open(Open { at, .. }) = self.link else { return };
+        // Outgoing: resend from the first message the peer has not seen;
+        // everything before it is acknowledged.
+        let from = if theirs.seen_stream == self.out.stream {
+            theirs.seen_next.clamp(self.out.base, self.out.next_id())
+        } else {
+            self.out.base
+        };
+        // Incoming: the peer resends by the same rule.
+        if theirs.stream == self.inbound.stream {
+            self.inbound.next = self.inbound.next.max(theirs.base);
+        } else {
+            self.inbound.stream = theirs.stream;
+            self.inbound.next = theirs.base;
+        }
+        self.inbound.unacked = 0;
+        self.inbound.unacked_bytes = 0;
+        self.inbound.ack_at = None;
+
+        self.acknowledged(from);
+        if matches!(self.link, Link::Done) {
+            return; // that acknowledged our CLOSE: the room is over
+        }
+        if let Some(session) = self.session() {
+            *session = Session::Established(Established { transport, partial: Vec::new(), sent: from, in_flight: 0 });
+        }
+        self.set_state(State::Connected);
+        if self.room.role() == Role::Joiner {
+            if at == Rendezvous::Pair && !self.room.is_paired() {
+                let inviter = *self.room.peer().expect("a joiner always knows the inviter");
+                self.room.set_paired(inviter);
+                self.output.push_back(Output::Event(Event::Paired));
+            }
+            // Tells the inviter at once that the session works, and so that
+            // this joiner holds the identity it is pinning.
+            self.send_ack();
+        }
+        self.pump();
+    }
+
+    /// The peer has everything below `next`.
+    fn acknowledged(&mut self, next: u64) {
+        let next = next.min(self.out.next_id());
+        if next <= self.out.base {
+            return;
+        }
+        let sent = match self.session() {
+            Some(Session::Established(est)) => Some(est.sent),
+            _ => None,
+        };
+        let mut freed_in_flight = 0;
+        while self.out.base < next {
+            let (_, data) = self.out.messages.pop_front().expect("ids below next_id are queued");
+            self.out.bytes -= data.len();
+            if sent.is_some_and(|sent| self.out.base < sent) {
+                freed_in_flight += data.len();
+            }
+            self.out.base += 1;
+        }
+        if let Some(Session::Established(est)) = self.session() {
+            est.in_flight = est.in_flight.saturating_sub(freed_in_flight);
+        }
+        self.output.push_back(Output::Event(Event::Delivered(next)));
+        if self.out.close.is_some_and(|id| id < next) {
+            self.finish(CloseReason::Closed);
         }
     }
 
-    fn establish(&mut self, transport: Transport) {
-        if let Some(session) = self.session() {
-            *session = Session::Established { transport, partial: Vec::new() };
-            self.set_state(State::Connected);
+    /// Transmits queued messages while the window allows.
+    fn pump(&mut self) {
+        let Link::Open(Open { phase: Phase::Joined(Session::Established(est)), .. }) = &mut self.link else {
+            return;
+        };
+        while est.in_flight < wire::WINDOW {
+            let Some((kind, data)) = self.out.messages.get((est.sent - self.out.base) as usize) else { break };
+            if *kind == kind::CLOSE {
+                self.output.push_back(Output::Send(seal(&mut est.transport, kind::CLOSE, &[])));
+            } else {
+                let mut chunks = data.chunks(CHUNK_LEN).peekable();
+                loop {
+                    let chunk = chunks.next().unwrap_or_default();
+                    let more = chunks.peek().is_some();
+                    let kind = if more { kind::MORE } else { kind::FINAL };
+                    self.output.push_back(Output::Send(seal(&mut est.transport, kind, chunk)));
+                    if !more {
+                        break;
+                    }
+                }
+            }
+            est.in_flight += data.len();
+            est.sent += 1;
         }
+    }
+
+    fn send_ack(&mut self) {
+        let next = self.inbound.next;
+        let Link::Open(Open { phase: Phase::Joined(Session::Established(est)), .. }) = &mut self.link else {
+            return;
+        };
+        self.output.push_back(Output::Send(seal(&mut est.transport, kind::ACK, &next.to_be_bytes())));
+        self.inbound.unacked = 0;
+        self.inbound.unacked_bytes = 0;
+        self.inbound.ack_at = None;
     }
 
     fn handle_message(&mut self, now: u64, body: &[u8]) {
         // Messages outside a session are left over from an earlier one.
-        let Link::Open(Open { phase: Phase::Joined(Session::Established { transport, partial }), .. }) = &mut self.link
-        else {
+        let Link::Open(Open { phase: Phase::Joined(Session::Established(est)), .. }) = &mut self.link else {
             return;
         };
-        let Ok(plaintext) = transport.decrypt(body) else {
+        let Ok(mut plaintext) = est.transport.decrypt(body) else {
             // Within a session the relay must deliver every message, in order,
             // untouched. Anything else breaks the session: start over.
             return self.reconnect(now);
         };
-        let Some((&kind, data)) = plaintext.split_first() else { return };
+        let Some(&kind) = plaintext.first() else { return };
         match kind {
             kind::MORE | kind::FINAL => {
-                if partial.len() + data.len() > wire::MAX_MESSAGE_LEN {
+                if est.partial.len() + plaintext.len() - 1 > wire::MAX_MESSAGE_LEN {
                     return self.reconnect(now);
                 }
-                partial.extend_from_slice(data);
-                if kind == kind::FINAL {
-                    let message = std::mem::take(partial);
-                    self.output.push_back(Output::Event(Event::Message(message)));
+                if kind == kind::MORE {
+                    est.partial.extend_from_slice(&plaintext[1..]);
+                } else {
+                    let message = if est.partial.is_empty() {
+                        plaintext.remove(0);
+                        plaintext
+                    } else {
+                        est.partial.extend_from_slice(&plaintext[1..]);
+                        std::mem::take(&mut est.partial)
+                    };
+                    self.deliver(now, message);
                 }
             }
-            kind::CLOSE => self.finish(CloseReason::ClosedByPeer),
+            kind::CLOSE => {
+                self.inbound.next += 1;
+                self.send_ack();
+                return self.finish(CloseReason::ClosedByPeer);
+            }
+            kind::ACK => {
+                if let Some(next) = plaintext.get(1..9) {
+                    self.acknowledged(u64::from_be_bytes(next.try_into().unwrap()));
+                    self.pump();
+                }
+            }
             _ => {}
+        }
+        self.confirm(now);
+    }
+
+    fn deliver(&mut self, now: u64, message: Vec<u8>) {
+        self.inbound.next += 1;
+        self.inbound.unacked += 1;
+        self.inbound.unacked_bytes += message.len();
+        self.output.push_back(Output::Event(Event::Message(message)));
+        if self.inbound.unacked >= ACK_MESSAGES || self.inbound.unacked_bytes >= ACK_BYTES {
+            self.send_ack();
+        } else if self.inbound.ack_at.is_none() {
+            self.inbound.ack_at = Some(now + ms(ACK_DELAY));
+        }
+    }
+
+    /// Inviter: an authenticated message from the joiner proves it holds the
+    /// session, and so that it knows it was pinned. Pairing is complete:
+    /// move to the pair ID at once, where the joiner follows, so the room
+    /// stops using the address the invite reaches.
+    fn confirm(&mut self, now: u64) {
+        if self.room.role() == Role::Inviter
+            && !self.room.is_paired()
+            && let Some(joiner) = self.tentative
+        {
+            self.room.set_paired(joiner);
+            self.output.push_back(Output::Event(Event::Paired));
+            self.drop_socket(now, true);
+            self.set_state(State::Offline);
+            self.connect(now);
         }
     }
 }

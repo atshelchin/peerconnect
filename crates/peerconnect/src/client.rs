@@ -8,10 +8,12 @@
 //! let room = Room::join(&invite.parse()?);
 //! // Persist `room` now: it holds the identity the inviter will pin.
 //! let mut conn = client::connect(room);
+//! conn.send(b"hello").await?; // queued until the peer is reachable
 //! while let Some(event) = conn.next().await {
 //!     match event {
-//!         Event::State(State::Connected) => conn.send(b"hello").await?,
 //!         Event::Message(data) => println!("{}", String::from_utf8_lossy(&data)),
+//!         Event::Paired => { /* persist conn.room() again */ }
+//!         Event::State(State::Closed(_)) => break,
 //!         _ => {}
 //!     }
 //! }
@@ -20,19 +22,19 @@
 //!
 //! The driver never stops reading the socket: incoming events are buffered
 //! without bound (like a browser WebSocket), so an application that is slow
-//! to call [`Connection::next`] costs memory but can never deadlock the
-//! connection. Sending is paced: [`Connection::send`] waits while more than
-//! 1 MiB is queued for the socket.
+//! to call [`Connection::next`] costs memory but can never stall the
+//! connection. Outgoing data is bounded by the protocol's window and the
+//! outbox limit, beyond which [`Connection::send`] waits.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -43,31 +45,30 @@ use crate::{CloseReason, Event, Output, Peer, Room, SendError, State, wire};
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Connecting = Pin<Box<dyn Future<Output = Option<Ws>> + Send>>;
+type Reply = oneshot::Sender<Result<u64, SendError>>;
 
-/// `send` waits while more than this is queued for the socket.
-const HIGH_WATER: usize = 1 << 20;
 /// Bytes written before each flush, at most.
 const BATCH: usize = 256 << 10;
-/// How long a closing socket may take to flush what is queued (including,
-/// after [`Connection::close`], the message ending the room) before it is dropped.
+/// How long a closing socket may take to flush what is queued before it is dropped.
 const FLUSH_GRACE: Duration = Duration::from_secs(30);
 
 /// Connects to the room's relay and keeps the room connected, reconnecting
 /// as needed, until the connection is left, closed or dropped. Must be
-/// called within a Tokio runtime.
+/// called within a Tokio runtime. A room that is closing carries on ending.
 pub fn connect(room: Room) -> Connection {
     let shared = Arc::new(Mutex::new(room.clone()));
+    let closing = Arc::new(AtomicBool::new(room.is_closing()));
     let (commands, rx) = mpsc::channel(64);
-    let (stop, stopped) = oneshot::channel();
+    let (control, controls) = mpsc::unbounded_channel();
     let (tx, events) = mpsc::unbounded_channel();
-    tokio::spawn(drive(Peer::new(room, 0), rx, stopped, tx, shared.clone()));
-    Connection { sender: Sender { commands }, stop: Some(stop), events, room: shared }
+    tokio::spawn(drive(Peer::new(room, 0), rx, controls, tx, shared.clone()));
+    Connection { sender: Sender { commands, closing }, control, events, room: shared }
 }
 
 /// A live room connection. Dropping it leaves the room.
 pub struct Connection {
     sender: Sender,
-    stop: Option<oneshot::Sender<Stop>>,
+    control: mpsc::UnboundedSender<Control>,
     events: mpsc::UnboundedReceiver<Event>,
     room: Arc<Mutex<Room>>,
 }
@@ -78,9 +79,9 @@ impl Connection {
         self.events.recv().await
     }
 
-    /// Sends a message if the peer is connected (see [`Peer::send`]). Waits
-    /// while the socket has a large backlog.
-    pub async fn send(&self, data: impl Into<Vec<u8>>) -> Result<(), SendError> {
+    /// Queues a message for the peer and returns its id (see [`Peer::send`]).
+    /// Waits while too much is unacknowledged.
+    pub async fn send(&self, data: impl Into<Vec<u8>>) -> Result<u64, SendError> {
         self.sender.send(data).await
     }
 
@@ -89,80 +90,86 @@ impl Connection {
         self.sender.clone()
     }
 
-    /// The room as it currently stands; persist it after [`Event::Paired`].
+    /// The room as it currently stands; persist it after [`Event::Paired`]
+    /// and after [`Connection::close`].
     pub fn room(&self) -> Room {
         self.room.lock().unwrap().clone()
     }
 
+    /// Ends the room for both peers (see [`Peer::close`]): the connection
+    /// keeps going until the peer has been told, then reports
+    /// [`CloseReason::Closed`]. The room now says it is closing; persist it,
+    /// so that reconnecting later finishes the job if this does not.
+    pub fn close(&self) {
+        self.sender.closing.store(true, Ordering::Relaxed);
+        self.room.lock().unwrap().set_closing();
+        let _ = self.control.send(Control::Close);
+    }
+
     /// Disconnects, keeping the room for later.
     pub async fn leave(mut self) {
-        self.stop(Stop::Leave).await;
-    }
-
-    /// Ends the room for both peers (see [`Peer::close`]). Returns once the
-    /// peer has been told, as far as that is possible: the message ending
-    /// the room follows anything still queued, and is given up on if the
-    /// connection does not drain within 30 s.
-    pub async fn close(mut self) {
-        self.stop(Stop::Close).await;
-    }
-
-    async fn stop(&mut self, stop: Stop) {
-        if let Some(tx) = self.stop.take() {
-            let _ = tx.send(stop);
-        }
+        let _ = self.control.send(Control::Leave);
         while self.events.recv().await.is_some() {}
     }
 }
 
 #[derive(Clone)]
 pub struct Sender {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<(Vec<u8>, Reply)>,
+    /// Set by [`Connection::close`]: nothing is sent after that.
+    closing: Arc<AtomicBool>,
 }
 
 impl Sender {
-    pub async fn send(&self, data: impl Into<Vec<u8>>) -> Result<(), SendError> {
-        let (reply, result) = oneshot::channel();
-        let data = data.into();
-        if self.commands.send(Command::Send(data, reply)).await.is_err() {
-            return Err(SendError::NotConnected);
+    pub async fn send(&self, data: impl Into<Vec<u8>>) -> Result<u64, SendError> {
+        if self.closing.load(Ordering::Relaxed) {
+            return Err(SendError::Closed);
         }
-        result.await.unwrap_or(Err(SendError::NotConnected))
+        let (reply, result) = oneshot::channel();
+        if self.commands.send((data.into(), reply)).await.is_err() {
+            return Err(SendError::Closed);
+        }
+        result.await.unwrap_or(Err(SendError::Closed))
     }
 }
 
-enum Command {
-    Send(Vec<u8>, oneshot::Sender<Result<(), SendError>>),
-}
-
-/// How the application stops the connection. Dropping the sender leaves.
-enum Stop {
-    Leave,
+/// How the application stops the connection. Dropping it leaves.
+enum Control {
     Close,
+    Leave,
 }
 
 async fn drive(
     mut peer: Peer,
-    mut commands: mpsc::Receiver<Command>,
-    mut stop: oneshot::Receiver<Stop>,
+    mut commands: mpsc::Receiver<(Vec<u8>, Reply)>,
+    mut control: mpsc::UnboundedReceiver<Control>,
     events: mpsc::UnboundedSender<Event>,
     room: Arc<Mutex<Room>>,
 ) {
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
-    let drained = Arc::new(Notify::new());
     let mut socket: Option<Socket> = None;
     let mut connecting: Option<Connecting> = None;
     let mut flushing: Option<tokio::task::JoinHandle<()>> = None;
-    let mut stopping = false;
+    // A send waiting for room in the outbox.
+    let mut waiting: Option<(Vec<u8>, Reply)> = None;
+    let mut controlled = true;
 
     loop {
+        if let Some((data, reply)) = waiting.take() {
+            match peer.send(&data) {
+                Err(SendError::Full) => waiting = Some((data, reply)),
+                result => {
+                    let _ = reply.send(result);
+                }
+            }
+        }
         while let Some(output) = peer.poll_output() {
             match output {
                 Output::Connect(url) => connecting = Some(Box::pin(open(url))),
                 Output::Send(frame) => {
                     if let Some(socket) = &socket {
-                        socket.send(frame);
+                        let _ = socket.data.send(Message::binary(frame));
                     }
                 }
                 Output::Ping => {
@@ -187,8 +194,9 @@ async fn drive(
             }
         }
         if let State::Closed(reason) = peer.state() {
-            // Ending the room is only done once the peer could have been told.
-            if reason == CloseReason::Closed
+            // Make sure the last word (the CLOSE, or our acknowledgement of
+            // the peer's) leaves before returning.
+            if reason != CloseReason::Left
                 && let Some(flushing) = flushing
             {
                 let _ = flushing.await;
@@ -197,13 +205,33 @@ async fn drive(
         }
 
         let deadline = peer.poll_timeout().map(|t| start + Duration::from_millis(t));
-        let backlogged = socket.as_ref().is_some_and(|s| s.queued.load(Ordering::Relaxed) >= HIGH_WATER);
         tokio::select! {
+            // Application requests and timers first: sends issued before a
+            // close go before it, and pings are never starved by a busy
+            // socket. Sends cannot starve reading either: the window and the
+            // outbox limit park them until acknowledgements are read.
+            biased;
+            Some((data, reply)) = commands.recv(), if waiting.is_none() => {
+                waiting = Some((data, reply)); // tried at the top of the loop
+            }
+            control = control.recv(), if controlled => match control {
+                Some(Control::Close) => {
+                    peer.close();
+                    *room.lock().unwrap() = peer.room().clone();
+                }
+                Some(Control::Leave) | None => {
+                    controlled = false;
+                    peer.leave();
+                }
+            },
+            () = async { sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
+                peer.handle_timeout(now());
+            }
             ws = async { connecting.as_mut().unwrap().await }, if connecting.is_some() => {
                 connecting = None;
                 match ws {
                     Some(ws) => {
-                        socket = Some(Socket::new(ws, drained.clone()));
+                        socket = Some(Socket::new(ws));
                         peer.handle_open(now());
                     }
                     None => peer.handle_close(now(), None),
@@ -222,20 +250,6 @@ async fn drive(
                     peer.handle_close(now(), None);
                 }
             },
-            Some(Command::Send(data, reply)) = commands.recv(), if !backlogged => {
-                let _ = reply.send(peer.send(&data));
-            }
-            how = &mut stop, if !stopping => {
-                stopping = true;
-                match how {
-                    Ok(Stop::Close) => peer.close(),
-                    Ok(Stop::Leave) | Err(_) => peer.leave(),
-                }
-            }
-            () = drained.notified(), if backlogged => {}
-            () = async { sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
-                peer.handle_timeout(now());
-            }
         }
     }
 }
@@ -247,30 +261,22 @@ struct Socket {
     data: mpsc::UnboundedSender<Message>,
     /// Keepalives, written ahead of queued data.
     control: mpsc::UnboundedSender<Message>,
-    /// Bytes queued but not yet written.
-    queued: Arc<AtomicUsize>,
     writer: tokio::task::JoinHandle<()>,
 }
 
 impl Socket {
-    fn new(ws: Ws, drained: Arc<Notify>) -> Socket {
+    fn new(ws: Ws) -> Socket {
         let (sink, stream) = ws.split();
         let (data, data_rx) = mpsc::unbounded_channel();
         let (control, control_rx) = mpsc::unbounded_channel();
-        let queued = Arc::new(AtomicUsize::new(0));
-        let writer = tokio::spawn(write(sink, control_rx, data_rx, queued.clone(), drained));
-        Socket { stream, data, control, queued, writer }
-    }
-
-    fn send(&self, frame: Vec<u8>) {
-        self.queued.fetch_add(frame.len(), Ordering::Relaxed);
-        let _ = self.data.send(Message::binary(frame));
+        let writer = tokio::spawn(write(sink, control_rx, data_rx));
+        Socket { stream, data, control, writer }
     }
 
     /// Closes with 1000 once everything queued is written, abandoning a
     /// socket that does not drain in time. The returned task finishes then.
     fn close(self) -> tokio::task::JoinHandle<()> {
-        let Socket { stream, data, control, mut writer, .. } = self;
+        let Socket { stream, data, control, mut writer } = self;
         drop((data, control));
         tokio::spawn(async move {
             if timeout(FLUSH_GRACE, &mut writer).await.is_err() {
@@ -285,8 +291,6 @@ async fn write(
     mut sink: SplitSink<Ws, Message>,
     mut control: mpsc::UnboundedReceiver<Message>,
     mut data: mpsc::UnboundedReceiver<Message>,
-    queued: Arc<AtomicUsize>,
-    drained: Arc<Notify>,
 ) {
     loop {
         let first = tokio::select! {
@@ -301,9 +305,7 @@ async fn write(
         let mut written = 0;
         let mut next = Some(first);
         while let Some(msg) = next {
-            if let Message::Binary(frame) = &msg {
-                written += frame.len();
-            }
+            written += msg.len();
             if sink.feed(msg).await.is_err() {
                 return;
             }
@@ -311,10 +313,6 @@ async fn write(
         }
         if sink.flush().await.is_err() {
             return;
-        }
-        if written > 0 {
-            queued.fetch_sub(written, Ordering::Relaxed);
-            drained.notify_one();
         }
     }
     let _ = sink.send(Message::Close(Some(CloseFrame { code: CloseCode::Normal, reason: "".into() }))).await;

@@ -32,11 +32,15 @@ impl Relay {
     }
 
     async fn bind(addr: &str) -> Relay {
+        Relay::bind_with(addr, Default::default()).await
+    }
+
+    async fn bind_with(addr: &str, config: peerconnect_relay::Config) -> Relay {
         let listener = TcpListener::bind(addr).await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
-            peerconnect_relay::serve(listener, Default::default(), async {
+            peerconnect_relay::serve(listener, config, async {
                 let _ = stopped.await;
             })
             .await
@@ -78,16 +82,30 @@ async fn message(conn: &mut Connection) -> Vec<u8> {
     }
 }
 
+/// Pairs two clients; returns them once both have moved to the pair ID,
+/// with the joiner's paired record.
 async fn pair(relay: &Relay) -> (Connection, Connection, Room) {
     let inviter = Room::create(&relay.url).unwrap();
     let joiner = Room::join(&inviter.invite().unwrap().to_string().parse().unwrap());
     let mut a = client::connect(inviter);
     state(&mut a, State::Waiting).await;
-    let mut b = client::connect(joiner.clone());
+    let mut b = client::connect(joiner);
     wait(&mut a, |e| *e == Event::Paired).await;
+    wait(&mut b, |e| *e == Event::Paired).await;
     state(&mut a, State::Connected).await;
-    state(&mut b, State::Connected).await;
+    let joiner = b.room();
+    assert!(joiner.is_paired() && a.room().is_paired());
+    assert_eq!(joiner.id(), a.room().id());
     (a, b, joiner)
+}
+
+/// Two paired room records, the clients that paired them gone.
+async fn paired_rooms(relay: &Relay) -> (Room, Room) {
+    let (a, b, joiner) = pair(relay).await;
+    let inviter = a.room();
+    a.leave().await;
+    b.leave().await;
+    (inviter, joiner)
 }
 
 #[tokio::test]
@@ -156,7 +174,7 @@ async fn survives_relay_restart() {
 async fn newer_connection_replaces_older() {
     let relay = Relay::start().await;
     let (mut a, mut b, joiner) = pair(&relay).await;
-    let mut b2 = client::connect(joiner);
+    let mut b2 = client::connect(joiner); // the same paired room, opened again
     wait(&mut b, |e| *e == Event::Replaced).await;
     state(&mut b2, State::Connected).await;
     state(&mut a, State::Connected).await;
@@ -167,10 +185,47 @@ async fn newer_connection_replaces_older() {
 #[tokio::test]
 async fn close_ends_the_room_for_both() {
     let relay = Relay::start().await;
-    let (a, mut b, _) = pair(&relay).await;
-    a.close().await;
+    let (mut a, mut b, _) = pair(&relay).await;
+    a.close();
+    assert!(a.room().is_closing());
+    assert_eq!(a.send(b"too late").await, Err(peerconnect::SendError::Closed));
+    state(&mut a, State::Closed(CloseReason::Closed)).await;
     state(&mut b, State::Closed(CloseReason::ClosedByPeer)).await;
     assert!(b.next().await.is_none());
+}
+
+#[tokio::test]
+async fn closing_reaches_a_peer_that_was_away() {
+    let relay = Relay::start().await;
+    let (inviter, joiner) = paired_rooms(&relay).await;
+    let a = client::connect(inviter);
+    a.close();
+    let closing = a.room();
+    a.leave().await; // gives up for now; the record says it is closing
+    assert!(closing.is_closing());
+
+    // Restarted from that record later, it finishes the job once b is back.
+    let mut a = client::connect(closing);
+    let mut b = client::connect(joiner);
+    state(&mut b, State::Closed(CloseReason::ClosedByPeer)).await;
+    state(&mut a, State::Closed(CloseReason::Closed)).await;
+}
+
+#[tokio::test]
+async fn messages_wait_for_an_absent_peer() {
+    let relay = Relay::start().await;
+    let (inviter, joiner) = paired_rooms(&relay).await;
+    let mut a = client::connect(inviter);
+    for i in 0..100u32 {
+        a.send(i.to_be_bytes()).await.unwrap();
+    }
+    let delivered = wait(&mut a, |e| matches!(e, Event::Delivered(_)));
+    assert!(timeout(Duration::from_millis(500), delivered).await.is_err(), "nobody to deliver to yet");
+    let mut b = client::connect(joiner);
+    for i in 0..100u32 {
+        assert_eq!(message(&mut b).await, i.to_be_bytes());
+    }
+    wait(&mut a, |e| *e == Event::Delivered(100)).await;
 }
 
 // Raw protocol checks against the relay.
@@ -412,8 +467,7 @@ async fn a_peer_that_stops_reading_is_dropped_not_waited_for() {
 #[ignore]
 async fn slow_reader_still_gets_a_large_message() {
     let relay = Relay::start().await;
-    let inviter = Room::create(&relay.url).unwrap();
-    let joiner = Room::join(&inviter.invite().unwrap());
+    let (inviter, joiner) = paired_rooms(&relay).await;
     let mut a = client::connect(inviter);
     state(&mut a, State::Waiting).await;
     // b reads one frame every 300 ms: 16 MiB takes about 80 s.
@@ -499,8 +553,7 @@ async fn hand_driven_joiner(relay: &Relay, joiner: &Room) -> (RawWs, peerconnect
 #[tokio::test]
 async fn leaving_does_not_wait_for_the_send_backlog() {
     let relay = Relay::start().await;
-    let inviter = Room::create(&relay.url).unwrap();
-    let joiner = Room::join(&inviter.invite().unwrap());
+    let (inviter, joiner) = paired_rooms(&relay).await;
     let mut a = client::connect(inviter);
     state(&mut a, State::Waiting).await;
     let (b, _peer) = hand_driven_joiner(&relay, &joiner).await; // and then never reads
@@ -515,10 +568,35 @@ async fn leaving_does_not_wait_for_the_send_backlog() {
 #[tokio::test]
 async fn close_right_after_a_large_message_still_ends_the_room() {
     let relay = Relay::start().await;
-    let (a, mut b, _) = pair(&relay).await;
+    let (mut a, mut b, _) = pair(&relay).await;
     let big = vec![2u8; wire::MAX_MESSAGE_LEN];
     a.send(big.clone()).await.unwrap();
-    a.close().await;
+    a.close();
     assert_eq!(message(&mut b).await, big);
     state(&mut b, State::Closed(CloseReason::ClosedByPeer)).await;
+    state(&mut a, State::Closed(CloseReason::Closed)).await;
+}
+
+#[tokio::test]
+async fn connections_are_limited_per_address() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let config = peerconnect_relay::Config { max_per_address: 2, trust_proxy: true, ..Default::default() };
+    let relay = Relay::bind_with("127.0.0.1:0", config).await;
+    let room = Room::create(&relay.url).unwrap();
+    let open = |from: &'static str| {
+        let mut request = room.endpoint().into_client_request().unwrap();
+        request.headers_mut().insert("x-forwarded-for", format!("198.51.100.1, {from}").parse().unwrap());
+        tokio_tungstenite::connect_async(request)
+    };
+    let (_a, _) = open("192.0.2.1").await.unwrap();
+    let (_b, _) = open("192.0.2.1").await.unwrap();
+    match open("192.0.2.1").await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status(), 429),
+        other => panic!("expected 429, got {other:?}"),
+    }
+    // Another address (the last entry is the one the proxy saw) is fine.
+    let (_c, _) = open("192.0.2.2").await.unwrap();
+    drop(_a);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_d, _) = open("192.0.2.1").await.unwrap();
 }

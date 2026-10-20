@@ -11,7 +11,8 @@ initSync({ module: Uint8Array.from(atob(module), (c) => c.charCodeAt(0)) });
 
 export { Room };
 
-/** Connects to a room and keeps it connected until left or closed. */
+/** Connects to a room and keeps it connected until left or closed. A room
+ * that is closing carries on ending. */
 export function connect(room) {
   return new Connection(typeof room === "string" ? Room.parse(room) : room);
 }
@@ -36,31 +37,42 @@ export class Connection extends EventTarget {
     queueMicrotask(() => this.#pump());
   }
 
-  /** Bytes handed to the WebSocket but not yet sent: pace large transfers by it. */
-  get bufferedAmount() {
-    return this.#socket?.bufferedAmount ?? 0;
+  /** Bytes of messages waiting to be acknowledged by the peer. */
+  get queued() {
+    return this.#peer.queued;
   }
 
-  /** The room as it stands now; save `room.toString()` after "paired". */
+  /** The room as it stands now; save `room.toString()` after "paired" and after `close()`. */
   get room() {
     return this.#peer.room();
   }
 
-  /** Sends a message (bytes or a string, as UTF-8). Throws unless connected. */
+  /**
+   * Queues a message (bytes, or a string as UTF-8) and returns its id. It is
+   * delivered as soon as the peer is reachable; "delivered" events report
+   * progress. Throws if it is over 16 MiB, if 64 MiB are already waiting for
+   * acknowledgement, or if the room is closed or closing.
+   */
   send(data) {
     const bytes =
       typeof data === "string" ? encoder.encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data);
-    this.#peer.send(bytes);
+    const id = this.#peer.send(bytes);
     this.#pump();
+    return id;
   }
 
-  /** Disconnects, keeping the room for later. */
+  /** Disconnects, keeping the room for later. Unacknowledged messages are dropped. */
   leave() {
     this.#peer.leave();
     this.#pump();
   }
 
-  /** Ends the room for both peers. */
+  /**
+   * Ends the room for both peers. The connection carries on until the peer
+   * has been told, then its state becomes "closed" with reason "closed".
+   * The room now says it is closing: save it, so that connecting with it
+   * later finishes the job if this does not.
+   */
   close() {
     this.#peer.close();
     this.#pump();
@@ -92,6 +104,9 @@ export class Connection extends EventTarget {
           break;
         case "message":
           this.dispatchEvent(new MessageEvent("message", { data: out.data }));
+          break;
+        case "delivered":
+          this.dispatchEvent(new CustomEvent("delivered", { detail: out.id }));
           break;
         case "paired":
         case "replaced":
