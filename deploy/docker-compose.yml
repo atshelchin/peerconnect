@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     environment:
       PEERCONNECT_MAX_CONNECTIONS: "10000"
-      PEERCONNECT_MAX_PER_ADDRESS: "64"
+      PEERCONNECT_MAX_PER_ADDRESS: "256"
       # Caddy appends the client's address to X-Forwarded-For.
       PEERCONNECT_TRUST_PROXY: "1"
   caddy:

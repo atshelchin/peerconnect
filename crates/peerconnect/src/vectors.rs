@@ -30,7 +30,7 @@ fn hex(data: &[u8]) -> String {
 /// A room record built from fixed parts (see `Room::to_bytes`).
 fn record(role: Role, paired: bool, secret: [u8; 32], identity: [u8; 32], peer: Option<[u8; 32]>) -> Room {
     let flags = peer.map_or(0, |_| 1) | if paired { 2 } else { 0 };
-    let mut raw = vec![1, role as u8, flags];
+    let mut raw = vec![2, role as u8, flags];
     raw.extend_from_slice(&secret);
     raw.extend_from_slice(&identity);
     if let Some(peer) = peer {

@@ -57,6 +57,12 @@ struct Relay {
     /// Cut the receiving connection after this many forwarded MESSAGE frames.
     cut_every: Option<u32>,
     forwarded: u32,
+    /// Cut this node's connection right after forwarding it the next MESSAGE.
+    cut_after_next_to: Option<usize>,
+    /// The last INIT forwarded (a malicious relay keeps it to replay later).
+    recorded_init: Option<Vec<u8>>,
+    /// Silently drop the next MESSAGE frame forwarded.
+    swallow_next: bool,
     /// Hold every frame for this node instead of delivering it.
     hold_for: Option<usize>,
     held: Vec<(usize, SocketId, Vec<u8>)>,
@@ -202,6 +208,12 @@ impl Sim {
                         if frame[0] == wire::INIT && self.relay.drop_init {
                             return;
                         }
+                        if frame[0] == wire::INIT {
+                            self.relay.recorded_init = Some(frame.clone());
+                        }
+                        if frame[0] == wire::MESSAGE && std::mem::take(&mut self.relay.swallow_next) {
+                            return;
+                        }
                         if frame[0] == wire::MESSAGE && std::mem::take(&mut self.relay.tamper) {
                             frame[5] ^= 1;
                         }
@@ -215,6 +227,11 @@ impl Sim {
                             self.queue.push_back(Delivery::ToPeer(node, p, Msg::Binary(frame)));
                             if kind == wire::REPLY && self.relay.kick_after_reply {
                                 self.relay.kick_after_reply = false;
+                                self.queue.push_back(Delivery::Hangup(p));
+                                self.queue.push_back(Delivery::Closed(node, p, None));
+                            }
+                            if kind == wire::MESSAGE && self.relay.cut_after_next_to == Some(node) {
+                                self.relay.cut_after_next_to = None;
                                 self.queue.push_back(Delivery::Hangup(p));
                                 self.queue.push_back(Delivery::Closed(node, p, None));
                             }
@@ -690,4 +707,254 @@ fn connections_that_fail_right_after_joining_back_off() {
     sim.advance(120_000);
     // Constant half-second retries would make ~240 attempts in two minutes.
     assert!(sim.relay.connects < 15, "{} attempts", sim.relay.connects);
+}
+
+/// Property: whatever the relay and the network do (cut connections at
+/// random, restart, tamper), each peer receives exactly the other's
+/// messages, in order, once things settle.
+#[test]
+fn streams_survive_random_chaos() {
+    // More rounds: PEERCONNECT_CHAOS_SEEDS=100 cargo test --release chaos
+    let seeds = std::env::var("PEERCONNECT_CHAOS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(4u64);
+    for seed in 1..=seeds {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move |n: u64| {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        };
+        let mut sim = Sim::new();
+        let (a, b, ..) = pair(&mut sim);
+        let mut sent: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        for step in 0..400u32 {
+            match next(20) {
+                0..=9 => {
+                    let from = [a, b][next(2) as usize];
+                    let side = usize::from(from == b);
+                    let len = [0, 10, 70_000, 200_000][next(4) as usize];
+                    let mut message = step.to_be_bytes().to_vec();
+                    message.resize(4 + len, side as u8);
+                    if sim.send(from, &message).is_ok() {
+                        sent[side].push(message);
+                    }
+                }
+                10..=13 => sim.advance(next(5_000)),
+                14 | 15 => {
+                    // Cut one peer's connection without a word.
+                    let node = [a, b][next(2) as usize];
+                    if let Some(id) = sim.nodes[node].socket {
+                        sim.drop_socket(id, None);
+                        sim.queue.push_back(Delivery::Closed(node, id, None));
+                        sim.run();
+                    }
+                }
+                16 => sim.restart_relay(),
+                17 => sim.relay.tamper = true,
+                _ => sim.advance(next(60_000)),
+            }
+        }
+        sim.relay.tamper = false;
+        sim.advance(300_000);
+        assert_eq!((sim.state(a), sim.state(b)), (State::Connected, State::Connected), "seed {seed}");
+        let got_b = sim.messages(b);
+        let got_a = sim.messages(a);
+        assert!(got_b == sent[0], "seed {seed}: b got {} of {} messages from a", got_b.len(), sent[0].len());
+        assert!(got_a == sent[1], "seed {seed}: a got {} of {} messages from b", got_a.len(), sent[1].len());
+        assert_eq!((sim.nodes[a].peer.queued(), sim.nodes[b].peer.queued()), (0, 0), "seed {seed}");
+    }
+}
+
+#[test]
+fn two_instances_of_one_joiner_never_cause_duplicates() {
+    let mut sim = Sim::new();
+    let (a, x, _, joiner) = pair(&mut sim);
+    for i in 0..3u8 {
+        sim.send(x, &[i]).unwrap();
+    }
+    // a has the messages but has not acknowledged them yet (that waits 50 ms)
+    // when another instance of the joiner takes the seat.
+    assert_eq!(sim.messages(a).len(), 3);
+    let y = sim.add(joiner);
+    assert_eq!(sim.state(y), State::Connected);
+    sim.send(y, b"from y").unwrap();
+    // The first instance comes back a minute later and takes the seat again,
+    // still holding its three messages: a must not deliver them twice.
+    sim.advance(80_000);
+    assert_eq!(sim.state(x), State::Connected);
+    sim.advance(1_000);
+    assert_eq!(sim.messages(a), vec![b"from y".to_vec()]);
+    assert_eq!(sim.nodes[x].peer.queued(), 0);
+}
+
+#[test]
+fn an_inviter_can_close_before_pairing_completes() {
+    let mut sim = Sim::new();
+    let inviter = Room::create("wss://relay.test").unwrap();
+    let joiner = Room::join(&inviter.invite().unwrap());
+    let a = sim.add(inviter);
+    sim.nodes[a].peer.close(); // cancel the invitation
+    sim.run();
+    let b = sim.add(joiner);
+    sim.advance(2_000);
+    assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
+    assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
+    assert!(!sim.events(a).contains(&Event::Paired));
+}
+
+#[test]
+fn a_lost_acknowledgement_of_close_still_ends_both() {
+    let mut sim = Sim::new();
+    let (a, b, ..) = pair(&mut sim);
+    sim.relay.cut_after_next_to = Some(b); // b gets the CLOSE, its ACK is lost
+    sim.nodes[a].peer.close();
+    sim.run();
+    assert_ne!(sim.state(a), State::Closed(CloseReason::Closed));
+    sim.advance(5_000); // b reconnects, its handshake says it has the CLOSE
+    assert_eq!(sim.state(a), State::Closed(CloseReason::Closed));
+    assert_eq!(sim.state(b), State::Closed(CloseReason::ClosedByPeer));
+}
+
+#[test]
+fn a_paired_joiner_finds_an_inviter_that_lost_its_pairing() {
+    let mut sim = Sim::new();
+    let inviter = Room::create("wss://relay.test").unwrap();
+    let unpaired = inviter.to_string(); // the inviter never managed to save the paired record
+    let joiner = Room::join(&inviter.invite().unwrap());
+    let (a, b) = (sim.add(inviter), sim.add(joiner));
+    assert!(sim.nodes[b].peer.room().is_paired());
+    sim.nodes[a].peer.leave();
+    sim.run();
+    let a2 = sim.add(unpaired.parse().unwrap());
+    // The joiner waits at the pair ID, then looks at the invite ID, where
+    // pairing completes again with the same identities.
+    sim.advance(7 * 60_000);
+    assert_eq!((sim.state(a2), sim.state(b)), (State::Connected, State::Connected));
+    assert!(sim.nodes[a2].peer.room().is_paired());
+    assert_eq!(sim.at(a2), Some(sim.nodes[b].peer.room().id()));
+}
+
+/// Property: peers restarted from their records (new instances, new streams)
+/// in the middle of everything: no instance ever gets a message twice, and
+/// everything the final instances send arrives, in order. (A restarted
+/// receiver may get again what its previous instance had received but not
+/// yet acknowledged: it has forgotten it.)
+#[test]
+fn restarted_instances_never_duplicate() {
+    let seeds = std::env::var("PEERCONNECT_CHAOS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(4u64);
+    for seed in 1..=seeds {
+        let mut rng = seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut next = move |n: u64| {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        };
+        let mut sim = Sim::new();
+        let (a, b, ra, rb) = pair(&mut sim);
+        let mut nodes = [a, b];
+        let records = [ra, rb];
+        // Messages carry (sender side, sender instance, sequence).
+        let mut instance = [0u32; 2];
+        let mut final_sent: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        // What each receiving instance got, per side.
+        let mut got: [Vec<Vec<Vec<u8>>>; 2] = [vec![Vec::new()], vec![Vec::new()]];
+        let mut seq = 0u32;
+        for _ in 0..300 {
+            for i in 0..2 {
+                let fresh = sim.messages(nodes[i]);
+                got[i].last_mut().unwrap().extend(fresh);
+            }
+            match next(12) {
+                0..=6 => {
+                    let side = next(2) as usize;
+                    seq += 1;
+                    let message = [[side as u8].as_slice(), &instance[side].to_be_bytes(), &seq.to_be_bytes()].concat();
+                    if sim.send(nodes[side], &message).is_ok() {
+                        final_sent[side].push(message);
+                    }
+                }
+                7 | 8 => sim.advance(next(3_000)),
+                9 => {
+                    if let Some(id) = sim.nodes[nodes[0]].socket {
+                        sim.drop_socket(id, None);
+                        sim.queue.push_back(Delivery::Closed(nodes[0], id, None));
+                        sim.run();
+                    }
+                }
+                _ => {
+                    // Restart one side from its record: a new instance.
+                    let side = next(2) as usize;
+                    let fresh = sim.messages(nodes[side]);
+                    got[side].last_mut().unwrap().extend(fresh);
+                    sim.nodes[nodes[side]].peer.leave();
+                    sim.run();
+                    nodes[side] = sim.add(records[side].clone());
+                    instance[side] += 1;
+                    got[side].push(Vec::new());
+                    final_sent[side].clear(); // what the old instance had not had acknowledged may be lost
+                }
+            }
+        }
+        sim.advance(200_000);
+        for i in 0..2 {
+            let fresh = sim.messages(nodes[i]);
+            got[i].last_mut().unwrap().extend(fresh);
+        }
+        for side in 0..2 {
+            for list in &got[1 - side] {
+                let mut unique = list.clone();
+                unique.sort();
+                unique.dedup();
+                assert_eq!(unique.len(), list.len(), "seed {seed}: one instance got a message twice");
+            }
+            // Everything the final sender instance sent arrived somewhere...
+            let all: Vec<&Vec<u8>> = got[1 - side].iter().flatten().collect();
+            assert!(final_sent[side].iter().all(|m| all.contains(&m)), "seed {seed}: a message was lost");
+            // ...and each receiving instance got each sender instance's
+            // messages in order.
+            for list in &got[1 - side] {
+                let mut last = std::collections::HashMap::new();
+                for m in list.iter().filter(|m| m[0] == side as u8) {
+                    let (inst, n) = (&m[1..5], u32::from_be_bytes(m[5..9].try_into().unwrap()));
+                    let previous = last.insert(inst.to_vec(), n);
+                    assert!(previous.is_none_or(|p| p < n), "seed {seed}: out of order");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_replayed_handshake_from_an_old_instance_causes_no_duplicates() {
+    let mut sim = Sim::new();
+    let (a, j0, _, joiner) = pair(&mut sim);
+    let old_init = sim.relay.recorded_init.clone().unwrap(); // from the first joiner instance
+    sim.nodes[j0].peer.leave();
+    sim.run();
+    let j1 = sim.add(joiner); // a new instance: a new stream
+    sim.send(j1, b"one").unwrap();
+    sim.send(j1, b"two").unwrap();
+    // a has them, unacknowledged, when the relay replays the old instance's INIT.
+    let a_socket = sim.nodes[a].socket.unwrap();
+    sim.queue.push_back(Delivery::ToPeer(a, a_socket, Msg::Binary(old_init)));
+    sim.run();
+    sim.advance(60_000);
+    assert_eq!((sim.state(a), sim.state(j1)), (State::Connected, State::Connected));
+    assert_eq!(sim.messages(a), vec![b"one".to_vec(), b"two".to_vec()]);
+    assert_eq!(sim.nodes[j1].peer.queued(), 0);
+}
+
+#[test]
+fn a_silently_lost_frame_is_resent() {
+    let mut sim = Sim::new();
+    let (a, b, ..) = pair(&mut sim);
+    sim.relay.swallow_next = true; // the relay drops it and says nothing
+    sim.send(a, b"lost in transit").unwrap();
+    sim.advance(20_000);
+    assert!(sim.messages(b).is_empty());
+    // No acknowledgement within 30 s: a reconnects, and the stream resumes.
+    sim.advance(20_000);
+    assert_eq!(sim.messages(b), vec![b"lost in transit".to_vec()]);
+    assert_eq!(sim.nodes[a].peer.queued(), 0);
 }

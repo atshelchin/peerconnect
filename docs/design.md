@@ -44,7 +44,7 @@ The move is exactly the two-generals situation the first design avoided, so it i
 - The inviter moves when pairing completes, which is when it first receives an authenticated message from the joiner. The joiner acknowledges at once on every new session.
 - An unpaired joiner does not try to know whether the inviter has moved. It alternates between the two IDs: on every reconnection, after 20 s alone, and at once when the inviter leaves a session. Because the inviter is at exactly one of the two, the joiner finds it within one round.
 
-So there is no moment at which one side's lost message strands the other; the simulation drops the confirmation on purpose, and restarts the inviter mid-pairing, to show it. In practice the invite ID carries one round trip of traffic, and the room then lives where the invite cannot follow.
+So there is no moment at which one side's lost message strands the other; the simulation drops the confirmation on purpose, and restarts the inviter mid-pairing, to show it. One more case needed care: an inviter that crashes after moving but before its app persisted the completion comes back unpaired, at the invite ID, while the joiner, now paired, waits at the pair ID. So a paired joiner that has been alone for five minutes looks at the invite ID for 20 s, completes pairing again with the same identities, and both move back. In practice the invite ID carries one round trip of traffic, and the room then lives where the invite cannot follow.
 
 `IK` over `XX`: one round trip instead of one and a half; the inviter's key is in the invite anyway; and the joiner gets assurance of the inviter's identity even if the invite was copied. `psk1` over `psk2`: the psk must be mixed into message 1, or the inviter could be made to pin a key from someone who never had the invite.
 
@@ -70,17 +70,18 @@ Details that keep it small:
 - **Resume state rides in the handshake payloads,** which Noise encrypts and authenticates and which were empty before: 32 bytes each way, so resuming costs no extra round trip.
 - **Message ids never travel.** Both sides compute the resume point from the two payloads; within a session, Noise's nonces already guarantee order.
 - **A random stream id per process start** tells a resumed stream from a new one. A peer that restarted lost its queue; its partner sees the new id and starts counting afresh, rather than discarding the new messages as duplicates.
-- **ACKs are cumulative and batched** (50 ms, or 32 messages, or 1 MiB).
+- **Positions are kept per stream.** A receiver remembers its place in each of the last 16 streams it saw from the peer, and computes where the sender will resume by the sender's own rule. A first version kept one position; review showed that two instances of the same peer taking turns, or a relay replaying an old handshake, then moved it backwards and caused duplicates.
+- **ACKs are cumulative and batched** (50 ms, or 32 messages, or 1 MiB), with a progress ACK every 10 s while a long message is arriving. A sender that hears nothing for 30 s with data in flight reconnects: a relay that silently drops the last frame of a session can otherwise stall the stream forever.
 - **A 4 MiB window** caps what is unacknowledged in flight. That bounds what any relay has to hold, including Cloudflare's, which cannot apply backpressure.
 
-What it cannot do: survive the sender's own process ending. The queue is in memory, as any persistence would make the SDK opinionated about storage. Applications that need that keep their own copies until they see the message acknowledged.
+What it cannot do: survive the sender's own process ending. The queue is in memory, as any persistence would make the SDK opinionated about storage. Applications that need that keep their own copies until they see the message acknowledged. Symmetrically, a *receiver* that restarts forgets what it had received but not yet acknowledged (at most 50 ms' worth), and gets it again: exactly once while both keep running, at least once across a receiver's restart.
 
 ## 5. Close is end-to-end; leave is just closing the socket
 
 The draft lists `leave` and `close` as relay operations. But a stateless relay cannot *enforce* that a room is over: it would forget on restart, and either peer could simply rejoin. So:
 
 - **leave** = close the WebSocket. The partner sees `PRESENCE(0)`. Nothing is lost.
-- **close** = a `CLOSE` at the end of the stream, which the partner trusts because it is authenticated. Being part of the stream, it is resent until acknowledged, and the record says "closing" so that even a restarted peer carries on.
+- **close** = a `CLOSE` at the end of the stream, which the partner trusts because it is authenticated. Being part of the stream, it is resent until acknowledged, and the record says "closing" so that even a restarted peer carries on. The partner acknowledges, then lingers until the closer leaves (at most 30 s), so that an acknowledgement lost with a dropped connection is repeated by the next handshake rather than lost for good. An inviter closing before pairing completes simply stays at the invite ID until it is told.
 
 A peer that is never online at the same time as the closer, after the closer gave up, is never told. That limit is inherent and stated in the spec, rather than papered over with a "closed rooms" list the relay would lose anyway.
 

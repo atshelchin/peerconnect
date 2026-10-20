@@ -48,7 +48,8 @@ pub struct Config {
     /// Connections beyond this are refused with HTTP 503.
     pub max_connections: usize,
     /// Connections from one client address (an IPv6 /64 counts as one)
-    /// beyond this are refused with HTTP 429.
+    /// beyond this are refused with HTTP 429. Many users can share one
+    /// address behind carrier-grade or corporate NAT: keep it generous.
     pub max_per_address: usize,
     /// Take the client address from the last `X-Forwarded-For` entry, as
     /// appended by a proxy in front of the relay. Only enable this behind
@@ -61,7 +62,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_connections: 10_000, max_per_address: 64, trust_proxy: false, queue_bytes: 256 << 10 }
+        Config { max_connections: 10_000, max_per_address: 256, trust_proxy: false, queue_bytes: 256 << 10 }
     }
 }
 

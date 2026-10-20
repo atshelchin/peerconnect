@@ -157,7 +157,9 @@ pub struct Room {
     closing: bool,
 }
 
-const RECORD_VERSION: u8 = 1;
+/// Bumped whenever the layout changes, so an old record is refused rather
+/// than misread.
+const RECORD_VERSION: u8 = 2;
 const HAS_PEER: u8 = 1;
 const PAIRED: u8 = 2;
 const CLOSING: u8 = 4;

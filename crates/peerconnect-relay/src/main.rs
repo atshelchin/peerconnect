@@ -5,7 +5,7 @@
 //! - `PEERCONNECT_LISTEN` — address to listen on (default `0.0.0.0:8080`)
 //! - `PEERCONNECT_MAX_CONNECTIONS` — concurrent WebSockets (default 10000)
 //! - `PEERCONNECT_MAX_PER_ADDRESS` — concurrent WebSockets per client
-//!   address, IPv6 counted per /64 (default 64)
+//!   address, IPv6 counted per /64 (default 256)
 //! - `PEERCONNECT_TRUST_PROXY=1` — take the client address from the last
 //!   `X-Forwarded-For` entry (only behind a proxy that sets it)
 //!

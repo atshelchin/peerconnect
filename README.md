@@ -39,7 +39,7 @@ cargo install worker-build
 cd crates/peerconnect-worker && npx wrangler deploy
 ```
 
-**Binary**: `cargo run --release -p peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 64, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`.
+**Binary**: `cargo run --release -p peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`.
 
 ### JavaScript (browsers, Node.js 22+, Deno, Bun)
 
@@ -137,7 +137,8 @@ What is covered:
 - **Test vectors.** Every value and wire byte is reproduced by an independent implementation built only from `SPEC.md` (`test-vectors/verify.mjs`).
 - **Simulation.** A deterministic simulation drives two peers and a relay through:
   - pairing and the move to the pair ID, including a lost confirmation and an inviter restarted mid-pairing;
-  - messages queued while apart, and no loss or duplication when connections are cut every few frames;
+  - messages queued while apart, and no loss or duplication when connections are cut every few frames, frames vanish silently, or old handshakes are replayed;
+  - randomized chaos (cuts, relay restarts, tampering, peers restarted from their records) checked against delivery properties over hundreds of seeds;
   - the window and the outbox limit;
   - closing a room while the other peer is away;
   - relay restarts, replacement, keepalive loss, lost handshakes, tampering and reconnection storms.
@@ -166,7 +167,7 @@ These are loopback numbers: they show the protocol's and the relay's own overhea
 
 ## Limitations
 
-- **The queue lives in the sender's memory.** Messages survive disconnections, relay restarts and any number of reconnections, but not the sending process: messages not yet acknowledged when it stops are lost. Applications that need delivery across restarts keep a copy until they see `Delivered`.
+- **The queue lives in the sender's memory.** Messages survive disconnections, relay restarts and any number of reconnections, but not the sending process: messages not yet acknowledged when it stops are lost. Applications that need delivery across restarts keep a copy until they see `Delivered`. Likewise a receiver that restarts may get again what it had received in its last ~50 ms: exactly once while both run, at least once across restarts.
 - **Ending a room needs both peers online once more.** `close()` keeps trying (and a closing record resumes after a restart) until the other peer acknowledges. A peer that never comes back while the closer is still trying is never told.
 - **Before pairing, the invite is a bearer credential.** Whoever uses it first pairs; the race is visible, since the rightful joiner never connects, but it is not prevented. Send invites over a private channel. After pairing they are useless.
 - **One relay per room.** If it is down, peers wait. They can move a room to another relay by agreeing on a new URL; there is no automatic failover.
@@ -174,7 +175,7 @@ These are loopback numbers: they show the protocol's and the relay's own overhea
   - It enforces the idle timeout lazily (when a room next wakes up), to keep hibernating rooms free.
   - It cannot apply backpressure (the runtime does not say how much it buffers). The 4 MiB window bounds honest peers; a dishonest one can at worst exhaust its own room's Durable Object.
   - Unjoined connections are capped per client address (4) and per room (64). Someone who knows a room ID and controls many addresses can still delay the room's peers; add Cloudflare rate-limiting rules if that matters.
-- **Not yet independently audited.** The design has had two rounds of adversarial review, and its vectors are reproduced by a second implementation written from the spec. Neither replaces an external cryptographic audit.
+- **Not yet independently audited.** The design has had several rounds of adversarial review, and its vectors are reproduced by a second implementation written from the spec. Neither replaces an external cryptographic audit.
 
 ## License
 

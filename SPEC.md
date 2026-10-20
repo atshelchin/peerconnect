@@ -259,16 +259,18 @@ The plaintext is a kind byte followed by data:
 
 A message is sent as zero or more MORE chunks followed by one FINAL chunk, each carrying 0 to 65,518 bytes (the largest plaintext, 65,519, minus the kind byte). An empty message is a single empty FINAL. The receiver concatenates chunks and delivers the message on FINAL. Messages are at most **16 MiB** (16,777,216 bytes); a receiver whose reassembled message would exceed that MUST treat it as a session failure. Receivers MUST ignore plaintexts with an unknown kind, or with no kind byte.
 
-**Numbering.** Each peer numbers what it sends, messages and its CLOSE alike, 0, 1, 2, … in its **stream**, which has a random non-zero 64-bit **stream id** chosen afresh whenever the peer starts. ACKs are not numbered. A sender keeps every message until the peer acknowledges it; its **base** is the id of the oldest one it still holds. A receiver tracks, for the stream id it last saw from the peer (`seen_stream`, 0 if none), the id of the next message it expects (`seen_next`).
+**Numbering.** Each peer numbers what it sends, messages and its CLOSE alike, 0, 1, 2, … in its **stream**, which has a random non-zero 64-bit **stream id** chosen afresh whenever the peer starts. ACKs are not numbered. A sender keeps every message until the peer acknowledges it; its **base** is the id of the oldest one it still holds. A receiver remembers, for each of the peer's streams it has seen recently (at least the last 16), its **position**: the id of the next message to deliver. Remembering several matters when two instances of the same peer take turns, or when a relay replays an old handshake: one stream's arrival must not move another's position.
 
-**Resuming.** Each side's handshake payload carries `stream`, `base`, `seen_stream`, `seen_next` as they stand when the handshake starts. When a session is established, each side:
+**Resuming.** Each side's handshake payload carries its `stream` and `base`, and one position: `seen_stream` and `seen_next`. The joiner, which cannot know the inviter's stream yet, gives its position in the inviter stream it saw most recently; the inviter, having read message 1, gives its position in the joiner's stream (or `seen_stream = 0` if it has none). When a session is established, each side:
 
 - *as a sender*, resumes from `max(theirs.seen_next, own base)` if `theirs.seen_stream` is its own stream id (and no further than its next unused id), and from its own `base` otherwise. Everything below that point is acknowledged.
-- *as a receiver*, expects next `max(own seen_next, theirs.base)` if `theirs.stream` equals its `seen_stream`, and otherwise adopts `theirs.stream` as `seen_stream` and expects `theirs.base` next.
+- *as a receiver*, numbers the messages that arrive from the point the sender resumes from, which it computes by the same rule from the same two payloads: `max(own seen_next, theirs.base)` if its own payload's `seen_stream` is `theirs.stream`, and `theirs.base` otherwise. It delivers only messages at or above its position in `theirs.stream` (`theirs.base` if it has none), and drops the rest as duplicates.
 
-Both sides compute the same numbers from the same two payloads, so message ids need not travel with messages: in a session, messages arrive in id order starting from the resume point.
+So message ids need not travel with messages: in a session, messages arrive in id order from a point both sides agree on.
 
-**Acknowledging.** A receiver sends ACK with `seen_next` within **50 ms** of delivering a message, and at once after delivering 32 messages or 1 MiB since its last ACK. A sender drops every message below an ACK's `next` and may report them as delivered.
+**Acknowledging.** A receiver sends ACK with its position in the current stream within **50 ms** of delivering a message, at once after delivering 32 messages or 1 MiB since its last ACK, and at least every **10 s** while it is receiving the chunks of a message. The joiner also sends ACK at once on every new session. A sender drops every message below an ACK's `next` and may report them as delivered.
+
+**Liveness.** A sender that has data in flight in a session and has received no ACK for **30 s** treats the session as broken (a frame lost, or the peer's side of it gone), closes its connection and reconnects; the stream resumes in the next session.
 
 **Flow control.** A sender transmits a message only while less than a **window** of **4 MiB** of what it has sent in the current session is unacknowledged (a single message may overrun the window). The window bounds what is ever in flight between two peers, whatever the relay does.
 
@@ -278,15 +280,15 @@ Both sides compute the same numbers from the same two payloads, so message ids n
 
 While both peers keep running, every message one sends is delivered to the other exactly once and in order, however often connections drop, relays restart or sessions are replaced; it reaches the other peer as soon as both are connected to the same relay at the same time. The relay is never trusted with this: it only ever sees ciphertext in flight.
 
-A peer that stops loses the messages it had not had acknowledged (§3.4). A peer that restarts gets a new stream id; the other peer then starts its count afresh, so nothing is mistaken for a duplicate.
+A peer that stops loses the messages it had not had acknowledged (§3.4). A peer that restarts gets a new stream id; the other peer then starts a new position for it, so nothing is mistaken for a duplicate. A restarted peer has also forgotten what it had received: messages it had received but not yet acknowledged (within the acknowledgement delay) are resent to it, so across a receiver's restart delivery is at least once. Applications that cannot tolerate that number their own messages.
 
 ### 5.5 Ending a room
 
 A peer ends a room by marking its record as closing, persisting it, and queueing a CLOSE in its stream, after any messages already queued. It accepts no further messages to send. Like any message, the CLOSE is resent until acknowledged: the peer keeps connecting until the other peer acknowledges it, and a peer started from a closing record queues the CLOSE again. Once acknowledged, the room is over for this peer.
 
-A peer that receives CLOSE acknowledges it at once, closes its connection, stops reconnecting, and reports the room as ended. Both peers then SHOULD delete their records.
+A peer that receives CLOSE acknowledges it at once, then stays until the other peer leaves, or for at most **30 s**, before it stops reconnecting and reports the room as ended; if its connection drops meanwhile, it reconnects, and the position in its next handshake acknowledges the CLOSE in case the ACK was lost. Both peers then SHOULD delete their records.
 
-CLOSE reaches the other peer only once both are connected at the same time: a closing peer that gives up, or deletes its record, before that never tells it.
+CLOSE reaches the other peer only once both are connected at the same time: a closing peer that gives up, or deletes its record, before that never tells it. And a closing peer whose acknowledgement was lost beyond recovery waits in vain; applications SHOULD bound how long they keep trying.
 
 Leaving a room for now, without ending it, is simply closing the WebSocket with 1000; the partner sees PRESENCE `0x00`.
 
@@ -309,7 +311,9 @@ A peer whose connection is closed with **4409** reports this to the application 
 A paired peer always uses the pair ID. Before pairing completes:
 
 - The **inviter** uses the invite ID. When pairing completes (§5.2), it closes its connection at once and reconnects at the pair ID; the session in progress ends, and its unacknowledged messages are resent there.
-- The **joiner** alternates between the invite ID and the pair ID, starting with the invite ID: it moves to the other one whenever it reconnects, whenever it has waited **20 s** alone in a room, and at once when the inviter leaves a session it had with it. Since the inviter is at the invite ID until paired and at the pair ID afterwards, the joiner finds it within one round of alternation, whichever of its messages were lost.
+- The **joiner** alternates between the invite ID and the pair ID, starting with the invite ID: it moves to the other one whenever it reconnects, whenever it has waited **20 s** alone in a room, and at once when the inviter leaves a session it had with it at the invite ID. Since the inviter is at the invite ID until paired and at the pair ID afterwards, the joiner finds it within one round of alternation, whichever of its messages were lost.
+
+A paired joiner uses the pair ID, but after **5 minutes** alone there it looks at the invite ID for 20 s. An inviter that crashed before persisting the completion of pairing comes back unpaired, at the invite ID; this is where the joiner finds it, completes pairing with it again, and follows it back to the pair ID.
 
 So the invite ID serves for pairing only, typically for one round trip, and the room then lives at an ID that the invite does not lead to.
 
@@ -320,7 +324,9 @@ So the invite ID serves for pairing only, typically for one round trip, and the 
 | Frame size | ≤ 65,536 bytes | relay (1009) |
 | Message size | ≤ 16 MiB | peers |
 | Window | 4 MiB unacknowledged per session | senders |
-| ACK delay | ≤ 50 ms, or at once after 32 messages / 1 MiB | receivers |
+| ACK delay | ≤ 50 ms, or at once after 32 messages / 1 MiB; ≥ every 10 s during a message | receivers |
+| ACK timeout | 30 s with data in flight | senders reconnect |
+| Linger after CLOSE | until the peer leaves, ≤ 30 s | the peer told to close |
 | `ping` interval | 25 s | peers send |
 | Join timeout | 10 s | relay (4408) |
 | Idle timeout | 90 s without any frame | relay (4408), optional |
@@ -329,7 +335,7 @@ So the invite ID serves for pairing only, typically for one round trip, and the 
 | Wait after 4409 | at least 30 s | peers |
 | Receive timeout | 60 s without any frame | peers |
 | Handshake timeout | 10 s for REPLY | joiner |
-| Rendezvous dwell | 20 s alone before trying the other ID | unpaired joiner |
+| Rendezvous dwell | 20 s alone before trying the other ID (5 min at the pair ID once paired) | joiner |
 
 Implementations also bound how much they queue for sending; the reference implementation refuses new messages while 64 MiB await acknowledgement.
 
@@ -362,7 +368,7 @@ A stateless relay cannot make an invite single-use, as that would require rememb
 
 ### 8.4 Handshake properties
 
-`IKpsk1` gives the joiner explicit authentication of the inviter on receipt of REPLY, and the inviter authentication of the joiner on receipt of INIT (through `ss` and the psk). INIT can be replayed by the relay: a replayed INIT makes the inviter run a handshake nobody can complete, and resume from the stale payload it carried. That can only make it resend messages the joiner has, which the joiner's resume rule discards, or nothing at all; the real joiner's next INIT restores the session. The joiner's identity is protected against passive observers and against active attackers who do not hold the inviter's identity key.
+`IKpsk1` gives the joiner explicit authentication of the inviter on receipt of REPLY, and the inviter authentication of the joiner on receipt of INIT (through `ss` and the psk). INIT can be replayed by the relay. A replayed INIT makes the inviter run a handshake nobody can complete, replacing its working session; it acts on the stale payload only for the stream that payload names, whose position it keeps separately from the current one (§5.3), so nothing is delivered twice. The broken session is noticed when either side next sends, or by the acknowledgement timeout, and the next handshake resumes the stream. The joiner's identity is protected against passive observers and against active attackers who do not hold the inviter's identity key.
 
 Both peers require knowledge of `S` (through the psk) in addition to their identity keys, so an attacker needs both a peer's identity key *and* the room secret to impersonate it.
 

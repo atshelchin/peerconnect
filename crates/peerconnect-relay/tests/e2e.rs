@@ -475,13 +475,17 @@ async fn slow_reader_still_gets_a_large_message() {
     state(&mut a, State::Connected).await;
     let big: Vec<u8> = (0..wire::MAX_MESSAGE_LEN).map(|i| i as u8).collect();
     a.send(big.clone()).await.unwrap();
+    let started = std::time::Instant::now();
     let received = 'read: loop {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let frame = next_binary(&mut b).await;
-        peer.handle_binary(0, &frame);
+        peer.handle_binary(started.elapsed().as_millis() as u64, &frame);
         while let Some(out) = peer.poll_output() {
-            if let peerconnect::Output::Event(Event::Message(m)) = out {
-                break 'read m;
+            match out {
+                // Progress acknowledgements keep the sender from giving up.
+                peerconnect::Output::Send(f) => b.send(Message::binary(f)).await.unwrap(),
+                peerconnect::Output::Event(Event::Message(m)) => break 'read m,
+                _ => {}
             }
         }
     };

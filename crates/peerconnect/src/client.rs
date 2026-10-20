@@ -154,6 +154,8 @@ async fn drive(
     // A send waiting for room in the outbox.
     let mut waiting: Option<(Vec<u8>, Reply)> = None;
     let mut controlled = true;
+    // close() was called: sends issued before it go first.
+    let mut closing = false;
 
     loop {
         if let Some((data, reply)) = waiting.take() {
@@ -162,6 +164,20 @@ async fn drive(
                 result => {
                     let _ = reply.send(result);
                 }
+            }
+        }
+        if closing && waiting.is_none() {
+            match commands.try_recv() {
+                Ok(command) => waiting = Some(command),
+                Err(_) => {
+                    closing = false;
+                    peer.close();
+                    let mut shared = room.lock().unwrap();
+                    *shared = peer.room().clone();
+                }
+            }
+            if waiting.is_some() {
+                continue;
             }
         }
         while let Some(output) = peer.poll_output() {
@@ -185,7 +201,12 @@ async fn drive(
                 }
                 Output::Event(event) => {
                     if event == Event::Paired {
-                        *room.lock().unwrap() = peer.room().clone();
+                        let mut shared = room.lock().unwrap();
+                        let closing = shared.is_closing(); // close() may have marked it already
+                        *shared = peer.room().clone();
+                        if closing {
+                            shared.set_closing();
+                        }
                     }
                     if events.send(event).is_err() {
                         peer.leave(); // nobody is listening any more
@@ -215,10 +236,8 @@ async fn drive(
                 waiting = Some((data, reply)); // tried at the top of the loop
             }
             control = control.recv(), if controlled => match control {
-                Some(Control::Close) => {
-                    peer.close();
-                    *room.lock().unwrap() = peer.room().clone();
-                }
+                // Takes effect once the sends issued before it are queued.
+                Some(Control::Close) => closing = true,
                 Some(Control::Leave) | None => {
                     controlled = false;
                     peer.leave();

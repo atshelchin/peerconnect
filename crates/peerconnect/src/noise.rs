@@ -91,7 +91,55 @@ impl Initiator {
     }
 }
 
+/// Responder side, having read the initiator's first message.
+pub struct Responder {
+    state: SymmetricState,
+    re: PublicKey,
+    /// The initiator's static public key, authenticated by the handshake.
+    pub peer: PublicKey,
+    /// The payload of the initiator's first message.
+    pub payload: Vec<u8>,
+}
+
+impl Responder {
+    /// Reads the initiator's first message.
+    pub fn read(s: &StaticSecret, psk: &[u8; 32], msg: &[u8]) -> Result<Responder, Error> {
+        if msg.len() < INIT_LEN {
+            return Err(Error);
+        }
+        let mut st = SymmetricState::new();
+        st.mix_hash(PublicKey::from(s).as_bytes());
+
+        let re = PublicKey::from(<[u8; 32]>::try_from(&msg[..KEY_LEN]).unwrap());
+        st.mix_hash(re.as_bytes());
+        st.mix_key(re.as_bytes());
+        st.mix_key(&dh(s, &re)?);
+        let rs = st.decrypt_and_hash(&msg[KEY_LEN..KEY_LEN * 2 + TAG_LEN])?;
+        let rs = PublicKey::from(<[u8; 32]>::try_from(rs.as_slice()).unwrap());
+        st.mix_key(&dh(s, &rs)?);
+        st.mix_key_and_hash(psk);
+        let payload = st.decrypt_and_hash(&msg[KEY_LEN * 2 + TAG_LEN..])?;
+        Ok(Responder { state: st, re, peer: rs, payload })
+    }
+
+    /// Writes the reply, which carries `payload`, and completes the handshake.
+    pub fn reply(self, e: StaticSecret, payload: &[u8]) -> Result<(Vec<u8>, Transport), Error> {
+        let mut st = self.state;
+        let mut reply = Vec::with_capacity(REPLY_LEN + payload.len());
+        let e_pub = PublicKey::from(&e);
+        reply.extend_from_slice(e_pub.as_bytes());
+        st.mix_hash(e_pub.as_bytes());
+        st.mix_key(e_pub.as_bytes());
+        st.mix_key(&dh(&e, &self.re)?);
+        st.mix_key(&dh(&e, &self.peer)?);
+        st.encrypt_and_hash(payload, &mut reply)?;
+        let (recv, send) = st.split();
+        Ok((reply, Transport { send, recv }))
+    }
+}
+
 /// The outcome of a responder processing an initiator's first message.
+#[cfg(test)]
 pub struct Response {
     /// The initiator's static public key, authenticated by the handshake.
     pub peer: PublicKey,
@@ -102,8 +150,9 @@ pub struct Response {
     pub transport: Transport,
 }
 
-/// Responder side: reads the first message and immediately produces the
+/// Responder side in one step: reads the first message and produces the
 /// reply, which carries `payload`.
+#[cfg(test)]
 pub fn respond(
     s: &StaticSecret,
     psk: &[u8; 32],
@@ -111,33 +160,10 @@ pub fn respond(
     e: StaticSecret,
     payload: &[u8],
 ) -> Result<Response, Error> {
-    if msg.len() < INIT_LEN {
-        return Err(Error);
-    }
-    let mut st = SymmetricState::new();
-    st.mix_hash(PublicKey::from(s).as_bytes());
-
-    let re = PublicKey::from(<[u8; 32]>::try_from(&msg[..KEY_LEN]).unwrap());
-    st.mix_hash(re.as_bytes());
-    st.mix_key(re.as_bytes());
-    st.mix_key(&dh(s, &re)?);
-    let rs = st.decrypt_and_hash(&msg[KEY_LEN..KEY_LEN * 2 + TAG_LEN])?;
-    let rs = PublicKey::from(<[u8; 32]>::try_from(rs.as_slice()).unwrap());
-    st.mix_key(&dh(s, &rs)?);
-    st.mix_key_and_hash(psk);
-    let initiator_payload = st.decrypt_and_hash(&msg[KEY_LEN * 2 + TAG_LEN..])?;
-
-    let mut reply = Vec::with_capacity(REPLY_LEN);
-    let e_pub = PublicKey::from(&e);
-    reply.extend_from_slice(e_pub.as_bytes());
-    st.mix_hash(e_pub.as_bytes());
-    st.mix_key(e_pub.as_bytes());
-    st.mix_key(&dh(&e, &re)?);
-    st.mix_key(&dh(&e, &rs)?);
-    st.encrypt_and_hash(payload, &mut reply)?;
-
-    let (recv, send) = st.split();
-    Ok(Response { peer: rs, payload: initiator_payload, reply, transport: Transport { send, recv } })
+    let responder = Responder::read(s, psk, msg)?;
+    let (peer, initiator_payload) = (responder.peer, responder.payload.clone());
+    let (reply, transport) = responder.reply(e, payload)?;
+    Ok(Response { peer, payload: initiator_payload, reply, transport })
 }
 
 /// The pair of cipher states produced by a completed handshake.
