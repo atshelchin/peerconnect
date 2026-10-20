@@ -1,0 +1,30 @@
+{
+  "description": "PeerConnect v1 test vectors. Byte strings are hex unless named *_text. Key pairs are given by their private keys; X25519 private keys are used as-is (clamping happens inside X25519).",
+  "relay_url": "wss://relay.example.com",
+  "room_secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "room_seed": "2b48250e9bd591044705ff318c49e6ce40dca526787107d5ecdeab9bdd2d2639",
+  "room_id": "1ca14be7bdabb2639db7af986f42161822790aa126e58284666bc73f128538cb",
+  "room_id_text": "HKFL572rsmOdt6-Yb0IWGCJ5CqEm5YKEZmvHPxKFOMs",
+  "psk": "bb273891e19b4550b99c49a38a632b4f5d6e3423d72bb009954b9aea175d8c21",
+  "endpoint": "wss://relay.example.com/v1/HKFL572rsmOdt6-Yb0IWGCJ5CqEm5YKEZmvHPxKFOMs",
+  "inviter_identity_private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "inviter_identity_public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254",
+  "invite": "wss://relay.example.com#AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh81gHLWNliA0a7qMprfkSE4OFHtIaKOO3XpZdDSzRZiVA",
+  "hello_nonce": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+  "hello_frame": "80a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+  "join_frame_inviter": "8100cfabfbfa29511b4b4dafc66a6d0c640e2d0496bb23a3a4d4176020ed9dee714c6bd336cde04e89d7f369b02d45a72c65999776f19664b45ced39effb9e28c40f",
+  "join_frame_joiner": "8101fe54282fbc55312a03236132cde39f069fe5058fb27d2a667b385b18c2ef6045cc4bf26bf3a2b6f158f3ee269666b693d3af847c21d1b3406d5eb6ef23d87608",
+  "joiner_identity_private": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+  "joiner_identity_public": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a",
+  "joiner_ephemeral_private": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+  "inviter_ephemeral_private": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+  "init_frame": "01675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f8a20f977467b8f02d3a69c1f5dd368d76deaad0f1e3846edf85e884ad1dcb5355503e890db8a8c54765535485690aa3f845abf96b1d7f9e63a1a344bc078342a",
+  "reply_frame": "02493e82fc74464a59268817623d2053c5eb8e2cc4a988b4fee179ec6b010d531d9f4cb596efcc3127bda87f6bd0c75515",
+  "messages": [
+    { "direction": "joiner->inviter", "message": "utf8:hello", "frames": ["032f3f4bfb69e69c93869eab48c23a05de73f9c5d7e17d"] },
+    { "direction": "inviter->joiner", "message": "utf8:", "frames": ["039b2c28d9ea2c95b178e21066d02f4e3197"] },
+    { "direction": "joiner->inviter", "message": "100000 bytes: byte i = i mod 251", "frames_sha256": ["64172df35c77c44e109b5fbba4f76b56de41688bfc1ced5c5e938ed5ce7741a9", "f08cc2e1550a8bd2608846ab2eeaa4d0d7ddc118fb41a3f1b75ba823bcb30306"] },
+    { "direction": "inviter->joiner", "message": "utf8:world", "frames": ["037307c1c18f99611e1519c6c7d7d05ff7f1954e39dd56"] },
+    { "direction": "inviter->joiner", "message": "CLOSE", "frames": ["0356273b9cb1f3ef0711acd6562a713aecf0"] }
+  ]
+}

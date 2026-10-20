@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/peerconnect", "crates/peerconnect-relay", "crates/peerconnect-worker", "crates/peerconnect-wasm"]
+# The worker and the JS bindings only build for wasm32.
+default-members = ["crates/peerconnect", "crates/peerconnect-relay"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/peerconnect/peerconnect"
+rust-version = "1.91"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Size-optimized build for the JavaScript SDK.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+panic = "abort"

@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PeerConnect browser check</title>
+<pre id="log">running…</pre>
+<script type="module">
+  // Open with ?relay=ws://host:port; reports into #log and window.result.
+  import { connect, Room } from "../index.js";
+  const relay = new URLSearchParams(location.search).get("relay") ?? "ws://127.0.0.1:8080";
+  const log = (line) => (document.getElementById("log").textContent += "\n" + line);
+  const state = (c, s) => new Promise((r) => c.addEventListener("state", () => c.state === s && r()));
+  const message = (c) => new Promise((r) => c.addEventListener("message", (e) => r(e.data), { once: true }));
+  try {
+    const t0 = performance.now();
+    const room = Room.create(relay);
+    const a = connect(room);
+    await state(a, "waiting");
+    const b = connect(Room.join(room.invite));
+    await Promise.all([state(a, "connected"), state(b, "connected")]);
+    log(`paired in ${(performance.now() - t0).toFixed(1)} ms`);
+    const hello = message(b);
+    a.send("hello from the browser");
+    const text = new TextDecoder().decode(await hello);
+    const big = new Uint8Array(1_000_000).map((_, i) => i % 251);
+    const echoed = message(a);
+    b.send(big);
+    const back = await echoed;
+    const same = back.length === big.length && back.every((x, i) => x === big[i]);
+    a.close();
+    window.result = { ok: text === "hello from the browser" && same, text, bigOk: same, agent: navigator.userAgent };
+    log(JSON.stringify(window.result));
+  } catch (e) {
+    window.result = { ok: false, error: String(e) };
+    log("error: " + e);
+  }
+</script>

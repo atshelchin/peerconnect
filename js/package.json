@@ -1,0 +1,20 @@
+{
+  "name": "peerconnect",
+  "version": "1.0.0",
+  "description": "PeerConnect: two peers, one room, end-to-end encrypted over an untrusted WebSocket relay",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "dist/"],
+  "sideEffects": false,
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "sh scripts/build.sh",
+    "test": "node --test"
+  }
+}

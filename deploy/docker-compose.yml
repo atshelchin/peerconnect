@@ -1,0 +1,20 @@
+# A relay with automatic HTTPS: set DOMAIN to a name pointing at this host,
+#   DOMAIN=relay.example.com docker compose up -d
+# and use wss://relay.example.com as the relay URL.
+services:
+  relay:
+    build: ..
+    restart: unless-stopped
+    environment:
+      PEERCONNECT_MAX_CONNECTIONS: "10000"
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the relay's host name}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+volumes:
+  caddy-data:
