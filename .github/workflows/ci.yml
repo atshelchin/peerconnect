@@ -39,6 +39,26 @@ jobs:
       - run: npm test
         working-directory: js
 
+  website:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@v2
+      - name: Install the wasm-bindgen CLI matching Cargo.lock
+        run: cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid -p wasm-bindgen | sed 's/.*@//')"
+      - run: sh js/scripts/build.sh
+      - working-directory: website
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun run lint
+          bunx vitest --run
+          bunx playwright install --with-deps chromium
+          bunx playwright test
+
   cloudflare:
     runs-on: ubuntu-latest
     steps:

@@ -3,3 +3,4 @@ crates/peerconnect-worker/build
 **/node_modules
 **/.wrangler
 js/dist
+website

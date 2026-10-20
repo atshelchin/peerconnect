@@ -1,0 +1,11 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"strict": true,
+		// The generated worker-configuration.d.ts imports the built worker, which
+		// would otherwise have the whole build output type-checked as JavaScript.
+		"checkJs": false,
+		"types": ["$app/types", "node", "./worker-configuration.d.ts"]
+	},
+	"include": ["src", "vite.config.ts", "playwright.config.ts"]
+}

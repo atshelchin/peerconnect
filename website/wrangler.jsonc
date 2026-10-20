@@ -1,0 +1,15 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "peerconnect-website",
+	"compatibility_date": "2026-10-20",
+	"compatibility_flags": ["nodejs_als"],
+	"main": ".svelte-kit/cloudflare/_worker.js",
+	"assets": {
+		"binding": "ASSETS",
+		"directory": ".svelte-kit/cloudflare"
+	},
+	// Served at peerconnect.dev only: a second host would duplicate every page.
+	"routes": [{ "pattern": "peerconnect.dev", "custom_domain": true }],
+	"workers_dev": false,
+	"preview_urls": true
+}

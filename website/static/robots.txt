@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://peerconnect.dev/sitemap.xml

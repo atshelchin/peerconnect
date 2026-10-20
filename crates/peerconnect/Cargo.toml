@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["e2ee", "noise", "websocket", "relay", "pairing"]
+categories = ["cryptography", "network-programming"]
 
 [dependencies]
 chacha20poly1305 = { version = "0.11", default-features = false }
@@ -26,6 +30,9 @@ tokio-tungstenite = { version = "0.30", optional = true, default-features = fals
 snow = "0.10"
 base64 = "0.23"
 tokio = { version = "1", features = ["macros", "rt", "io-std", "io-util"] }
+
+[package.metadata.docs.rs]
+features = ["client"]
 
 [[example]]
 name = "chat"

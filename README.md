@@ -39,9 +39,13 @@ cargo install worker-build
 cd crates/peerconnect-worker && npx wrangler deploy
 ```
 
-**Binary**: `cargo run --release -p peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`.
+**Binary**: `cargo install peerconnect-relay`, then run `peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`.
 
 ### JavaScript (browsers, Node.js 22+, Deno, Bun)
+
+```sh
+npm install peerconnect
+```
 
 ```js
 import { connect, Room } from "peerconnect";
@@ -67,12 +71,12 @@ connB.addEventListener("delivered", (e) => console.log("A has everything below",
 // To end the room: conn.close(), save conn.room (it is now "closing"), delete it once closed.
 ```
 
-Build the package with `sh js/scripts/build.sh` (needs `wasm-bindgen-cli`); the WebAssembly is inlined, so it loads without bundler configuration. 46 KB gzipped.
+The WebAssembly is inlined, so the package loads without bundler configuration (46 KB gzipped). To build it from source: `sh js/scripts/build.sh` (needs `wasm-bindgen-cli`).
 
 ### Rust
 
 ```toml
-peerconnect = { version = "1", features = ["client"] }
+peerconnect = { version = "0.1", features = ["client"] }
 ```
 
 ```rust
@@ -121,6 +125,7 @@ The design decisions, and how they differ from the original draft, are explained
 | [`crates/peerconnect-worker`](crates/peerconnect-worker) | Relay for Cloudflare Workers and Durable Objects |
 | [`crates/peerconnect-wasm`](crates/peerconnect-wasm), [`js/`](js) | JavaScript SDK |
 | [`deploy/`](deploy) | docker-compose with automatic HTTPS |
+| [`website/`](website) | [peerconnect.dev](https://peerconnect.dev): introduction, guide, specification and live demo, in English and Chinese |
 
 ## Testing
 

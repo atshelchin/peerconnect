@@ -5,10 +5,11 @@ members = ["crates/peerconnect", "crates/peerconnect-relay", "crates/peerconnect
 default-members = ["crates/peerconnect", "crates/peerconnect-relay"]
 
 [workspace.package]
-version = "1.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/peerconnect/peerconnect"
+repository = "https://github.com/atshelchin/peerconnect"
+homepage = "https://peerconnect.dev"
 rust-version = "1.91"
 
 [profile.release]

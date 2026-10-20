@@ -1,12 +1,16 @@
 # peerconnect (JavaScript)
 
-Two peers, one room, end-to-end encrypted, reliable messaging over an untrusted WebSocket relay. Works in browsers, Node.js 22+, Deno and Bun. The protocol runs in WebAssembly compiled from the Rust implementation (46 KB gzipped, inlined, so no bundler setup is needed). See the [repository README](../README.md) and the [specification](../SPEC.md).
+Two peers, one room, end-to-end encrypted, reliable messaging over an untrusted WebSocket relay. Works in browsers, Node.js 22+, Deno and Bun. The protocol runs in WebAssembly compiled from the Rust implementation (46 KB gzipped, inlined, so no bundler setup is needed). Guide, specification and a live demo: <https://peerconnect.dev>.
+
+```sh
+npm install peerconnect
+```
 
 ```js
 import { connect, Room } from "peerconnect";
 
 // Inviter
-const room = Room.create("wss://relay.example.com");
+const room = Room.create("wss://relay.peerconnect.dev"); // public test relay, or run your own
 const invite = room.invite;                 // hand this to the other peer, e.g. as a QR code
 const a = connect(room);
 a.addEventListener("paired", () => save(a.room.toString()));  // a secret: store it like a password
@@ -51,7 +55,13 @@ Messages are delivered in order, exactly once, as long as both sides keep runnin
 
 ## Building
 
+From a clone of [the repository](https://github.com/atshelchin/peerconnect):
+
 ```sh
 sh scripts/build.sh   # needs Rust with the wasm32-unknown-unknown target and wasm-bindgen-cli
 npm test              # runs against the Rust relay in ../target/debug (cargo build first)
 ```
+
+## License
+
+MIT OR Apache-2.0, at your option.
