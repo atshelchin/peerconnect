@@ -10,6 +10,7 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,6 +25,7 @@ jobs:
 
   javascript:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,6 +43,7 @@ jobs:
 
   website:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,6 +64,7 @@ jobs:
 
   cloudflare:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,15 +74,18 @@ jobs:
         with:
           node-version: 22
       - run: cargo install worker-build --locked
+      # Compile the tests first, so the build does not compete with workerd.
+      - run: cargo test -p peerconnect-relay --test e2e --no-run
       - name: Run the Worker locally and test it
         working-directory: crates/peerconnect-worker
         run: |
           npx --yes wrangler@4 dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
           for i in $(seq 1 180); do curl -sf http://127.0.0.1:8787/ && break; sleep 2; done
-          PEERCONNECT_RELAY=ws://127.0.0.1:8787 cargo test -p peerconnect-relay --test e2e
+          PEERCONNECT_RELAY=ws://127.0.0.1:8787 cargo test -p peerconnect-relay --test e2e || { cat wrangler.log; exit 1; }
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t peerconnect-relay .
