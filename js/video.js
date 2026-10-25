@@ -10,6 +10,13 @@
 // Each video frame is `codec[1] ‖ encoded chunk` (GROUP.md §7.4): 1 VP8,
 // 2 VP9, 3 H.264 (Annex B), 4 AV1. Timestamps are milliseconds on the
 // sender's clock.
+//
+// Frames are drawn upright before they are encoded: a phone held upright
+// gives the camera's sideways picture plus a note to turn it, which a
+// <video> element follows and an encoder does not; drawing the element
+// follows it. The encoded size follows the picture's shape (270 × 480 for
+// a phone held upright), and `setRotation` turns what we send by hand,
+// `rotateView` what we show of someone else.
 
 const CODECS = [
   { id: 1, codec: "vp8" },
@@ -37,13 +44,17 @@ export class Video extends EventTarget {
   #track;
   #codec = null;
   #encoder = null;
-  #reader = null;
   #element = null;
   #timer = undefined;
+  /** What we draw each frame on before encoding it, and its size. */
+  #canvas = null;
+  #size = null;
+  /** Quarter turns, clockwise: of what we send, and of what we show of each member. */
+  #rotation = 0;
+  #views = new Map();
   #sending = true;
   #keyframeDue = true;
   #lastKeyframe = 0;
-  #lastFrame = -Infinity;
   #bitrate;
   #requests = [];
   #raisedAt = 0;
@@ -97,7 +108,10 @@ export class Video extends EventTarget {
     if (track) await this.#startSending(track);
   }
 
-  /** Draws `member`'s video into `canvas` from now on (`null` to stop). */
+  /**
+   * Draws `member`'s video into `canvas` from now on (`null` to stop). Our
+   * own member ID shows what we send, as others will see it.
+   */
   attach(member, canvas) {
     if (canvas) this.#canvases.set(member, canvas);
     else this.#canvases.delete(member);
@@ -112,6 +126,28 @@ export class Video extends EventTarget {
     this.#stopSending();
     const track = stream?.getVideoTracks()[0];
     if (track) await this.#startSending(track);
+  }
+
+  /** Turns what we send by `degrees` clockwise (0, 90, 180 or 270), for everyone. */
+  setRotation(degrees) {
+    this.#rotation = quarter(degrees);
+  }
+
+  /** The rotation of what we send, in degrees. */
+  get rotation() {
+    return this.#rotation * 90;
+  }
+
+  /** Turns how we show `member`'s video by `degrees` clockwise, for us only. */
+  rotateView(member, degrees) {
+    const turns = quarter(degrees);
+    if (turns) this.#views.set(member, turns);
+    else this.#views.delete(member);
+  }
+
+  /** How we show `member`'s video, in degrees. */
+  viewRotation(member) {
+    return (this.#views.get(member) ?? 0) * 90;
   }
 
   /** Pauses or resumes sending (the camera stays open). */
@@ -141,8 +177,6 @@ export class Video extends EventTarget {
 
   #stopSending() {
     clearTimeout(this.#timer);
-    this.#reader?.cancel().catch(() => {});
-    this.#reader = null;
     if (this.#element) {
       this.#element.pause();
       this.#element.srcObject = null;
@@ -160,69 +194,69 @@ export class Video extends EventTarget {
       output: (chunk) => this.#output(chunk),
       error: (e) => this.dispatchEvent(new CustomEvent("error", { detail: e })),
     });
-    this.#configure();
-    if (typeof MediaStreamTrackProcessor === "function") {
-      // Frames straight from the camera (Chromium).
-      const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
-      this.#reader = reader;
-      (async () => {
-        for (;;) {
-          const { value, done } = await reader.read().catch(() => ({ done: true }));
-          if (done) return;
-          if (this.#reader === reader) this.#encode(value);
-          else value.close();
-        }
-      })();
-    } else {
-      // Elsewhere: through a <video> element, at our frame rate.
-      const element = document.createElement("video");
-      this.#element = element;
-      element.muted = true;
-      element.playsInline = true;
-      element.srcObject = new MediaStream([track]);
-      await element.play();
-      const tick = () => {
-        if (this.#element !== element) return;
-        if (element.readyState >= 2) this.#encode(new VideoFrame(element, { timestamp: performance.now() * 1000 }));
-        this.#timer = setTimeout(tick, 1000 / framerate);
-      };
-      tick();
-    }
+    this.#size = null; // configured for the first frame's shape
+    // The camera through a <video> element, which turns it upright, drawn
+    // at our frame rate.
+    const element = document.createElement("video");
+    this.#element = element;
+    element.muted = true;
+    element.playsInline = true;
+    element.srcObject = new MediaStream([track]);
+    await element.play();
+    this.#canvas ??= typeof OffscreenCanvas === "function" ? new OffscreenCanvas(2, 2) : document.createElement("canvas");
+    const tick = () => {
+      if (this.#element !== element) return;
+      if (element.readyState >= 2 && element.videoWidth) this.#capture(element);
+      this.#timer = setTimeout(tick, 1000 / framerate);
+    };
+    tick();
   }
 
-  #configure() {
-    const { width, height, framerate } = this.#options;
-    this.#encoder.configure({
-      codec: this.#codec.codec,
-      width,
-      height,
-      bitrate: this.#bitrate,
-      framerate,
-      latencyMode: "realtime",
-      ...(this.#codec.avc ? { avc: this.#codec.avc } : {}),
-    });
-    this.#keyframeDue = true;
-  }
-
-  #encode(frame) {
+  /** Draws the camera's picture upright, turned as asked, and encodes it. */
+  #capture(element) {
     const now = performance.now();
-    const due = now - this.#lastFrame >= 1000 / this.#options.framerate - 2;
-    // Skip frames over our rate, while paused, and while the encoder is behind.
     const encoder = this.#encoder;
-    if (!this.#sending || !due || encoder?.state !== "configured" || encoder.encodeQueueSize > 2) {
-      if (due && this.#sending) this.#stats.skipped++;
-      frame.close();
+    // Skip frames while paused, and while the encoder is behind.
+    if (!this.#sending || !encoder || encoder.state === "closed" || encoder.encodeQueueSize > 2) {
+      if (this.#sending) this.#stats.skipped++;
       return;
     }
-    this.#lastFrame = now;
+    const turned = this.#rotation % 2 === 1;
+    const [sw, sh] = turned ? [element.videoHeight, element.videoWidth] : [element.videoWidth, element.videoHeight];
+    const [w, h] = fit(sw, sh, this.#options);
+    if (this.#size?.[0] !== w || this.#size?.[1] !== h) {
+      this.#size = [w, h];
+      this.#configure(); // a new shape: a new configuration, and a keyframe
+    }
+    const canvas = this.#canvas;
+    if (canvas.width !== w || canvas.height !== h) [canvas.width, canvas.height] = [w, h];
+    draw(canvas.getContext("2d"), element, w, h, this.#rotation);
+    const frame = new VideoFrame(canvas, { timestamp: Math.round(now * 1000) });
+    const preview = this.#canvases.get(this.#conn.id);
+    if (preview) copyTo(preview, canvas, w, h);
     const keyFrame = this.#keyframeDue || now - this.#lastKeyframe >= this.#options.keyframeInterval;
     if (keyFrame) {
       this.#keyframeDue = false;
       this.#lastKeyframe = now;
     }
-    this.#encoder.encode(frame, { keyFrame });
+    encoder.encode(frame, { keyFrame });
     frame.close();
     this.#raise(now);
+  }
+
+  #configure() {
+    if (!this.#size || !this.#encoder || this.#encoder.state === "closed") return;
+    const [width, height] = this.#size;
+    this.#encoder.configure({
+      codec: this.#codec.codec,
+      width,
+      height,
+      bitrate: this.#bitrate,
+      framerate: this.#options.framerate,
+      latencyMode: "realtime",
+      ...(this.#codec.avc ? { avc: this.#codec.avc } : {}),
+    });
+    this.#keyframeDue = true;
   }
 
   #output(chunk) {
@@ -292,11 +326,10 @@ export class Video extends EventTarget {
     stats.height = frame.displayHeight;
     const canvas = this.#canvases.get(member);
     if (canvas) {
-      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-        canvas.width = frame.displayWidth;
-        canvas.height = frame.displayHeight;
-      }
-      canvas.getContext("2d").drawImage(frame, 0, 0);
+      const turns = this.#views.get(member) ?? 0;
+      const [w, h] = turns % 2 ? [frame.displayHeight, frame.displayWidth] : [frame.displayWidth, frame.displayHeight];
+      if (canvas.width !== w || canvas.height !== h) [canvas.width, canvas.height] = [w, h];
+      draw(canvas.getContext("2d"), frame, w, h, turns);
     }
     if (this.#options.onFrame) this.#options.onFrame(member, frame, track);
     else frame.close();
@@ -307,6 +340,39 @@ export class Video extends EventTarget {
     if (decoder && decoder.state !== "closed") decoder.close();
     this.#decoders.delete(member);
   }
+}
+
+/** 0–3 quarter turns from degrees. */
+function quarter(degrees) {
+  return ((Math.round(degrees / 90) % 4) + 4) % 4;
+}
+
+/**
+ * The size to encode a picture of `sw` × `sh` at: within the configured
+ * size, turned to the picture's shape (a tall picture gets a tall size),
+ * keeping its proportions, in even numbers.
+ */
+function fit(sw, sh, { width, height }) {
+  const long = Math.max(width, height);
+  const short = Math.min(width, height);
+  const scale = Math.min(1, sw >= sh ? Math.min(long / sw, short / sh) : Math.min(short / sw, long / sh));
+  const even = (v) => Math.max(2, Math.round((v * scale) / 2) * 2);
+  return [even(sw), even(sh)];
+}
+
+/** Draws `source` into a `w` × `h` context, turned `turns` quarter turns clockwise. */
+function draw(ctx, source, w, h, turns) {
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate((turns * Math.PI) / 2);
+  const [dw, dh] = turns % 2 ? [h, w] : [w, h];
+  ctx.drawImage(source, -dw / 2, -dh / 2, dw, dh);
+  ctx.restore();
+}
+
+function copyTo(target, source, w, h) {
+  if (target.width !== w || target.height !== h) [target.width, target.height] = [w, h];
+  target.getContext("2d").drawImage(source, 0, 0);
 }
 
 /** The first codec of the preference (or the default order) that this browser encodes. */

@@ -340,7 +340,9 @@ export const en = {
 			theirHearingOff: '{name} turned their headphones off and hears nobody',
 			cameraOn: 'Turn your camera off',
 			cameraOff: 'Turn your camera on: everyone sees you',
-			video: 'Video from {name}'
+			video: 'Video from {name}',
+			rotateMine: 'Turn your picture a quarter turn, for everyone',
+			rotateTheirs: 'Turn {name}’s picture a quarter turn (only for you)'
 		},
 		invite: {
 			title: 'Invite',

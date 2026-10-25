@@ -102,15 +102,20 @@ test('the camera turns on and off from our own card', async ({ page }) => {
 	await page.getByLabel('Your name').fill('Alice');
 	await page.getByRole('button', { name: 'Join with microphone' }).click();
 	const mine = page.locator('.person.mine');
-	await expect(mine.locator('video')).toHaveCount(0); // off until asked
+	await expect(mine.locator('.screen')).toHaveCount(0); // off until asked
 	await page.getByRole('button', { name: 'Turn your camera on: everyone sees you' }).click();
-	const preview = mine.locator('video.screen');
+	// What we send, as the others will see it: the fake camera is wide.
+	const preview = mine.locator('canvas.screen');
 	await expect(preview).toBeVisible();
-	await expect
-		.poll(() => preview.evaluate((v: HTMLVideoElement) => v.videoWidth), { timeout: 10_000 })
-		.toBeGreaterThan(0);
+	const size = () => preview.evaluate((c: HTMLCanvasElement) => [c.width, c.height]);
+	await expect.poll(size, { timeout: 10_000 }).toEqual([480, 270]);
+	// Turned a quarter turn, for everyone: tall.
+	await page
+		.getByRole('button', { name: 'Turn your picture a quarter turn, for everyone' })
+		.click();
+	await expect.poll(size, { timeout: 10_000 }).toEqual([270, 480]);
 	await page.getByRole('button', { name: 'Turn your camera off' }).click();
-	await expect(mine.locator('video')).toHaveCount(0);
+	await expect(mine.locator('.screen')).toHaveCount(0);
 });
 
 // Through the public relay too: run with PEERCONNECT_DEMO_E2E=1.
@@ -154,6 +159,14 @@ test('two browsers see each other on their cards', async ({ browser }) => {
 	// And nothing on Bob's own card, nor on Alice's view of Bob.
 	await expect(b.locator('.person.mine .screen')).toHaveCount(0);
 	await expect(a.locator('.person', { hasText: 'Bob' }).locator('.screen')).toHaveCount(0);
+
+	// Bob turns Alice's picture for himself: tall on his page.
+	await b
+		.getByRole('button', { name: 'Turn Alice’s picture a quarter turn (only for you)' })
+		.click();
+	await expect
+		.poll(() => screen.evaluate((c: HTMLCanvasElement) => c.height > c.width), { timeout: 10_000 })
+		.toBe(true);
 
 	// When she turns it off, her video goes from Bob's page.
 	await a.getByRole('button', { name: 'Turn your camera off' }).click();

@@ -137,6 +137,16 @@ try {
       });
   void pinned;
 
+  // A camera held upright stays upright, and the picture turns on request.
+  const shape = await page.evaluate((relay) => window.shape({ relay }), `ws://127.0.0.1:${port}`);
+  console.log("tall picture:", JSON.stringify(shape));
+  assert.ok(shape.upright.height > shape.upright.width, "sent tall");
+  assert.equal(shape.upright.top, "red", "and upright");
+  assert.ok(shape.turned.width > shape.turned.height, "turned by the sender: wide");
+  assert.equal(shape.turned.left, "blue", "a quarter turn clockwise puts the top on the right");
+  assert.ok(shape.viewed.width > shape.viewed.height, "turned by the receiver: wide");
+  assert.equal(shape.viewed.left, "red", "three quarter turns put the top on the left");
+
   const ws = await run("video, WebSocket", { relay: `ws://127.0.0.1:${port}` });
   const wt = await run("video, WebTransport", { relay: `https://127.0.0.1:${port}`, webTransport: true });
   tcp.lossChance = 0.02;

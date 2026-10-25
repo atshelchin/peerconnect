@@ -8,6 +8,62 @@
 
   // Two members in one page: a sends the (fake) camera, b decodes it. For
   // each frame, the time from a handing it to the group to b decoding it.
+  // A camera held upright: a tall picture, red above and blue below.
+  function portrait() {
+    const canvas = document.createElement("canvas");
+    [canvas.width, canvas.height] = [280, 480];
+    const ctx = canvas.getContext("2d");
+    const paint = () => {
+      ctx.fillStyle = "#e00000";
+      ctx.fillRect(0, 0, 280, 240);
+      ctx.fillStyle = "#0000e0";
+      ctx.fillRect(0, 240, 280, 240);
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, (performance.now() / 10) % 280, 8); // something moving
+    };
+    paint();
+    setInterval(paint, 50);
+    return canvas.captureStream(20);
+  }
+
+  /** The colour (r, g, b) at a point of a canvas, from 0 to 1 across and down. */
+  function at(canvas, x, y) {
+    const [r, g, b] = canvas.getContext("2d").getImageData(Math.floor(x * canvas.width), Math.floor(y * canvas.height), 1, 1).data;
+    return r > 150 && b < 100 ? "red" : b > 150 && r < 100 ? "blue" : "other";
+  }
+
+  // The tall picture goes out tall and upright; then turned, by the sender
+  // for everyone and by a receiver for itself.
+  window.shape = async ({ relay }) => {
+    const group = Group.create(relay);
+    const a = joinGroup(group, { profile: "a" });
+    const b = joinGroup(group, { profile: "b" });
+    await new Promise((resolve) => {
+      const check = () => a.members.size && b.members.size && resolve();
+      a.addEventListener("joined", check);
+      b.addEventListener("joined", check);
+    });
+    const shown = document.createElement("canvas");
+    const va = await startVideo(a, { stream: portrait(), width: 480, height: 270, framerate: 20 });
+    const vb = await startVideo(b);
+    vb.attach(a.id, shown);
+    const look = async () => {
+      await new Promise((r) => setTimeout(r, 1500));
+      return { width: shown.width, height: shown.height, top: at(shown, 0.5, 0.25), left: at(shown, 0.25, 0.5) };
+    };
+    const upright = await look();
+    va.setRotation(90); // for everyone: red now on the right
+    const turned = await look();
+    va.setRotation(0);
+    vb.rotateView(a.id, 270); // for b only: red on the left
+    const viewed = await look();
+    va.stop();
+    vb.stop();
+    a.leave();
+    b.leave();
+    return { upright, turned, viewed };
+  };
+
   window.run = async ({ relay, seconds, webTransport, bitrate }) => {
     const group = Group.create(relay);
     const a = joinGroup(group, { profile: "a", webTransport });

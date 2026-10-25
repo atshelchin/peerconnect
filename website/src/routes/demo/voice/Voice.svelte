@@ -337,17 +337,11 @@
 		};
 	}
 
-	/** Shows our own camera, straight from it. */
-	function preview(node: HTMLVideoElement, stream: MediaStream | undefined) {
-		node.srcObject = stream ?? null;
-		return {
-			update(next: MediaStream | undefined) {
-				node.srcObject = next ?? null;
-			},
-			destroy() {
-				node.srcObject = null;
-			}
-		};
+	/** Turns our picture for everyone, or someone else's for us, a quarter turn at a time. */
+	function rotate(id: string) {
+		if (!video) return;
+		if (id === me) video.setRotation(video.rotation + 90);
+		else video.rotateView(id, video.viewRotation(id) + 90);
 	}
 
 	function toggleThem(id: string) {
@@ -458,9 +452,13 @@
 		| 'speaker-off'
 		| 'camera'
 		| 'camera-off'
+		| 'rotate'
 )}
 	<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-		{#if name === 'camera' || name === 'camera-off'}
+		{#if name === 'rotate'}
+			<path d="M20 12a8 8 0 1 1-2.34-5.66" />
+			<path d="M20 4v4.5h-4.5" />
+		{:else if name === 'camera' || name === 'camera-off'}
 			<rect x="3" y="6.5" width="13" height="11" rx="2.5" />
 			<path d="M16 10.5l5-3v9l-5-3z" />
 			{#if name === 'camera-off'}<path d="M4 4l16 16" />{/if}
@@ -535,13 +533,22 @@
 					{@const off = mine ? muted : !!presence[person.id]?.muted || !!silenced[person.id]}
 					{@const talking = !off && speaking(person.id)}
 					<li class="person" class:mine class:talking class:off>
-						{#if mine && camera && cameraStream}
-							<video class="screen mirror" use:preview={cameraStream} autoplay muted playsinline
-							></video>
-						{:else if !mine && watching[person.id]}
-							<canvas class="screen" use:screen={person.id}
-								>{t.room.video.replace('{name}', person.name)}</canvas
-							>
+						{#if (mine && camera) || (!mine && watching[person.id])}
+							{@const turn = mine
+								? t.room.rotateMine
+								: t.room.rotateTheirs.replace('{name}', person.name)}
+							<div class="frame">
+								<!-- Ours as we send it (mirrored, as a mirror would be); theirs as they arrive. -->
+								<canvas class="screen" class:mirror={mine} use:screen={person.id}
+									>{t.room.video.replace('{name}', person.name)}</canvas
+								>
+								<button
+									class="rotate"
+									aria-label={turn}
+									title={turn}
+									onclick={() => rotate(person.id)}>{@render icon('rotate')}</button
+								>
+							</div>
 						{/if}
 						<span class="avatar" aria-hidden="true">{person.name.slice(0, 1).toUpperCase()}</span>
 						<span class="who">
@@ -833,15 +840,40 @@
 		--state: #c2410c;
 	}
 
-	/* Video, when there is any, across the top of the card. */
+	/* Video, when there is any, across the top of the card, whole, in its
+	   own shape (a phone held upright sends a tall picture). */
+	.frame {
+		position: relative;
+		flex: 1 0 100%;
+	}
+
 	.screen {
 		display: block;
-		flex: 1 0 100%;
 		width: 100%;
-		aspect-ratio: 16 / 9;
+		height: auto;
+		max-height: min(60vh, 560px);
 		border-radius: 10px;
 		background: #000;
-		object-fit: cover;
+		object-fit: contain;
+	}
+
+	.rotate {
+		position: absolute;
+		top: 8px;
+		right: 8px;
+		display: grid;
+		place-items: center;
+		width: 36px;
+		height: 36px;
+		border: 0;
+		border-radius: 50%;
+		background: rgb(0 0 0 / 0.45);
+		color: #fff;
+		cursor: pointer;
+	}
+
+	.rotate:hover {
+		background: rgb(0 0 0 / 0.65);
 	}
 
 	.screen.mirror {

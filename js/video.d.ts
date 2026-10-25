@@ -3,7 +3,10 @@ import type { GroupConnection } from "./index.js";
 export interface VideoOptions {
   /** A stream whose video track to send (camera, screen, `canvas.captureStream()`); without one, only receive. */
   stream?: MediaStream;
-  /** Encoded size (default 640 × 360) and frames per second (default 15). */
+  /**
+   * The largest size to encode at (default 640 × 360), turned to the picture's shape: a
+   * phone held upright sends 360 × 640. Frames per second (default 15).
+   */
   width?: number;
   height?: number;
   framerate?: number;
@@ -41,8 +44,14 @@ export class Video extends EventTarget {
   /** Bits per second the encoder runs at now (it steps down while receivers keep losing frames). */
   readonly bitrate: number;
   readonly codec: string | null;
-  /** Draws `member`'s video into `canvas` from now on; `null` stops. */
+  /** Draws `member`'s video into `canvas` from now on; `null` stops. Our own ID shows what we send. */
   attach(member: string, canvas: HTMLCanvasElement | OffscreenCanvas | null): void;
+  /** Turns what we send by 0, 90, 180 or 270 degrees clockwise, for everyone (pictures are upright by default). */
+  setRotation(degrees: number): void;
+  readonly rotation: number;
+  /** Turns how we show `member`'s video, for us only. */
+  rotateView(member: string, degrees: number): void;
+  viewRotation(member: string): number;
   /** Sends this stream's video track from now on; `null` stops sending (receiving goes on). */
   setStream(stream: MediaStream | null): Promise<void>;
   /** Pauses or resumes sending. */
