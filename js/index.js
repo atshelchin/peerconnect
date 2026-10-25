@@ -2,9 +2,9 @@
 //
 // The protocol runs in WebAssembly, compiled from the same Rust state
 // machine as the native implementation; this file only supplies the
-// WebSocket and the timers.
+// sockets (WebSocket, and WebTransport for groups) and the timers.
 
-import { Group, Identity, initSync, Member, Peer, Room } from "./dist/peerconnect.js";
+import { Group, Identity, initSync, Member, Peer, Room, weeklyCertificateHashes } from "./dist/peerconnect.js";
 import module from "./dist/module.js";
 
 initSync({ module: Uint8Array.from(atob(module), (c) => c.charCodeAt(0)) });
@@ -161,19 +161,56 @@ export class Connection extends EventTarget {
 const VOICE_BACKLOG = 4 << 10;
 /** Chat and state transfer are handed to the socket only while it has less than this unsent. */
 const LOW_BACKLOG = 16 << 10;
+/** Video waiting to be sent beyond which the oldest is dropped. */
+const VIDEO_BACKLOG = 64 << 10;
+/** How long WebTransport has to connect before the WebSocket is tried as well. */
+const WEBTRANSPORT_HEAD_START = 1500;
+/** WebTransport stream priorities, by class (0 command, 1 voice, 2 chat, 3 bulk, 4 video): higher goes first. */
+const SEND_ORDER = [4, 3, 2, 0, 1];
 
 /**
  * Joins a group (a `Group` or its invite) and stays in it, reconnecting as
  * needed, until left. `identity` defaults to a new one; persist
  * `identity.seed` to be recognised later. `profile` (a string or bytes, at
  * most 1 KiB) describes this member to the others.
+ *
+ * For an `https://` relay, it connects over WebTransport where the runtime
+ * has it, falling back to the relay's `wss://` WebSocket. For a `quic://`
+ * relay (one with no domain or certificate), over WebTransport too, pinning
+ * the relay's weekly certificate, which needs no domain (GROUP.md §3.7),
+ * falling back to its `ws://` WebSocket. `webTransport` is passed to the
+ * `WebTransport` constructor (`serverCertificateHashes`, say).
  */
-export function joinGroup(group, { identity, profile } = {}) {
+export function joinGroup(group, { identity, profile, webTransport } = {}) {
   return new GroupConnection(
     typeof group === "string" ? Group.parse(group) : group,
     identity ?? Identity.generate(),
     bytes(profile ?? new Uint8Array()),
+    webTransport,
   );
+}
+
+/**
+ * The ways to reach a group endpoint from JavaScript, in the order to try
+ * them (GROUP.md §3.6, §3.7): `[{ type: "webtransport" | "websocket", url,
+ * weekly? }]`, where `weekly` means pinning the weekly certificate.
+ */
+export function transportsFor(url) {
+  const match = /^(wss?|https|quic):\/\/([^/]+)(.*)$/.exec(url);
+  if (!match) return [];
+  const [, scheme, authority, path] = match;
+  if (scheme === "ws" || scheme === "wss") return [{ type: "websocket", url }];
+  if (scheme === "https") return [{ type: "webtransport", url }, { type: "websocket", url: `wss://${authority}${path}` }];
+  // quic:// is 443 by default, as https:// is.
+  return [
+    { type: "webtransport", url: `https://${authority}${path}`, weekly: true },
+    { type: "websocket", url: `ws://${authority}${path}` },
+  ];
+}
+
+/** The SHA-256 hashes of the weekly certificates a relay may be serving now (GROUP.md §3.7). */
+export function weeklyHashes(now = Date.now()) {
+  return weeklyCertificateHashes(now).map((value) => ({ algorithm: "sha-256", value }));
 }
 
 export class GroupConnection extends EventTarget {
@@ -185,18 +222,26 @@ export class GroupConnection extends EventTarget {
   id;
 
   #member;
-  #socket = null;
+  /** The open link to the relay. */
+  #link = null;
+  /** Links being opened, of which the first to open wins. */
+  #opening = [];
+  #headStart = undefined;
+  #webTransport;
   #timer = undefined;
   #epoch = performance.now();
-  /** Chat and bulk frames waiting for the socket to drain. */
-  #backlog = [[], []];
-  #flushTimer = undefined;
 
-  constructor(group, identity, profile) {
+  constructor(group, identity, profile, webTransport) {
     super();
     this.#member = new Member(group, identity, profile, this.#now());
     this.id = this.#member.id;
+    this.#webTransport = webTransport;
     queueMicrotask(() => this.#pump());
+  }
+
+  /** What the connection to the relay runs over: "webtransport", "websocket", or null while there is none. */
+  get via() {
+    return this.#link?.via ?? null;
   }
 
   /** The latest round trip to the relay, in milliseconds. */
@@ -221,6 +266,17 @@ export class GroupConnection extends EventTarget {
   /** Sends a voice frame (`seq` counts frames, silent ones included); dropped if the connection is backed up. */
   sendVoice(seq, data) {
     return this.#do(() => this.#member.sendVoice(seq & 0xffff, bytes(data)));
+  }
+
+  /**
+   * Sends a video frame of `track` (up to 255,000 bytes) to everyone, cut
+   * into fragments that each fit a datagram; receivers get it whole, in
+   * order, as a "video" event, and ask for a keyframe ("keyframerequest")
+   * when they lose one for good. Dropped, oldest first, when the connection
+   * backs up. See `startVideo` in `peerconnect/video` for camera video.
+   */
+  sendVideo(track, keyframe, timestamp, data) {
+    return this.#do(() => this.#member.sendVideo(track, keyframe, timestamp >>> 0, bytes(data)));
   }
 
   /** Sends data that is dropped rather than delayed, to one member or (no `to`) everyone. */
@@ -267,7 +323,7 @@ export class GroupConnection extends EventTarget {
           this.#send(out.data, out.class);
           break;
         case "ping":
-          this.#socket?.send("ping");
+          this.#link?.ping();
           break;
         case "disconnect":
           this.#disconnect();
@@ -306,63 +362,362 @@ export class GroupConnection extends EventTarget {
     this.dispatchEvent(new CustomEvent(type, { detail }));
   }
 
-  /** Commands go at once; voice only if the socket keeps up; chat and bulk as it drains. */
   #send(frame, kind) {
+    this.#link?.send(frame, kind);
+  }
+
+  /** Opens the first transport to work: WebTransport, with a head start, then the WebSocket. */
+  #open(url) {
+    const ways = transportsFor(url);
+    const webTransport = ways.find((w) => w.type === "webtransport");
+    const webSocket = ways.find((w) => w.type === "websocket");
+    const startWebSocket = () => {
+      clearTimeout(this.#headStart);
+      this.#headStart = undefined;
+      if (webSocket) this.#opening.push(new WebSocketLink(webSocket.url, handlers));
+    };
+    const handlers = {
+      open: (link) => {
+        if (this.#link || !this.#opening.includes(link)) return link.close();
+        this.#stopOpening(link);
+        this.#link = link;
+        this.#member.handleOpen(this.#now());
+        this.#pump();
+      },
+      binary: (link, frame) => {
+        if (link !== this.#link) return;
+        this.#member.handleBinary(this.#now(), frame);
+        this.#pump();
+      },
+      text: (link, text) => {
+        if (link !== this.#link) return;
+        this.#member.handleText(this.#now(), text);
+        this.#pump();
+      },
+      close: (link, code) => {
+        if (link === this.#link) {
+          this.#link = null;
+          this.#member.handleClose(this.#now(), code);
+          this.#pump();
+        } else if (this.#opening.includes(link)) {
+          // That way failed: try the next one now, and report once all have.
+          this.#opening = this.#opening.filter((l) => l !== link);
+          if (this.#headStart !== undefined) startWebSocket();
+          if (this.#opening.length === 0) {
+            this.#member.handleClose(this.#now(), undefined);
+            this.#pump();
+          }
+        }
+      },
+    };
+    if (webTransport && typeof WebTransport === "function") {
+      const options = webTransport.weekly ? { serverCertificateHashes: weeklyHashes(), ...this.#webTransport } : this.#webTransport;
+      this.#opening.push(new WebTransportLink(webTransport.url, handlers, options));
+      this.#headStart = setTimeout(startWebSocket, WEBTRANSPORT_HEAD_START);
+    } else if (webSocket) {
+      startWebSocket();
+    } else {
+      queueMicrotask(() => {
+        this.#member.handleClose(this.#now(), undefined);
+        this.#pump();
+      });
+    }
+  }
+
+  /** Abandons the links still opening, but `keep`. */
+  #stopOpening(keep) {
+    clearTimeout(this.#headStart);
+    this.#headStart = undefined;
+    for (const link of this.#opening) if (link !== keep) link.close();
+    this.#opening = [];
+  }
+
+  #disconnect() {
+    this.#stopOpening(null);
+    const link = this.#link;
+    this.#link = null;
+    link?.close();
+  }
+}
+
+/**
+ * A WebSocket to the relay: commands go at once; voice only if the socket
+ * keeps up; chat, video and bulk, in that order, as it drains (video
+ * dropping its oldest past its budget).
+ */
+class WebSocketLink {
+  via = "websocket";
+  #socket;
+  /** Chat, video and bulk frames waiting for the socket to drain. */
+  #backlog = [[], [], []];
+  #videoBytes = 0;
+  #flushTimer = undefined;
+
+  constructor(url, on) {
+    const socket = new WebSocket(url);
+    socket.binaryType = "arraybuffer";
+    this.#socket = socket;
+    socket.onopen = () => on.open(this);
+    socket.onmessage = (event) =>
+      typeof event.data === "string" ? on.text(this, event.data) : on.binary(this, new Uint8Array(event.data));
+    socket.onclose = (event) => {
+      this.#backlog = [[], [], []];
+      on.close(this, event.code);
+    };
+  }
+
+  send(frame, kind) {
     const socket = this.#socket;
-    if (!socket) return;
     if (kind === 0) socket.send(frame);
     else if (kind === 1) {
       if (socket.bufferedAmount <= VOICE_BACKLOG) socket.send(frame);
     } else {
-      this.#backlog[kind - 2].push(frame);
+      const queue = this.#backlog[{ 2: 0, 4: 1, 3: 2 }[kind]];
+      if (kind === 4) {
+        this.#videoBytes += frame.length;
+        while (this.#videoBytes > VIDEO_BACKLOG) this.#videoBytes -= queue.shift().length;
+      }
+      queue.push(frame);
       this.#flush();
     }
+  }
+
+  ping() {
+    this.#socket.send("ping");
   }
 
   #flush() {
     clearTimeout(this.#flushTimer);
     const socket = this.#socket;
-    if (!socket) return;
+    if (socket.readyState !== WebSocket.OPEN) return;
     while (socket.bufferedAmount < LOW_BACKLOG) {
-      const frame = this.#backlog[0].shift() ?? this.#backlog[1].shift();
-      if (!frame) return;
+      const queue = this.#backlog.find((q) => q.length);
+      if (!queue) return;
+      const frame = queue.shift();
+      if (queue === this.#backlog[1]) this.#videoBytes -= frame.length;
       socket.send(frame);
     }
     // WebSocket has no event for a drained buffer: look again shortly.
     this.#flushTimer = setTimeout(() => this.#flush(), 5);
   }
 
-  #open(url) {
-    const socket = new WebSocket(url);
-    socket.binaryType = "arraybuffer";
-    this.#socket = socket;
-    const live = (handler) => (event) => {
-      if (this.#socket !== socket) return;
-      handler(event);
-      this.#pump();
-    };
-    socket.onopen = live(() => this.#member.handleOpen(this.#now()));
-    socket.onmessage = live((event) =>
-      typeof event.data === "string"
-        ? this.#member.handleText(this.#now(), event.data)
-        : this.#member.handleBinary(this.#now(), new Uint8Array(event.data)),
+  close() {
+    clearTimeout(this.#flushTimer);
+    this.#backlog = [[], [], []];
+    const socket = this.#socket;
+    socket.onopen = socket.onmessage = socket.onclose = null;
+    socket.close(1000);
+  }
+}
+
+/**
+ * A WebTransport session to the relay (GROUP.md §3.6): each class on a
+ * stream of its own, a byte naming the class and then `length[2] ‖ frame`
+ * messages, so that a lost packet holds up only its class; voice as
+ * datagrams, which wait for nothing. The empty message is ping, and pong.
+ */
+class WebTransportLink {
+  via = "webtransport";
+  #session;
+  #on;
+  #closed = false;
+  #writers = [null, null, null, null, null];
+  #queues = [[], [], [], [], []];
+  #queued = [0, 0, 0, 0, 0];
+  #writing = [false, false, false, false, false];
+  #datagrams = null;
+  /** Video frames waiting for room among the datagrams. */
+  #video = [];
+  #videoBytes = 0;
+  #pacing = false;
+
+  constructor(url, on, options) {
+    this.#on = on;
+    try {
+      this.#session = new WebTransport(url, { requireUnreliable: true, ...options });
+    } catch {
+      queueMicrotask(() => this.#end(undefined));
+      return;
+    }
+    const session = this.#session;
+    session.ready.then(
+      () => {
+        if (this.#closed) return;
+        const datagrams = session.datagrams;
+        // Voice older than this is worth nothing: let the browser drop it.
+        if ("outgoingMaxAge" in datagrams) datagrams.outgoingMaxAge = 200;
+        this.#datagrams = (datagrams.createWritable?.() ?? datagrams.writable).getWriter();
+        this.#readStreams();
+        this.#readDatagrams();
+        this.#on?.open(this);
+        this.#paceVideo();
+      },
+      () => {},
     );
-    socket.onclose = live((event) => {
-      this.#socket = null;
-      this.#backlog = [[], []];
-      this.#member.handleClose(this.#now(), event.code);
-    });
+    session.closed.then(
+      (info) => this.#end(info?.closeCode),
+      () => this.#end(undefined),
+    );
   }
 
-  #disconnect() {
-    const socket = this.#socket;
-    this.#socket = null;
-    this.#backlog = [[], []];
-    if (socket) {
-      socket.onopen = socket.onmessage = socket.onclose = null;
-      socket.close(1000);
+  send(frame, kind) {
+    if (kind === 4) {
+      this.#video.push(frame);
+      this.#videoBytes += frame.length;
+      while (this.#videoBytes > VIDEO_BACKLOG) this.#videoBytes -= this.#video.shift().length;
+      this.#paceVideo();
+      return;
+    }
+    if (kind === 1 && this.#datagrams && frame.length <= (this.#session.datagrams.maxDatagramSize ?? 1024)) {
+      this.#datagrams.write(frame).catch(() => {});
+      return;
+    }
+    // Late audio is worse than lost audio.
+    if (kind === 1 && this.#queued[1] > VOICE_BACKLOG) return;
+    this.#queue(kind, frame);
+  }
+
+  ping() {
+    this.#queue(0, new Uint8Array(0));
+  }
+
+  /**
+   * Hands video to the browser's datagram queue only when that is empty,
+   * so that voice, which joins the same queue, waits behind one video
+   * datagram at most; video too big for a datagram goes on its stream.
+   */
+  async #paceVideo() {
+    if (this.#pacing) return;
+    this.#pacing = true;
+    try {
+      while (this.#video.length && !this.#closed) {
+        const writer = this.#datagrams;
+        if (!writer) return; // not open yet: sent once it is
+        const frame = this.#video[0];
+        if (frame.length > (this.#session.datagrams.maxDatagramSize ?? 1024)) {
+          this.#videoBytes -= this.#video.shift().length;
+          this.#queue(4, frame);
+          continue;
+        }
+        if (writer.desiredSize !== null && writer.desiredSize <= 0) {
+          await Promise.race([writer.ready, new Promise((resolve) => setTimeout(resolve, 5))]);
+          continue;
+        }
+        this.#videoBytes -= this.#video.shift().length;
+        writer.write(frame).catch(() => {});
+      }
+    } finally {
+      this.#pacing = false;
     }
   }
+
+  /** Closes it, without telling `on`. */
+  close() {
+    this.#on = null;
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      this.#session?.close({ closeCode: 1000, reason: "" });
+    } catch {
+      // Not open yet, or already gone.
+    }
+  }
+
+  #end(code) {
+    const on = this.#on;
+    this.#on = null;
+    this.#closed = true;
+    on?.close(this, code);
+  }
+
+  #queue(kind, frame) {
+    const message = new Uint8Array(2 + frame.length);
+    message[0] = frame.length >> 8;
+    message[1] = frame.length & 0xff;
+    message.set(frame, 2);
+    this.#queues[kind].push(message);
+    this.#queued[kind] += message.length;
+    this.#drain(kind);
+  }
+
+  /** Writes a class's queue to its stream, opened when first needed, as fast as the stream takes it. */
+  async #drain(kind) {
+    if (this.#writing[kind]) return;
+    this.#writing[kind] = true;
+    try {
+      let writer = this.#writers[kind];
+      if (!writer) {
+        const stream = await this.#session.createUnidirectionalStream({ sendOrder: SEND_ORDER[kind] });
+        writer = this.#writers[kind] = stream.getWriter();
+        writer.write(new Uint8Array([kind])).catch(() => {});
+      }
+      while (this.#queues[kind].length && !this.#closed) {
+        await writer.ready;
+        const batch = concat(this.#queues[kind].splice(0));
+        this.#queued[kind] = 0;
+        writer.write(batch).catch(() => {});
+      }
+    } catch {
+      // The session is gone: `closed` says so.
+    } finally {
+      this.#writing[kind] = false;
+    }
+  }
+
+  async #readStreams() {
+    const streams = this.#session.incomingUnidirectionalStreams.getReader();
+    for (;;) {
+      const { value, done } = await streams.read().catch(() => ({ done: true }));
+      if (done || this.#closed) return;
+      this.#readStream(value);
+    }
+  }
+
+  async #readStream(stream) {
+    const reader = stream.getReader();
+    let buf = new Uint8Array(0);
+    let headed = false;
+    for (;;) {
+      const { value, done } = await reader.read().catch(() => ({ done: true }));
+      if (done || this.#closed) return;
+      buf = buf.length ? concat([buf, value]) : value;
+      let at = 0;
+      if (!headed && buf.length) {
+        headed = true;
+        at = 1;
+      }
+      while (buf.length - at >= 2) {
+        const length = (buf[at] << 8) | buf[at + 1];
+        if (buf.length - at - 2 < length) break;
+        const message = buf.slice(at + 2, at + 2 + length);
+        at += 2 + length;
+        if (length === 0) this.#on?.text(this, "pong");
+        else this.#on?.binary(this, message);
+      }
+      buf = buf.subarray(at);
+    }
+  }
+
+  async #readDatagrams() {
+    const reader = this.#session.datagrams.readable.getReader();
+    for (;;) {
+      const { value, done } = await reader.read().catch(() => ({ done: true }));
+      if (done || this.#closed) return;
+      this.#on?.binary(this, value);
+    }
+  }
+}
+
+function concat(parts) {
+  let length = 0;
+  for (const part of parts) length += part.length;
+  const out = new Uint8Array(length);
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
 }
 
 function bytes(data) {

@@ -9,6 +9,10 @@
 //! table, one small mutex per room.
 //!
 //! Groups (`/g1/<id>`) work differently, without backpressure: see [`group`].
+//! They can also be reached over QUIC, on a UDP socket ([`quic`]): raw QUIC
+//! for native members, and WebTransport for browsers, which needs a
+//! certificate they trust ([`Tls`]). With one, the TCP listener also
+//! accepts `wss://` next to plain `ws://`, told apart by their first byte.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -29,6 +33,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use peerconnect::RoomId;
 use peerconnect::relay::{self, Action, Conn};
 use peerconnect::wire::{self, Role, close};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
@@ -38,6 +43,10 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role as WsRole, WebSo
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 mod group;
+pub mod quic;
+mod tls;
+
+pub use tls::Tls;
 
 /// A connection that accepts nothing forwarded to it for this long is closed.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -70,10 +79,17 @@ pub struct Config {
     /// Command and voice bytes queued towards a group connection beyond
     /// which voice frames for it are dropped: bounds how late audio gets.
     pub voice_queue_bytes: usize,
+    /// Video bytes queued towards a group connection beyond which its
+    /// oldest video is dropped: bounds how late video gets.
+    pub video_queue_bytes: usize,
     /// What one group connection may send, in bytes per second, sustained
     /// and in bursts. Beyond it voice is dropped and the rest delayed.
     pub group_rate: usize,
     pub group_burst: usize,
+    /// The certificate for `wss://` and WebTransport, reloaded when its
+    /// files change. Without it the relay serves plain `ws://`, and raw QUIC
+    /// with a certificate of its own making.
+    pub tls: Option<Tls>,
 }
 
 impl Default for Config {
@@ -86,15 +102,40 @@ impl Default for Config {
             max_group_members: 10,
             group_queue_bytes: 2 << 20,
             voice_queue_bytes: 8 << 10,
+            video_queue_bytes: 64 << 10,
             group_rate: 2 << 20,
             group_burst: 4 << 20,
+            tls: None,
         }
     }
 }
 
 /// Serves the relay on `listener` until `shutdown` completes, then closes
 /// every connection with 1001 (going away) and waits briefly for them.
+///
+/// Panics if [`Config::tls`] names files that do not hold a certificate;
+/// [`serve_all`] reports that instead.
 pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<Output = ()>) {
+    if let Err(err) = serve_all(listener, None, config, shutdown).await {
+        panic!("{err}");
+    }
+}
+
+/// Like [`serve`], and serves groups over QUIC on `quic` too.
+pub async fn serve_all(
+    listener: TcpListener,
+    quic: Option<std::net::UdpSocket>,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), String> {
+    let certificate = tls::Certificate::new(config.tls.as_ref())?;
+    let acceptor = certificate
+        .is_configured()
+        .then(|| tokio_rustls::TlsAcceptor::from(Arc::new(certificate.server_config(&[b"http/1.1"], false))));
+    let endpoint = match quic {
+        Some(socket) => Some(quic::endpoint(socket, &certificate).map_err(|err| format!("cannot serve QUIC: {err}"))?),
+        None => None,
+    };
     let relay = Arc::new(Relay {
         rooms: Mutex::new(HashMap::new()),
         groups: Mutex::new(HashMap::new()),
@@ -104,6 +145,10 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
         stop: watch::channel(false).0,
         config,
     });
+    let watcher = tokio::spawn(certificate.clone().watch());
+    if let Some(endpoint) = &endpoint {
+        tokio::spawn(relay.clone().serve_quic(endpoint.clone()));
+    }
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -111,7 +156,7 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
                 let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
                 limit_unsent(&stream);
-                tokio::spawn(relay.clone().http(stream, peer.ip()));
+                tokio::spawn(relay.clone().tcp(stream, peer.ip(), acceptor.clone()));
             }
             () = &mut shutdown => break,
         }
@@ -119,6 +164,11 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
     relay.stop.send_replace(true);
     let all = relay.config.max_connections as u32;
     let _ = timeout(Duration::from_secs(5), relay.slots.acquire_many(all)).await;
+    watcher.abort();
+    if let Some(endpoint) = endpoint {
+        let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    }
+    Ok(())
 }
 
 struct Relay {
@@ -197,7 +247,23 @@ impl Outbox {
 pub(crate) type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 impl Relay {
-    async fn http(self: Arc<Self>, stream: tokio::net::TcpStream, peer: IpAddr) {
+    /// Serves a TCP connection: TLS if it starts with a TLS handshake
+    /// record and a certificate is configured, plain HTTP otherwise.
+    async fn tcp(self: Arc<Self>, stream: tokio::net::TcpStream, peer: IpAddr, tls: Option<tokio_rustls::TlsAcceptor>) {
+        let Some(tls) = tls else { return self.http(stream, peer).await };
+        let mut first = [0];
+        match timeout(wire::JOIN_TIMEOUT, stream.peek(&mut first)).await {
+            Ok(Ok(1)) if first[0] == 0x16 => {
+                if let Ok(Ok(stream)) = timeout(wire::JOIN_TIMEOUT, tls.accept(stream)).await {
+                    self.http(stream, peer).await;
+                }
+            }
+            Ok(Ok(1)) => self.http(stream, peer).await,
+            _ => {}
+        }
+    }
+
+    async fn http(self: Arc<Self>, stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, peer: IpAddr) {
         let service = hyper::service::service_fn(move |req| {
             let relay = self.clone();
             async move { Ok::<_, Infallible>(relay.route(req, peer)) }
@@ -249,7 +315,7 @@ impl Relay {
             let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
             match endpoint {
                 Endpoint::Room(room) => self.connection(room, ws, slot).await,
-                Endpoint::Group(group) => self.group_connection(group, ws, slot).await,
+                Endpoint::Group(group) => self.group_websocket(group, ws, slot).await,
             }
             drop(per_address);
         });

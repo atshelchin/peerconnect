@@ -24,9 +24,9 @@ export const zh: Dict = {
 				'用二维码配对两个浏览器，通过公共 PeerConnect 中继进行端到端加密聊天。演示运行的是编译为 WebAssembly 的真实协议实现。'
 		},
 		voice: {
-			title: '在线演示：多人语音聊天 — PeerConnect',
+			title: '在线演示：多人语音视频聊天 — PeerConnect',
 			description:
-				'最多十人一起语音，端到端加密，经公共 PeerConnect 中继转发：Opus 语音、自适应抖动缓冲，外加文字聊天。在两台设备上打开即可体验。'
+				'最多十人一起语音、开摄像头互相看见，端到端加密，经公共 PeerConnect 中继转发：Opus 语音、VP8 视频，外加文字聊天。在两台设备上打开即可体验。'
 		},
 		spec: {
 			title: '协议规范 v1 — PeerConnect',
@@ -274,14 +274,14 @@ export const zh: Dict = {
 	},
 	voice: {
 		eyebrow: '在线演示',
-		title: '多人语音聊天',
-		lead: '最多十人同时语音，端到端加密。创建一个房间，把链接发给朋友或者在手机上打开，然后开口说话。',
+		title: '多人语音视频聊天',
+		lead: '最多十人同时语音，也可以打开摄像头互相看见，端到端加密。创建一个房间，把链接发给朋友或者在手机上打开，然后开口说话。',
 		steps: [
 			'创建房间，分享链接。',
 			'打开链接的人输入名字，开启麦克风加入。',
-			'开始说话。如果几台设备在同一个房间里，请戴耳机，否则麦克风会互相拾音。'
+			'开始说话，想露脸就在自己的卡片上打开摄像头。如果几台设备在同一个房间里，请戴耳机，否则麦克风会互相拾音。'
 		],
-		note: '这是真实的协议：Rust 内核编译成 WebAssembly，用 WebCodecs 编码 Opus，每个说话人一个自适应抖动缓冲，全部经公共中继 <code>{relay}</code> 转发，中继只看得到密文。房间密钥在链接 <code>#</code> 之后的部分，浏览器不会把它发给任何服务器。',
+		note: '这是真实的协议：Rust 内核编译成 WebAssembly，用 WebCodecs 编码 Opus 和 VP8，每个说话人一个自适应抖动缓冲，视频由分片完整拼回，全部经公共中继 <code>{relay}</code> 转发，中继只看得到密文。房间密钥在链接 <code>#</code> 之后的部分，浏览器不会把它发给任何服务器。',
 		noscript: '本演示需要 JavaScript 和 WebAssembly。',
 		loading: '加载中…',
 		start: {
@@ -299,6 +299,7 @@ export const zh: Dict = {
 		},
 		problems: {
 			mic: '麦克风不可用（权限被拒绝或未找到设备）。你仍然可以收听和打字聊天。',
+			camera: '摄像头不可用（权限被拒绝或未找到设备）。',
 			codecs:
 				'这个浏览器无法编码 Opus 音频（WebCodecs）。文字聊天可用；语音请使用较新的 Chrome、Edge 或 Firefox。',
 			full: '房间已满（十人）。页面会继续尝试加入。',
@@ -323,7 +324,10 @@ export const zh: Dict = {
 			muteThem: '不听 {name}（只对你生效）',
 			unmuteThem: '恢复收听 {name}',
 			theirMicOff: '{name} 关了麦克风',
-			theirHearingOff: '{name} 关了耳机，听不到大家'
+			theirHearingOff: '{name} 关了耳机，听不到大家',
+			cameraOn: '关闭摄像头',
+			cameraOff: '打开摄像头：大家都能看见你',
+			video: '{name} 的视频'
 		},
 		invite: {
 			title: '邀请',
@@ -344,7 +348,7 @@ export const zh: Dict = {
 		lead: '在手机和电脑上（或两个浏览器窗口中）打开本页，用二维码把它们连起来，然后进行端到端加密聊天。',
 		note: '这里运行的是真实协议：Rust 核心编译成 WebAssembly，通过公共中继 <code>{relay}</code> 通信。每个浏览器标签页都是一个独立的端，刷新标签页不会丢失房间。',
 		noscript: '演示需要 JavaScript 和 WebAssembly。',
-		voiceLink: '不止两个人？试试多人语音聊天演示 →',
+		voiceLink: '不止两个人？试试多人语音视频聊天演示 →',
 		steps: [
 			'在一台设备上创建房间。',
 			'用另一台设备扫描二维码，或在那里打开链接。',

@@ -33,6 +33,8 @@ void every_frame(void) {
 pc_member_send(m, 0 /* command */, (const uint8_t *)"place 7", 7, NULL);
 ```
 
+`PC_CONNECT` gives the group's URL on its relay. For a `wss://` or `ws://` relay that is the WebSocket to open; for one that also offers QUIC it starts `https://` or `quic://`: open the WebSocket it falls back to, `wss://` or `ws://` with the rest unchanged, unless your engine speaks QUIC ([GROUP.md §3.6](../../GROUP.md)).
+
 When the socket closes, call `pc_member_handle_close` with its close code (or -1). The member reconnects on its own, by asking for `PC_CONNECT` again. Pointers in a `pc_output` are valid until the next call on that member; copy what you keep.
 
 Voice frames interoperate with the browser SDK when they use its format, `hold[1] ‖ Opus packet` ([GROUP.md §7.2](../../GROUP.md)).

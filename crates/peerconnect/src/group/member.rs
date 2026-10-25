@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use super::seal::{self, Announce, CHALLENGE_LEN, Challenge, Key};
+use super::video;
 use super::wire::{self, BROADCAST, Class, MAX_SLOTS};
 use super::{Group, Identity, MemberId};
 use crate::Error;
@@ -34,6 +35,10 @@ mod control {
     pub const SYNC_BEGIN: u8 = 0x11;
     pub const SYNC_ACK: u8 = 0x12;
     pub const SYNC_ABORT: u8 = 0x13;
+    /// `track[1] frame[4] index...`: video fragments to send again (`0xFF`: all).
+    pub const VIDEO_NACK: u8 = 0x20;
+    /// `track[1]`: a keyframe, please.
+    pub const KEYFRAME_REQUEST: u8 = 0x21;
 }
 
 /// COMMAND and CHAT kinds.
@@ -89,8 +94,12 @@ const REMEMBERED_STARTS: usize = 256;
 /// Snapshot chunk: small, so that a voice frame or a command queued behind
 /// one on a slow link waits little (4 KiB at 2 Mbit/s: 16 ms).
 const BULK_CHUNK: usize = 4 << 10;
+/// Snapshot bytes held that arrived before their SYNC_BEGIN, at most: more
+/// than a provider's window lets it send unacknowledged.
+const MAX_EARLY_BULK: usize = 2 << 20;
 /// Sealed frame types, each with its own counter.
-const SEALED: [u8; 6] = [wire::CONTROL, wire::COMMAND, wire::VOICE, wire::DATAGRAM, wire::CHAT, wire::BULK];
+const SEALED: [u8; 7] =
+    [wire::CONTROL, wire::COMMAND, wire::VOICE, wire::DATAGRAM, wire::CHAT, wire::BULK, wire::VIDEO];
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -193,6 +202,22 @@ pub enum Event {
         from: MemberId,
         data: Vec<u8>,
     },
+    /// A whole video frame from `from`'s `track`, in order and decodable: a
+    /// keyframe, or a frame that follows one with nothing lost in between.
+    /// `timestamp` is the sender's, in its units (milliseconds, say).
+    Video {
+        from: MemberId,
+        track: u8,
+        keyframe: bool,
+        timestamp: u32,
+        data: Vec<u8>,
+    },
+    /// Members lost some of our `track` and need a keyframe to go on: send
+    /// one soon. At most every 500 ms per track, however many ask.
+    KeyframeRequest {
+        from: MemberId,
+        track: u8,
+    },
     /// `count` messages of `from`'s stream were lost: it no longer had them,
     /// or a gap did not close in time.
     Missed {
@@ -292,6 +317,10 @@ pub struct Member {
     rtt: Option<u64>,
     /// When to announce our stream heads.
     heads_at: Option<u64>,
+    /// Our recent video frames, for resending.
+    video_out: video::Outgoing,
+    /// Others' video being put back together, by slot.
+    video_in: Vec<(u8, video::Incoming)>,
 }
 
 /// Messages we broadcast, kept for resending.
@@ -492,8 +521,41 @@ struct Remote {
     /// When we last sent it our `KEY`.
     key_sent_at: u64,
     state: Admission,
-    /// The last counter accepted per sealed type.
-    counters: [Option<u32>; SEALED.len()],
+    /// The counters accepted per sealed type.
+    counters: [Replay; SEALED.len()],
+}
+
+/// The counters of one sealed type accepted from one connection.
+#[derive(Debug, Clone, Copy, Default)]
+struct Replay {
+    /// The highest.
+    last: Option<u32>,
+    /// Bit `i`: whether `last - i` was accepted.
+    seen: u64,
+}
+
+impl Replay {
+    /// Accepts `counter` if it is above every one accepted so far, or, for
+    /// a type that may arrive out of order (`window`), if it is one of the
+    /// 63 below the highest and not accepted yet.
+    fn accept(&mut self, counter: u32, window: bool) -> bool {
+        let Some(last) = self.last else {
+            *self = Replay { last: Some(counter), seen: 1 };
+            return true;
+        };
+        if counter > last {
+            let shift = counter - last;
+            self.seen = if shift >= 64 { 0 } else { self.seen << shift } | 1;
+            self.last = Some(counter);
+            return true;
+        }
+        let behind = last - counter;
+        if !window || behind >= 64 || self.seen & (1 << behind) != 0 {
+            return false;
+        }
+        self.seen |= 1 << behind;
+        true
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -536,6 +598,8 @@ impl Member {
             next_transfer: u32::from_le_bytes(crate::random()),
             rtt: None,
             heads_at: None,
+            video_out: video::Outgoing::default(),
+            video_in: Vec::new(),
         };
         member.connect(now);
         Ok(member)
@@ -606,6 +670,12 @@ impl Member {
                         if let Some(heads) = self.heads_at {
                             at = at.min(heads);
                         }
+                        let rtt = self.member_rtt();
+                        for (_, v) in &self.video_in {
+                            if let Some(due) = v.deadline(rtt) {
+                                at = at.min(due);
+                            }
+                        }
                         for t in &self.transfers {
                             at = at.min(t.progress_at + ms(SYNC_STALL));
                             if let Some(data) = &t.data
@@ -653,6 +723,7 @@ impl Member {
                     self.check_gaps(now);
                     self.check_transfers(now);
                     self.pump_transfers();
+                    self.tick_video(now);
                 }
             }
             _ => {}
@@ -738,6 +809,9 @@ impl Member {
                 self.set_state(State::Online);
                 self.send_key(BROADCAST, [0; CHALLENGE_LEN]);
             }
+            // Peer frames can overtake WELCOME on a transport with a
+            // stream per class (GROUP.md §3.6); they are not for us yet.
+            Phase::Joining { sent_join: true, .. } if kind < 0x80 => {}
             Phase::Joining { .. } => self.reconnect(now),
             Phase::Joined(_) => match kind {
                 wire::MEMBER => self.handle_member(now, frame),
@@ -813,6 +887,25 @@ impl Member {
             None => return false,
         };
         self.seal_to(wire::DATAGRAM, slot, data)
+    }
+
+    /// Sends a video frame (at most [`wire::MAX_VIDEO_FRAME`] bytes) to
+    /// everyone, cut into fragments that each fit a datagram (GROUP.md §7.4).
+    /// Frames are numbered per `track`; receivers deliver them whole and in
+    /// order, ask for lost fragments once, and drop what follows a frame lost
+    /// for good until a keyframe ([`Event::KeyframeRequest`] asks for one).
+    /// Returns false if it was not sent.
+    pub fn send_video(&mut self, track: u8, keyframe: bool, timestamp: u32, data: &[u8]) -> bool {
+        if self.joined().is_none() {
+            return false;
+        }
+        let Some(fragments) = self.video_out.send(self.clock, track, keyframe, timestamp, data) else { return false };
+        for fragment in fragments {
+            if !self.seal_to(wire::VIDEO, BROADCAST, &fragment) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Asks `from` for a snapshot. Command messages are held from now until
@@ -915,6 +1008,7 @@ impl Member {
         }
         self.fail_sync();
         self.transfers.clear();
+        self.video_in.clear();
         self.heads_at = None; // the next KEY carries them
         for pos in &mut self.positions {
             if let Some(gap) = &mut pos.gap {
@@ -1007,6 +1101,7 @@ impl Member {
             return;
         }
         let old = std::mem::replace(&mut joined.remotes[slot as usize], (present == 1).then(|| Remote::new(now)));
+        self.video_in.retain(|(s, _)| *s != slot);
         if let Some(Remote { state: Admission::Admitted(a), .. }) = old {
             self.left(slot, a.identity);
         }
@@ -1039,7 +1134,7 @@ impl Member {
             // admit us. Unless already admitted, wait for their CONFIRM.
             if admitted.is_none() {
                 remote.state = Admission::Pending(announce.clone());
-                remote.counters = [None; SEALED.len()];
+                remote.counters = Default::default();
             }
             self.send_key(from, announce.challenge);
         } else if announce.echo == mine {
@@ -1048,7 +1143,7 @@ impl Member {
                 Some(echo) => self.send_confirm(from, echo),
                 // Proves the sender saw our fresh challenge: admit it.
                 None => {
-                    remote.counters = [None; SEALED.len()];
+                    remote.counters = Default::default();
                     let (echo, next) = (announce.challenge, announce.next);
                     self.admit(from, announce, next);
                     self.send_confirm(from, echo);
@@ -1140,10 +1235,10 @@ impl Member {
             Admission::Admitted(a) => (&a.key, true),
         };
         let Some((counter, plaintext)) = seal::open(key, frame) else { return };
-        if remote.counters[index].is_some_and(|last| counter <= last) {
+        // Real-time frames may overtake each other (GROUP.md §4.3).
+        if !remote.counters[index].accept(counter, Class::of(kind).is_realtime()) {
             return; // replayed
         }
-        remote.counters[index] = Some(counter);
         if !admitted {
             // Until admitted, only its CONFIRM counts.
             if kind == wire::CONTROL && plaintext.first() == Some(&control::CONFIRM) {
@@ -1168,6 +1263,19 @@ impl Member {
                 }
             }
             wire::DATAGRAM => self.emit(Event::Datagram { from: sender, data: plaintext }),
+            wire::VIDEO => {
+                let now = self.clock;
+                let mut actions = Vec::new();
+                match self.video_in.iter_mut().find(|(s, _)| *s == from) {
+                    Some((_, v)) => v.push(now, &plaintext, &mut actions),
+                    None => {
+                        let mut v = video::Incoming::default();
+                        v.push(now, &plaintext, &mut actions);
+                        self.video_in.push((from, v));
+                    }
+                }
+                self.video_actions(from, sender, actions);
+            }
             wire::BULK => self.handle_bulk(from, &plaintext),
             _ => {}
         }
@@ -1225,6 +1333,19 @@ impl Member {
                     self.pump_transfers();
                 }
             }
+            control::VIDEO_NACK if data.len() >= 6 => {
+                let (track, frame) = (data[0], u32_at(data, 1));
+                for fragment in self.video_out.resend(self.clock, track, frame, &data[5..]) {
+                    self.seal_to(wire::VIDEO, from, &fragment);
+                }
+            }
+            control::KEYFRAME_REQUEST if !data.is_empty() => {
+                if let Some(sender) = self.admitted(from).map(|a| a.identity)
+                    && self.video_out.keyframe_wanted(self.clock, data[0])
+                {
+                    self.emit(Event::KeyframeRequest { from: sender, track: data[0] });
+                }
+            }
             control::SYNC_ABORT if data.len() >= 4 => {
                 let transfer = u32_at(data, 0);
                 self.transfers.retain(|t| !(t.slot == from && t.transfer == transfer));
@@ -1233,6 +1354,47 @@ impl Member {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Video (GROUP.md §7.4).
+
+    /// The round trip to other members: twice ours to the relay.
+    fn member_rtt(&self) -> u64 {
+        self.rtt.map_or(100, |r| 2 * r)
+    }
+
+    fn tick_video(&mut self, now: u64) {
+        let rtt = self.member_rtt();
+        let mut all = Vec::new();
+        for (slot, v) in &mut self.video_in {
+            let mut actions = Vec::new();
+            v.tick(now, rtt, &mut actions);
+            if !actions.is_empty() {
+                all.push((*slot, actions));
+            }
+        }
+        for (slot, actions) in all {
+            if let Some(sender) = self.admitted(slot).map(|a| a.identity) {
+                self.video_actions(slot, sender, actions);
+            }
+        }
+    }
+
+    fn video_actions(&mut self, slot: u8, sender: MemberId, actions: Vec<video::Action>) {
+        for action in actions {
+            match action {
+                video::Action::Deliver { track, keyframe, timestamp, data } => {
+                    self.emit(Event::Video { from: sender, track, keyframe, timestamp, data });
+                }
+                video::Action::Nack { track, frame, indices } => {
+                    let nack = [&[control::VIDEO_NACK, track][..], &frame.to_be_bytes(), &indices].concat();
+                    self.seal_to(wire::CONTROL, slot, &nack);
+                }
+                video::Action::RequestKeyframe { track } => {
+                    self.seal_to(wire::CONTROL, slot, &[control::KEYFRAME_REQUEST, track]);
+                }
+            }
         }
     }
 
@@ -1511,24 +1673,38 @@ impl Member {
         sync.length = Some(length);
         sync.frontier = entries.chunks(16).map(|e| (u64_at(e, 0), u64_at(e, 8))).collect();
         sync.progress_at = self.clock;
-        if length == 0 {
-            self.finish_sync();
-        }
+        // Data that overtook SYNC_BEGIN (on another stream) counts now.
+        self.received_bulk(from, transfer);
     }
 
     fn handle_bulk(&mut self, from: u8, plaintext: &[u8]) {
         let Some(transfer) = plaintext.get(..4).map(|t| u32_at(t, 0)) else { return };
         let now = self.clock;
         let Some(sync) = self.sync.as_mut().filter(|s| s.slot == from && s.transfer == transfer) else { return };
-        let Some(length) = sync.length else { return };
         sync.data.extend_from_slice(&plaintext[4..]);
         sync.progress_at = now;
+        if sync.length.is_none() {
+            // Ahead of SYNC_BEGIN, which a transport with a stream per
+            // class may deliver later; no more than the provider's window.
+            if sync.data.len() > MAX_EARLY_BULK {
+                self.seal_to(wire::CONTROL, from, &abort(transfer));
+                self.fail_sync();
+            }
+            return;
+        }
+        self.received_bulk(from, transfer);
+    }
+
+    /// Acknowledges and completes a transfer with what it has received.
+    fn received_bulk(&mut self, from: u8, transfer: u32) {
+        let Some(sync) = self.sync.as_mut() else { return };
+        let Some(length) = sync.length else { return };
         let received = sync.data.len() as u64;
         if received > length {
             self.seal_to(wire::CONTROL, from, &abort(transfer));
             return self.fail_sync();
         }
-        if received - sync.acked >= SYNC_ACK_EVERY || received == length {
+        if received - sync.acked >= SYNC_ACK_EVERY || (received == length && received > sync.acked) {
             sync.acked = received;
             let ack = [&[control::SYNC_ACK][..], &transfer.to_be_bytes(), &received.to_be_bytes()].concat();
             self.seal_to(wire::CONTROL, from, &ack);
@@ -1638,7 +1814,7 @@ impl Member {
 
 impl Remote {
     fn new(now: u64) -> Remote {
-        Remote { since: now, key_sent_at: now, state: Admission::Unknown, counters: [None; SEALED.len()] }
+        Remote { since: now, key_sent_at: now, state: Admission::Unknown, counters: Default::default() }
     }
 }
 
@@ -1866,6 +2042,156 @@ mod tests {
         assert_eq!(w.bytes, before);
     }
 
+    /// Runs two members for `ms` of simulated time, dropping the frames
+    /// from a to b that `lose` picks; returns a's events and b's.
+    fn video_between(
+        a: &mut Member,
+        b: &mut Member,
+        from: u64,
+        to: u64,
+        mut lose: impl FnMut(&[u8]) -> bool,
+    ) -> (Vec<Event>, Vec<Event>) {
+        let (mut ea, mut eb) = (Vec::new(), Vec::new());
+        for now in from..to {
+            a.handle_timeout(now);
+            b.handle_timeout(now);
+            while let Some(out) = a.poll_output() {
+                match out {
+                    Output::Send(f, _) if f[0] < 0x80 && !lose(&f) => b.handle_binary(now, &f),
+                    Output::Event(e) => ea.push(e),
+                    _ => {}
+                }
+            }
+            while let Some(out) = b.poll_output() {
+                match out {
+                    Output::Send(f, _) if f[0] < 0x80 => a.handle_binary(now, &f),
+                    Output::Event(e) => eb.push(e),
+                    _ => {}
+                }
+            }
+        }
+        (ea, eb)
+    }
+
+    fn frames_from(events: &[Event], member: MemberId) -> Vec<(bool, u32, Vec<u8>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Video { from, track: 0, keyframe, timestamp, data } if *from == member => {
+                    Some((*keyframe, *timestamp, data.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn video_frames_arrive_whole_with_a_lost_fragment_resent() {
+        let (mut a, mut b) = pair(Config::default());
+        let ia = a.id();
+        let key: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        assert!(a.send_video(0, true, 1000, &key));
+        assert!(a.send_video(0, false, 1033, b"delta"));
+        // The keyframe's second fragment is lost, the first time only.
+        let mut broadcast = 0;
+        let (_, got) = video_between(&mut a, &mut b, 1, 200, |f| {
+            if f[0] != wire::VIDEO || f[2] != BROADCAST {
+                return false;
+            }
+            broadcast += 1;
+            broadcast == 2
+        });
+        assert_eq!(frames_from(&got, ia), [(true, 1000, key), (false, 1033, b"delta".to_vec())]);
+        assert!(!a.send_video(0, false, 0, &vec![0; wire::MAX_VIDEO_FRAME + 1]));
+    }
+
+    #[test]
+    fn a_video_frame_lost_for_good_brings_a_keyframe_request() {
+        let (mut a, mut b) = pair(Config::default());
+        let (ia, ib) = (a.id(), b.id());
+        assert!(a.send_video(0, true, 0, b"key"));
+        assert!(a.send_video(0, false, 1, b"lost"));
+        assert!(a.send_video(0, false, 2, b"after"));
+        // Frame 1 never arrives, nor do its resends.
+        let lost = |f: &[u8]| f[0] == wire::VIDEO && f.len() == 7 + 12 + 4 + 16;
+        let (asked, got) = video_between(&mut a, &mut b, 1, 600, lost);
+        assert_eq!(frames_from(&got, ia), [(true, 0, b"key".to_vec())], "frame 2 cannot be decoded without 1");
+        assert!(
+            asked.iter().any(|e| matches!(e, Event::KeyframeRequest { from, track: 0 } if *from == ib)),
+            "{asked:?}"
+        );
+        // The keyframe that answers it gets things going again.
+        assert!(a.send_video(0, true, 3, b"again"));
+        assert!(a.send_video(0, false, 4, b"fine"));
+        let (_, got) = video_between(&mut a, &mut b, 600, 700, |_| false);
+        assert_eq!(frames_from(&got, ia), [(true, 3, b"again".to_vec()), (false, 4, b"fine".to_vec())]);
+    }
+
+    #[test]
+    fn replay_windows() {
+        let mut strict = Replay::default();
+        assert!(strict.accept(5, false));
+        assert!(!strict.accept(5, false));
+        assert!(strict.accept(6, false));
+        assert!(!strict.accept(4, false), "no reordering outside the real-time classes");
+
+        let mut window = Replay::default();
+        for c in [10, 12, 11, 9, 13] {
+            assert!(window.accept(c, true), "{c}");
+        }
+        for c in [10, 11, 12, 13, 9] {
+            assert!(!window.accept(c, true), "{c} again");
+        }
+        assert!(window.accept(100, true));
+        assert!(window.accept(37, true), "63 below the highest");
+        assert!(!window.accept(36, true), "64 below is too old");
+        assert!(!window.accept(37, true));
+        assert!(window.accept(u32::MAX, true));
+        assert!(!window.accept(100, true), "far behind after a jump");
+    }
+
+    #[test]
+    fn voice_that_arrives_out_of_order_is_played_but_never_twice() {
+        let (mut a, mut b) = pair(Config::default());
+        for seq in 0..3u16 {
+            b.send_voice(seq, &[seq as u8]);
+        }
+        let mut frames: Vec<Vec<u8>> = std::iter::from_fn(|| b.poll_output())
+            .filter_map(|o| if let Output::Send(f, _) = o { Some(f) } else { None })
+            .collect();
+        frames.swap(0, 2);
+        for frame in frames.iter().chain(&frames) {
+            a.handle_binary(0, frame);
+        }
+        let seqs: Vec<u16> = events(&mut a)
+            .iter()
+            .filter_map(|e| if let Event::Voice { seq, .. } = e { Some(*seq) } else { None })
+            .collect();
+        assert_eq!(seqs, [2, 1, 0]);
+    }
+
+    #[test]
+    fn peer_frames_that_overtake_welcome_are_ignored() {
+        let group = Group::create("quic://relay.test:4433").unwrap();
+        let (_, mut b) = pair(Config::default());
+        b.send(Channel::Chat, b"early").unwrap();
+        b.send_voice(0, b"early");
+        let early: Vec<Vec<u8>> = std::iter::from_fn(|| b.poll_output())
+            .filter_map(|o| if let Output::Send(f, _) = o { Some(f) } else { None })
+            .collect();
+        let mut c = Member::new(group, Identity::generate(), Config::default(), 0).unwrap();
+        c.handle_timeout(0);
+        c.handle_open(0);
+        c.handle_binary(0, &crate::wire::hello(&[0; 32]));
+        for frame in &early {
+            c.handle_binary(0, frame);
+        }
+        c.handle_binary(0, &wire::welcome(2, 0b11));
+        let outs: Vec<Output> = std::iter::from_fn(|| c.poll_output()).collect();
+        assert!(!outs.contains(&Output::Disconnect), "{outs:?}");
+        assert_eq!(c.state(), State::Online);
+    }
+
     #[test]
     fn unknown_frames_kinds_and_short_frames_are_ignored() {
         let (mut a, mut b) = pair(Config::default());
@@ -1898,6 +2224,53 @@ mod tests {
         carry(&mut b, &mut a); // (carrying drops the sender's own events, not the receiver's)
         let got = events(&mut a);
         assert!(got.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"still fine")), "{got:?}");
+    }
+
+    #[test]
+    fn snapshot_data_that_overtakes_its_begin_is_kept() {
+        let (mut a, mut b) = pair(Config::default());
+        let (ia, ib) = (a.id(), b.id());
+        a.request_sync(ib).unwrap();
+        let request = std::iter::from_fn(|| a.poll_output())
+            .find_map(|o| if let Output::Send(f, _) = o { Some(f) } else { None })
+            .unwrap();
+        b.handle_binary(0, &request);
+        let Some(Event::SyncRequest { transfer, .. }) =
+            events(&mut b).into_iter().find(|e| matches!(e, Event::SyncRequest { .. }))
+        else {
+            panic!()
+        };
+        let world: Vec<u8> = (0..20_000u32).map(|i| i as u8).collect();
+        b.provide_sync(ia, transfer, world.clone()).unwrap();
+        let frames: Vec<Vec<u8>> = std::iter::from_fn(|| b.poll_output())
+            .filter_map(|o| if let Output::Send(f, _) = o { Some(f) } else { None })
+            .collect();
+        let (bulk, rest): (Vec<_>, Vec<_>) = frames.into_iter().partition(|f| f[0] == wire::BULK);
+        assert!(!bulk.is_empty() && rest.iter().any(|f| f[0] == wire::CONTROL));
+        for frame in bulk.iter().chain(&rest) {
+            a.handle_binary(0, frame);
+        }
+        // The rest of it, paced, in order.
+        let mut got = Vec::new();
+        for now in 1..5000 {
+            b.handle_timeout(now);
+            while let Some(out) = b.poll_output() {
+                if let Output::Send(f, _) = out {
+                    a.handle_binary(now, &f);
+                }
+            }
+            while let Some(out) = a.poll_output() {
+                match out {
+                    Output::Send(f, _) if f[0] < 0x80 => b.handle_binary(now, &f),
+                    Output::Event(e) => got.push(e),
+                    _ => {}
+                }
+            }
+            if !got.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(got, [Event::Snapshot { from: ib, data: world }]);
     }
 
     #[test]

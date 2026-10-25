@@ -33,11 +33,14 @@ enum {
 /* What pc_member_poll returns. */
 typedef enum {
   PC_NONE = 0,
-  /* Open a WebSocket to `data` (a NUL-terminated URL, `len` without the NUL). */
+  /* Open a WebSocket to `data` (a NUL-terminated URL, `len` without the NUL).
+   * For an https:// or quic:// URL, open the WebSocket it falls back to:
+   * wss:// or ws:// with the rest unchanged, unless you speak QUIC. */
   PC_CONNECT = 1,
-  /* Send `data` as a binary message. `class_` is its urgency: 0 command,
-   * 1 voice, 2 chat, 3 bulk. Send the most urgent first; a voice frame may
-   * be dropped when the socket is backed up. */
+  /* Send `data` as a binary message. `class_`: 0 command, 1 voice, 2 chat,
+   * 3 bulk, 4 video. Send the most urgent first, in the order command,
+   * voice, chat, video, bulk; voice and video may be dropped when the socket
+   * is backed up (video oldest first). */
   PC_SEND = 2,
   /* Send the text message "ping". */
   PC_PING = 3,
@@ -56,6 +59,8 @@ typedef enum {
   PC_SYNC_FAILED = 19,  /* the state transfer from `member` failed */
   PC_REPLACED = 20,     /* our identity joined elsewhere and took our slot */
   PC_FULL = 21,         /* the group is full on this relay */
+  PC_VIDEO = 22,        /* a whole video frame from `member`'s `track`: `keyframe`, `timestamp`, `data` */
+  PC_KEYFRAME_REQUEST = 23, /* members need a keyframe of our `track`: send one soon */
 } pc_kind;
 
 typedef struct {
@@ -71,9 +76,13 @@ typedef struct {
   /* Valid until the next call on this member. */
   const uint8_t *data;
   size_t len;
+  /* PC_VIDEO and PC_KEYFRAME_REQUEST. */
+  uint8_t track;
+  uint8_t keyframe;
+  uint32_t timestamp;
 } pc_output;
 
-/* Creates a group on `relay` (a ws:// or wss:// URL) and returns its invite,
+/* Creates a group on `relay` (a ws://, wss://, https:// or quic:// URL) and returns its invite,
  * or NULL. Free it with pc_string_free. The invite is a secret. */
 char *pc_group_create(const char *relay);
 void pc_string_free(char *s);
@@ -112,6 +121,9 @@ int32_t pc_member_send_to(pc_member *m, const uint8_t member[32], uint8_t channe
 int32_t pc_member_send_voice(pc_member *m, uint16_t seq, const uint8_t *data, size_t len);
 /* To one member, or to everyone if `member` is NULL. Returns 1 if sent, 0 if not. */
 int32_t pc_member_send_datagram(pc_member *m, const uint8_t *member, const uint8_t *data, size_t len);
+/* A video frame of `track` (at most 255,000 bytes), to everyone. Returns 1 if sent, 0 if not. */
+int32_t pc_member_send_video(pc_member *m, uint8_t track, uint8_t keyframe, uint32_t timestamp, const uint8_t *data,
+                             size_t len);
 int32_t pc_member_request_sync(pc_member *m, const uint8_t from[32]);
 int32_t pc_member_provide_sync(pc_member *m, const uint8_t to[32], uint32_t transfer, const uint8_t *data, size_t len);
 void pc_member_decline_sync(pc_member *m, const uint8_t to[32], uint32_t transfer);

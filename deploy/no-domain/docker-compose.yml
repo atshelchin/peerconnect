@@ -1,0 +1,21 @@
+# A relay with no domain and no certificate: open TCP and UDP 8080 and
+#
+#   docker compose up -d
+#
+# Invites then start quic://<this host's address>:8080. Native members (the
+# Rust client) use raw QUIC; browsers use WebTransport, pinning the weekly
+# certificate the relay serves (GROUP.md §3.7), which needs no domain; where
+# UDP does not get through, both fall back to ws://<address>:8080. (Browser
+# pages on https:// cannot open ws://, so there they need UDP.)
+services:
+  relay:
+    build: ../..
+    # Or the published image: ghcr.io/atshelchin/peerconnect-relay:main
+    restart: unless-stopped
+    ports: ["8080:8080", "8080:8080/udp"]
+    sysctls:
+      net.ipv4.tcp_notsent_lowat: "32768"
+    environment:
+      PEERCONNECT_MAX_CONNECTIONS: "10000"
+      PEERCONNECT_MAX_PER_ADDRESS: "256"
+      PEERCONNECT_MAX_GROUP_MEMBERS: "10"

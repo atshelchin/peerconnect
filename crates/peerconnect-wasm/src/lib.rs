@@ -241,6 +241,14 @@ impl Group {
     }
 }
 
+/// The SHA-256 hashes of the weekly certificates a `quic://` relay may be
+/// serving at `unix_ms` (GROUP.md §3.7), for `serverCertificateHashes`.
+#[wasm_bindgen(js_name = weeklyCertificateHashes)]
+pub fn weekly_certificate_hashes(unix_ms: f64) -> js_sys::Array {
+    let hashes = group::certificate::hashes((unix_ms / 1000.0).max(0.0) as u64);
+    hashes.iter().map(|h| JsValue::from(Uint8Array::from(&h[..]))).collect()
+}
+
 /// A member identity: an Ed25519 key pair. Persist `seed`.
 #[wasm_bindgen]
 pub struct Identity(group::Identity);
@@ -401,6 +409,19 @@ impl Member {
                     set("from", id(from));
                     set("data", bytes(&data));
                 }
+                Event::Video { from, track, keyframe, timestamp, data } => {
+                    kind("video");
+                    set("from", id(from));
+                    set("track", track.into());
+                    set("keyframe", keyframe.into());
+                    set("timestamp", timestamp.into());
+                    set("data", bytes(&data));
+                }
+                Event::KeyframeRequest { from, track } => {
+                    kind("keyframerequest");
+                    set("from", id(from));
+                    set("track", track.into());
+                }
                 Event::Missed { from, channel, count } => {
                     kind("missed");
                     set("from", id(from));
@@ -441,6 +462,11 @@ impl Member {
     #[wasm_bindgen(js_name = sendVoice)]
     pub fn send_voice(&mut self, seq: u16, data: &[u8]) -> bool {
         self.0.send_voice(seq, data)
+    }
+
+    #[wasm_bindgen(js_name = sendVideo)]
+    pub fn send_video(&mut self, track: u8, keyframe: bool, timestamp: u32, data: &[u8]) -> bool {
+        self.0.send_video(track, keyframe, timestamp, data)
     }
 
     #[wasm_bindgen(js_name = sendDatagram)]
@@ -489,4 +515,4 @@ fn member_of(id: &str) -> Result<group::MemberId, JsError> {
     id.parse().map_err(|_| JsError::new("not a member ID"))
 }
 
-const _: () = assert!(Class::Command as u8 == 0 && Class::Bulk as u8 == 3);
+const _: () = assert!(Class::Command as u8 == 0 && Class::Bulk as u8 == 3 && Class::Video as u8 == 4);

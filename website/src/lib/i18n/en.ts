@@ -26,9 +26,9 @@ export const en = {
 				'Pair two browsers with a QR code and chat end-to-end encrypted through a public PeerConnect relay. Runs the real protocol in WebAssembly.'
 		},
 		voice: {
-			title: 'Live demo: group voice chat — PeerConnect',
+			title: 'Live demo: group voice and video chat — PeerConnect',
 			description:
-				'Talk with up to ten people, end-to-end encrypted, through a public PeerConnect relay: Opus voice with an adaptive jitter buffer, and text chat. Open it on two devices.'
+				'Talk and see each other, up to ten people, end-to-end encrypted, through a public PeerConnect relay: Opus voice, VP8 video and text chat. Open it on two devices.'
 		},
 		spec: {
 			title: 'Protocol specification v1 — PeerConnect',
@@ -287,14 +287,14 @@ export const en = {
 	},
 	voice: {
 		eyebrow: 'Live demo',
-		title: 'Group voice chat',
-		lead: 'Talk with up to ten people at once, end-to-end encrypted. Create a room, send the link to a friend or open it on your phone, and speak.',
+		title: 'Group voice and video chat',
+		lead: 'Talk with up to ten people at once, and turn the camera on to see each other, end-to-end encrypted. Create a room, send the link to a friend or open it on your phone, and speak.',
 		steps: [
 			'Create a room, and share the link.',
 			'Everyone who opens it enters a name and joins with their microphone.',
-			'Speak. Use headphones if you are in the same room, or the microphones hear each other.'
+			'Speak, and turn your camera on from your card if you like. Use headphones if you are in the same room, or the microphones hear each other.'
 		],
-		note: 'The real thing: the Rust core in WebAssembly, Opus through WebCodecs, an adaptive jitter buffer per speaker, all through the public relay <code>{relay}</code>, which forwards only ciphertext. The room key is in the link after <code>#</code>, which browsers never send to a server.',
+		note: 'The real thing: the Rust core in WebAssembly, Opus and VP8 through WebCodecs, an adaptive jitter buffer per speaker, video put back together whole from its fragments, all through the public relay <code>{relay}</code>, which forwards only ciphertext. The room key is in the link after <code>#</code>, which browsers never send to a server.',
 		noscript: 'The demo needs JavaScript and WebAssembly.',
 		loading: 'Loading…',
 		start: {
@@ -312,6 +312,7 @@ export const en = {
 		},
 		problems: {
 			mic: 'The microphone is not available (permission denied, or none found). You can still listen and chat.',
+			camera: 'The camera is not available (permission denied, or none found).',
 			codecs:
 				'This browser cannot encode Opus audio (WebCodecs). Text chat works; for voice, use a recent Chrome, Edge or Firefox.',
 			full: 'The room is full (ten people). The page keeps trying.',
@@ -336,7 +337,10 @@ export const en = {
 			muteThem: 'Stop hearing {name} (only for you)',
 			unmuteThem: 'Hear {name} again',
 			theirMicOff: '{name} muted their microphone',
-			theirHearingOff: '{name} turned their headphones off and hears nobody'
+			theirHearingOff: '{name} turned their headphones off and hears nobody',
+			cameraOn: 'Turn your camera off',
+			cameraOff: 'Turn your camera on: everyone sees you',
+			video: 'Video from {name}'
 		},
 		invite: {
 			title: 'Invite',
@@ -357,7 +361,7 @@ export const en = {
 		lead: 'Open this page on your phone and your laptop — or in two browser windows — connect them with a QR code, and chat end-to-end encrypted.',
 		note: 'This is the real protocol: the Rust core compiled to WebAssembly, talking through the public relay <code>{relay}</code>. Each browser tab is its own peer, and reloading the tab keeps your room.',
 		noscript: 'The demo needs JavaScript and WebAssembly.',
-		voiceLink: 'More than two? Try the group voice chat demo →',
+		voiceLink: 'More than two? Try the group voice and video chat demo →',
 		steps: [
 			'Create a room on one device.',
 			'Scan the QR code with the other, or open the link there.',

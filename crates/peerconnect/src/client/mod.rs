@@ -44,6 +44,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::{CloseReason, Event, Output, Peer, Room, SendError, State, wire};
 
 pub mod group;
+mod quic;
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Connecting = Pin<Box<dyn Future<Output = Option<Ws>> + Send>>;

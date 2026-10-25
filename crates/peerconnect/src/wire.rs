@@ -68,6 +68,8 @@ pub mod close {
     pub const REPLACED: u16 = 4409;
     /// The group is full on this relay.
     pub const FULL: u16 = 4429;
+    /// Over raw QUIC: the request path names no group (HTTP 404 elsewhere).
+    pub const NOT_FOUND: u16 = 4404;
 }
 
 /// The two seats of a room.

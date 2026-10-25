@@ -105,7 +105,9 @@ for (const [who, slot, to, echo] of [
 }
 
 // §4.3, §5, §6: every sealed frame, rebuilt from its fields.
-const CONTROL = 0x02, COMMAND = 0x03, VOICE = 0x21, DATAGRAM = 0x22, CHAT = 0x41, BULK = 0x61;
+const CONTROL = 0x02, COMMAND = 0x03, VOICE = 0x21, DATAGRAM = 0x22, VIDEO = 0x31, CHAT = 0x41, BULK = 0x61;
+// §7.4: track[1] frame[4] index[1] count[1] flags[1] timestamp[4] ‖ data.
+const fragment = (f) => cat([f.track], u32(f.frame), [f.index, f.count, f.keyframe ? 1 : 0], u32(f.timestamp), hex(f.data));
 const message = (f) => cat([0x00], u64(f.id), ascii(f.payload));
 const builders = {
   //            type      from to         plaintext
@@ -121,6 +123,7 @@ const builders = {
   resent_message: (f) => [COMMAND, 2, 0, message(f)],
   resent: (f) => [COMMAND, 2, 0, cat([0x02], u64(f.next))],
   sync_request: (f) => [CONTROL, 0, 2, cat([0x10], u32(f.transfer))],
+  sync_request_declined: (f) => [CONTROL, 0, 2, cat([0x10], u32(f.transfer))],
   sync_begin: (f) => [
     CONTROL,
     2,
@@ -130,6 +133,12 @@ const builders = {
   bulk: (f) => [BULK, 2, 0, cat(u32(f.transfer), ascii(f.data))],
   sync_ack: (f) => [CONTROL, 0, 2, cat([0x12], u32(f.transfer), u64(f.received))],
   sync_abort: (f) => [CONTROL, 2, 0, cat([0x13], u32(f.transfer))],
+  video_fragment: (f) => [VIDEO, 2, BROADCAST, fragment(f)],
+  video_fragment_lost: (f) => [VIDEO, 2, BROADCAST, fragment(f)],
+  video_nack: (f) => [CONTROL, 0, 2, cat([0x20, f.track], u32(f.frame), f.indices)],
+  video_resent: (f) => [VIDEO, 2, 0, fragment(f)],
+  video_delta: (f) => [VIDEO, 2, BROADCAST, fragment(f)],
+  keyframe_request: (f) => [CONTROL, 0, 2, cat([0x21, f.track])],
 };
 
 for (const frame of v.frames) {
@@ -144,7 +153,67 @@ for (const frame of v.frames) {
   assert.deepEqual(cat(header, chacha(sender.key, nonce, header, plaintext)), hex(frame.frame), frame.name);
 }
 
+// A video frame is cut into fragments of at most 1,000 bytes of data (§7.4).
+assert.equal(hex(v.frames.find((f) => f.name === "video_fragment").fields.data).length, 1000);
 // The voice payload is the reference format: hold[1] ‖ Opus packet (§7.2).
 assert.equal(hex(v.frames.find((f) => f.name === "voice").fields.audio)[0], 12);
 
 console.log(`g1.json: all values and ${v.frames.length} frames reproduced independently`);
+
+// The weekly certificate (GROUP.md §3.7): rebuilt from the spec, with the
+// signature checked rather than recomputed (node:crypto signs ECDSA with a
+// random nonce; the reference uses RFC 6979, which only makes it repeatable).
+{
+  const w = JSON.parse(readFileSync(new URL("./g1-certificate.json", import.meta.url)));
+  const tlv = (tag, value) => {
+    const n = value.length;
+    const len = n < 0x80 ? [n] : n < 0x100 ? [0x81, n] : [0x82, n >> 8, n & 0xff];
+    return cat([tag], len, value);
+  };
+  const seq = (...parts) => tlv(0x30, cat(...parts));
+  const oid = (h) => tlv(0x06, hex(h));
+  const integer = (bytes) => {
+    let b = Buffer.from(bytes);
+    while (b.length > 1 && b[0] === 0) b = b.subarray(1);
+    return tlv(0x02, b[0] & 0x80 ? cat([0], b) : b);
+  };
+  const utc = (seconds) => tlv(0x17, ascii(new Date(seconds * 1000).toISOString().replace(/[-:T]/g, "").slice(2, 14) + "Z"));
+  const ecdsaSha256 = seq(oid("2a8648ce3d040302"));
+  const name = seq(tlv(0x31, seq(oid("550403"), tlv(0x0c, ascii("peerconnect")))));
+  const WEEK = 604800;
+  for (const { week, private_key, certificate, sha256 } of w.weeks) {
+    const scalar = crypto.createHash("sha256").update(ascii(w.context)).update(u64(week)).digest();
+    assert.deepEqual(scalar, hex(private_key), `week ${week}: key`);
+    const ecdh = crypto.createECDH("prime256v1");
+    ecdh.setPrivateKey(scalar);
+    const point = ecdh.getPublicKey(); // uncompressed
+    const start = week * WEEK;
+    const tbs = seq(
+      tlv(0xa0, integer([2])),
+      integer(u64(week + 1)),
+      ecdsaSha256,
+      name,
+      seq(utc(start - 86400), utc(start + 12 * 86400)),
+      name,
+      seq(seq(oid("2a8648ce3d0201"), oid("2a8648ce3d030107")), tlv(0x03, cat([0], point))),
+      tlv(0xa3, seq(seq(oid("551d13"), tlv(0x04, seq())))),
+    );
+    const der = hex(certificate);
+    // Certificate = SEQUENCE { tbs, algorithm, BIT STRING signature }.
+    const header = der[1] === 0x82 ? 4 : der[1] === 0x81 ? 3 : 2;
+    assert.deepEqual(der.subarray(header, header + tbs.length), tbs, `week ${week}: certificate body`);
+    const rest = der.subarray(header + tbs.length);
+    assert.deepEqual(rest.subarray(0, ecdsaSha256.length), ecdsaSha256, `week ${week}: signature algorithm`);
+    const bits = rest.subarray(ecdsaSha256.length);
+    assert.equal(bits[0], 0x03);
+    const signature = bits.subarray(bits[1] === 0x81 ? 4 : 3);
+    const key = crypto.createPublicKey({
+      key: { kty: "EC", crv: "P-256", x: point.subarray(1, 33).toString("base64url"), y: point.subarray(33).toString("base64url") },
+      format: "jwk",
+    });
+    assert.ok(crypto.verify("sha256", tbs, { key, dsaEncoding: "der" }, signature), `week ${week}: signature`);
+    assert.equal(crypto.createHash("sha256").update(der).digest("hex"), sha256, `week ${week}: hash`);
+    new crypto.X509Certificate(der); // and it parses as a certificate
+  }
+  console.log(`g1-certificate.json: ${w.weeks.length} weekly certificates rebuilt and verified independently`);
+}

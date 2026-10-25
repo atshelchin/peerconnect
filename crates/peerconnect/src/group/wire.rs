@@ -24,6 +24,8 @@ pub const COMMAND: u8 = 0x03;
 pub const VOICE: u8 = 0x21;
 /// Application data that is dropped rather than delayed (positions, poses).
 pub const DATAGRAM: u8 = 0x22;
+/// A fragment of a video frame (GROUP.md §7.4).
+pub const VIDEO: u8 = 0x31;
 pub const CHAT: u8 = 0x41;
 /// State transfer data.
 pub const BULK: u8 = 0x61;
@@ -44,6 +46,12 @@ pub const MAX_PLAINTEXT_LEN: usize = MAX_FRAME_LEN - SEALED_HEADER_LEN - TAG_LEN
 pub const MAX_PAYLOAD_LEN: usize = MAX_PLAINTEXT_LEN - 9;
 /// Largest voice frame or datagram.
 pub const MAX_DATAGRAM_LEN: usize = MAX_PLAINTEXT_LEN - 2;
+/// Video: a fragment's header, `track[1] frame[4] index[1] count[1] flags[1] timestamp[4]`.
+pub const VIDEO_HEADER_LEN: usize = 12;
+/// Video data per fragment, at most: small enough for a QUIC datagram on any path.
+pub const MAX_VIDEO_FRAGMENT: usize = 1000;
+/// Largest video frame: 255 fragments.
+pub const MAX_VIDEO_FRAME: usize = 255 * MAX_VIDEO_FRAGMENT;
 pub const MAX_PROFILE_LEN: usize = 1024;
 
 pub const TOKEN_LEN: usize = 16;
@@ -59,7 +67,8 @@ pub const RECEIVE_TIMEOUT: Duration = Duration::from_secs(25);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(40);
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How urgent a frame is, most urgent first, and how it is delivered.
+/// How a frame is delivered, and how urgent it is: see [`Class::PRIORITY`].
+/// The numbers are the classes' QUIC stream headers (GROUP.md §3.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     /// Commands and protocol control (and relay frames): reliable.
@@ -70,17 +79,24 @@ pub enum Class {
     Chat = 2,
     /// State transfer: reliable, flow-controlled end to end.
     Bulk = 3,
+    /// Video: dropped rather than delayed, like voice, but less urgent than
+    /// chat, which it could otherwise starve.
+    Video = 4,
 }
 
 impl Class {
-    pub const ALL: [Class; 4] = [Class::Command, Class::Voice, Class::Chat, Class::Bulk];
+    pub const ALL: [Class; 5] = [Class::Command, Class::Voice, Class::Chat, Class::Bulk, Class::Video];
+    /// Most urgent first.
+    pub const PRIORITY: [Class; 5] = [Class::Command, Class::Voice, Class::Chat, Class::Video, Class::Bulk];
+    pub const COUNT: usize = 5;
 
     /// The class of a peer frame type (`0x00`–`0x7F`).
     pub fn of(frame_type: u8) -> Class {
-        match frame_type >> 5 {
-            0 => Class::Command,
-            1 => Class::Voice,
-            2 => Class::Chat,
+        match frame_type >> 4 {
+            0 | 1 => Class::Command,
+            2 => Class::Voice,
+            3 => Class::Video,
+            4 | 5 => Class::Chat,
             _ => Class::Bulk,
         }
     }
@@ -91,7 +107,12 @@ impl Class {
 
     /// Whether frames of this class may be dropped instead of queued.
     pub fn is_realtime(self) -> bool {
-        self == Class::Voice
+        matches!(self, Class::Voice | Class::Video)
+    }
+
+    /// Higher is more urgent: 4 for commands down to 0 for bulk.
+    pub fn urgency(self) -> u8 {
+        (Class::COUNT - 1 - Class::PRIORITY.iter().position(|&c| c == self).unwrap()) as u8
     }
 }
 
@@ -136,6 +157,13 @@ mod tests {
         assert_eq!(Class::of(COMMAND), Class::Command);
         assert_eq!(Class::of(VOICE), Class::Voice);
         assert_eq!(Class::of(DATAGRAM), Class::Voice);
+        assert_eq!(Class::of(0x2F), Class::Voice);
+        assert_eq!(Class::of(VIDEO), Class::Video);
+        assert_eq!(Class::of(0x3F), Class::Video);
+        assert_eq!(Class::of(0x40), Class::Chat);
+        assert_eq!(Class::of(0x1F), Class::Command);
+        assert_eq!(Class::PRIORITY.map(Class::urgency), [4, 3, 2, 1, 0], "commands, voice, chat, video, bulk");
+        assert!(Class::Video.is_realtime() && Class::Voice.is_realtime() && !Class::Chat.is_realtime());
         assert_eq!(Class::of(CHAT), Class::Chat);
         assert_eq!(Class::of(BULK), Class::Bulk);
         assert_eq!(Class::of(0x7F), Class::Bulk);

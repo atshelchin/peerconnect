@@ -8,11 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["relay", "websocket", "e2ee", "server", "pairing"]
+keywords = ["relay", "websocket", "quic", "webtransport", "e2ee"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
-peerconnect = { path = "../peerconnect", version = "0.1.0" }
+peerconnect = { path = "../peerconnect", version = "0.1.0", features = ["certificate"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1"
@@ -20,6 +20,11 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# QUIC (GROUP.md §3.6), and TLS for wss:// and WebTransport.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -27,4 +32,6 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 peerconnect = { path = "../peerconnect", features = ["client"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

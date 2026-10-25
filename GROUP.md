@@ -1,6 +1,6 @@
 # PeerConnect Groups, version 1
 
-Up to 32 members, one group, end-to-end encryption over an untrusted, stateless WebSocket relay: commands, chat, voice and state transfer, each with its own priority.
+Up to 32 members, one group, end-to-end encryption over an untrusted, stateless relay, reached over WebSockets or QUIC: commands, chat, voice, video and state transfer, each with its own priority.
 
 Status: draft for review. It extends [SPEC.md](SPEC.md) (two-peer rooms) without changing it: groups use their own endpoint, frames and keys, and a relay may serve both. Sections of SPEC.md referenced here (base64url, primitives, keepalive) apply unchanged.
 
@@ -18,9 +18,9 @@ The relay:
 The members:
 
 - authenticate each other by identity, and agree on fresh per-connection **sender keys**, so that a relay cannot read, forge or replay anything, even from an earlier session;
-- send on four **traffic classes**, from most to least urgent: *commands*, *voice*, *chat* and *bulk*. A class never waits for a less urgent one, anywhere along the way;
+- send on five **traffic classes**, from most to least urgent: *commands*, *voice*, *chat*, *video* and *bulk*. A class never waits for a less urgent one, anywhere along the way;
 - carry two reliable broadcast **streams** per member, commands and chat: numbered messages, kept by the sender and resent after reconnections, delivered to every member in each sender's order, exactly once while both keep running;
-- send **voice** as real-time frames that anyone along the way drops rather than delays;
+- send **voice** and **video** as real-time frames that anyone along the way drops rather than delays;
 - bring a newcomer up to date with **state transfer**: a member already present sends an application snapshot together with the exact set of commands it contains, and the newcomer receives every later command, and only those.
 
 PeerConnect does not define what commands mean, does not order commands from different senders against each other, and keeps nothing on the relay. Applications choose their own consistency model (§7.3).
@@ -58,7 +58,7 @@ The text form of a group ID is its base64url encoding.
 invite = relay_url "#" base64url(S)
 ```
 
-`relay_url` is as in SPEC.md §3.3. The fragment MUST decode to exactly 32 bytes, which a version 1 two-peer implementation rejects (it expects 64), and vice versa.
+`relay_url` is as in SPEC.md §3.3, or, for a relay that also offers QUIC, an `https://` or `quic://` URL (§3.6). The fragment MUST decode to exactly 32 bytes, which a version 1 two-peer implementation rejects (it expects 64), and vice versa.
 
 The invite is the whole credential: there is nothing else to store, and no pairing. Whoever holds it can enter the group, read everything sent there and send under its own identity. Give it only to members, over a confidential channel; a game server that forms a squad would typically generate `S` and hand it to each player. To exclude someone, move the group to a new secret.
 
@@ -78,7 +78,7 @@ It lets the relay recognise a member's new connection as a replacement for its o
 
 ### 3.1 Endpoint and joining
 
-A member opens a WebSocket to
+A member opens a WebSocket (or a QUIC connection, §3.6) to
 
 ```
 relay_url "/g1/" group_id
@@ -110,7 +110,7 @@ Relay frames:
 
 On seating a connection, the relay sends it WELCOME, then sends every other connection MEMBER (`slot`, `0x01`), including when the new connection replaced an older one in that slot. When a seated connection ends for any reason other than replacement, the relay sends every other connection MEMBER (`slot`, `0x00`).
 
-Ordering: a connection receives nothing before its WELCOME, and receives MEMBER (`s`, `0x01`) before any frame from the new connection in slot `s`. A relay MUST NOT deliver any frame from a connection after the MEMBER that announced its replacement or departure: frames still queued from it are discarded.
+Ordering: a connection receives nothing before its WELCOME, and receives MEMBER (`s`, `0x01`) before any frame from the new connection in slot `s`. A relay MUST NOT deliver any frame from a connection after the MEMBER that announced its replacement or departure: frames still queued from it are discarded. Over QUIC these guarantees hold within the command class only (§3.6).
 
 ### 3.3 Peer frames and classes
 
@@ -128,13 +128,16 @@ The type determines the frame's **class**. The relay knows nothing else about it
 | Types | Class | Priority | Delivery |
 |---|---|---|---|
 | `0x00`–`0x1F` | command | 0 (most urgent) | reliable |
-| `0x20`–`0x3F` | voice | 1 | real-time: dropped rather than delayed |
+| `0x20`–`0x2F` | voice | 1 | real-time: dropped rather than delayed |
 | `0x40`–`0x5F` | chat | 2 | reliable |
-| `0x60`–`0x7F` | bulk | 3 | reliable, flow-controlled end to end |
+| `0x30`–`0x3F` | video | 3 | real-time: dropped rather than delayed |
+| `0x60`–`0x7F` | bulk | 4 | reliable, flow-controlled end to end |
 
-A relay MUST deliver the frames of one class from one connection to another in the order sent. It SHOULD hold a queue per class for each recipient and always send from the most urgent non-empty queue, so that a less urgent class never delays a more urgent one beyond the frame being written. Relay frames go with the command class.
+Video comes after chat, although it is real-time, because it can fill a link: ahead of chat, it could starve it.
 
-Real-time frames: a relay SHOULD drop a voice frame, instead of queueing it, when more than a few kilobytes (the reference relay: 8 KiB) of command and voice frames are already waiting for that recipient. Late audio is worse than lost audio.
+A relay MUST deliver the frames of one class from one connection to another in the order sent (over QUIC, voice excepted: §3.6). It SHOULD hold a queue per class for each recipient and always send from the most urgent non-empty queue, so that a less urgent class never delays a more urgent one beyond the frame being written. Relay frames go with the command class.
+
+Real-time frames: a relay SHOULD drop a voice frame, instead of queueing it, when more than a few kilobytes (the reference relay: 8 KiB) of command and voice frames are already waiting for that recipient. Late audio is worse than lost audio. It SHOULD give video a budget of its own (the reference relay: 64 KiB per recipient) and drop the *oldest* video frames queued to stay within it: an old picture is worth less than a new one.
 
 Reliable frames are never dropped. When a recipient falls behind on commands and chat (the reference relay: 256 KiB queued), the relay stops reading from the sender of the frame until that recipient catches up, but for **5 s** at most: a recipient that has not caught up by then is not reading, and the relay closes it with 4408. A recipient whose reliable queue overflows outright (the reference relay: 2 MiB) is closed at once. So a burst of commands slows its sender to the pace of the slowest member for a moment, while one stuck member cannot hold the group up for longer than that. Bulk does not count towards falling behind: its window (§6) bounds it. A relay SHOULD also bound each connection's sending rate (the reference relay: 2 MiB/s, bursts of 4 MiB), by dropping voice and delaying the rest.
 
@@ -151,6 +154,55 @@ As SPEC.md §4.6, with shorter times, since a game notices a dead voice connecti
 ### 3.5 Close codes
 
 As SPEC.md §4.7, with 4409 meaning a newer connection of the same identity took the slot, and **4429**: the group is full on this relay.
+
+### 3.6 QUIC
+
+A relay MAY also accept groups over QUIC (RFC 9000), where each class travels on a stream of its own and voice in datagrams (RFC 9221), so that a packet lost on the way holds up only its own class and voice waits for nothing. The relay URL says what a relay offers, and members try its transports in this order:
+
+| Relay URL | Transports, in order |
+|---|---|
+| `ws://…`, `wss://…` | that WebSocket |
+| `https://host[:port]…` | QUIC on UDP `host:port` (443 by default): WebTransport over HTTP/3 for browsers, raw QUIC for others; then the WebSocket `wss://host[:port]…` |
+| `quic://host[:port]…` | raw QUIC on UDP `host:port` (443 by default), or, for browsers, WebTransport to `https://host[:port]…` with the weekly certificate pinned (§3.7); then the WebSocket `ws://host[:port]…` |
+
+Paths are as in §3.1. A member SHOULD give QUIC a head start (the reference implementations: **1.5 s**) before trying the WebSocket as well, and keep whichever opens first; one that cannot use QUIC (a WebSocket-only runtime) goes to the WebSocket at once. Members on different transports share one group.
+
+**Connecting.** WebTransport uses ALPN `h3` and an extended CONNECT to the path; a relay rejects a path that is not a group with HTTP 404. Its certificate MUST be one browsers accept: for the host's name or address, or one they are given the hash of (`serverCertificateHashes`). Raw QUIC uses ALPN `peerconnect-g1`; the member's first message, on its command stream, is the path (UTF-8). A relay closes a raw connection whose path is not a group with **4404**, and one whose first stream is not the command stream with 1002. A member verifies the certificate of an `https://` relay for its host. A member of a `quic://` relay does not verify its certificate (raw QUIC), or pins the hashes of the weekly certificates (WebTransport, §3.7): groups do not rely on the relay for confidentiality or authenticity (§9), so such a relay needs neither a domain nor a certificate anyone signed.
+
+**Streams.** Each side opens, when it first needs one, a unidirectional stream per class, which starts with one byte, the class: `0x00` command, `0x01` voice, `0x02` chat, `0x03` bulk, `0x04` video. Then come messages, `length[2] ‖ message` (big-endian, at most 16,384): the WebSocket messages of §3.1–§3.3, with the empty message standing for the text messages, `ping` from a member and `pong` from the relay. Relay frames go on the command stream. Each stream SHOULD have its class's priority.
+
+**Datagrams.** A voice or video frame that fits in a datagram is sent as one, the frame alone; one that does not goes on its class's stream. The relay forwards each in a datagram where it fits the recipient's path, whatever the sender used. Datagrams leave in the order they are queued, so a sender SHOULD hand video to its datagram queue only while that leaves room for voice (the reference implementations: 4 KiB, of an 8 KiB queue), keeping the rest of its video in a queue of its own that drops its oldest.
+
+**Ordering.** Frames of one type from one connection arrive in order, voice and video frames excepted, which may be reordered; frames of different classes, relay frames included, may overtake each other. So over QUIC:
+
+- peer frames may arrive before WELCOME: a member ignores them;
+- frames from a slot's earlier connection, already on their way, may arrive after the MEMBER that announced a new one: they fail to decrypt under the new sender key and are ignored;
+- BULK data may arrive before its SYNC_BEGIN, which receivers allow for (§6);
+- a stream message may arrive before or after the KEY, CONFIRM or HEADS that announces its stream's position; §5 covers both.
+
+**Closing, keepalive and limits** are as over WebSockets: the close codes of §3.5 are the QUIC application close codes (raw QUIC) or the WebTransport session close codes; members `ping` as in §3.4; and a relay holds a sender back through QUIC flow control as through TCP, and drops voice for a recipient that is behind (§3.3).
+
+### 3.7 The weekly certificate
+
+Browsers accept a certificate that nobody signed for WebTransport only if they are told its SHA-256 hash in advance, and only if it is valid for at most 14 days. So a relay without a certificate of its own serves QUIC with the certificate of the current week, which is a pure function of the week, and members compute the hashes to pin:
+
+```
+week        = floor(unix_time / 604800)
+private key = the P-256 scalar SHA-256("peerconnect/g1 webtransport certificate" ‖ week[8]),
+              hashed again with SHA-256 while it is not a valid scalar
+certificate = X.509 v3, DER, self-signed:
+  serial      week + 1
+  algorithm   ecdsa-with-SHA256
+  issuer      CN=peerconnect (UTF8String), as the subject
+  validity    week × 604800 − 1 day  to  week × 604800 + 12 days (UTCTime)
+  key         id-ecPublicKey, prime256v1, the uncompressed public key
+  extensions  basicConstraints, empty (not a certificate authority)
+  signature   ECDSA with SHA-256 over the TBSCertificate, nonce per RFC 6979, DER
+```
+
+[`test-vectors/g1-certificate.json`](test-vectors/g1-certificate.json) gives the exact bytes for two weeks. A relay switches to the next week's certificate as its week begins. A member pins the hashes of the certificates of the previous, current and next week by its own clock, so that a day's difference between clocks does not matter (each certificate is valid for 13 days, and the next one from the day before its week).
+
+The private key is public: anyone can pose as such a relay, just as anyone on the path can for raw QUIC to a `quic://` relay, and learns what a relay learns, but nothing members send. TLS still keeps the traffic from those who only watch.
 
 ## 4. Keys
 
@@ -183,7 +235,7 @@ Each member keeps, for every slot, what it knows of the connection there:
 
 A member that has seen a slot occupied for **5 s** without admitting it SHOULD send that slot its KEY again (zero `echo` if it knows nothing of the slot, the slot's challenge if pending).
 
-Admission proves freshness: the sender has seen this connection's random challenge, so a relay cannot admit a member by replaying frames from an earlier session. Until a sender is admitted, everything from it except KEY and CONFIRM is ignored. On MEMBER for a slot, a member forgets what it knew of the slot (§3.2 guarantees nothing more from the old connection follows).
+Admission proves freshness: the sender has seen this connection's random challenge, so a relay cannot admit a member by replaying frames from an earlier session. Until a sender is admitted, everything from it except KEY and CONFIRM is ignored. On MEMBER for a slot, a member forgets what it knew of the slot (§3.2 guarantees nothing more from the old connection follows; over QUIC, what still does fails to decrypt).
 
 A member reports another as **joined** when it admits it, and as **left** when a MEMBER for its slot arrives. Two admitted slots with the same identity cannot occur through an honest relay (§3.2); the newer replaces the older.
 
@@ -196,7 +248,7 @@ type ‖ from ‖ to ‖ counter[4] ‖ ChaCha20-Poly1305(sender_key, nonce, ad 
 nonce = type ‖ 0x00 × 7 ‖ counter              (12 bytes)
 ```
 
-Each type has its own counter on each connection, starting at 0 and increasing by one per frame. A receiver accepts a frame only if its counter exceeds the last one it accepted of that type from that connection; so a relay may drop frames, or delay one class behind another, but cannot replay or reorder within a class. A frame that fails to decrypt is ignored. A sender that would need counter 2³² reconnects (which gives it a new sender key).
+Each type has its own counter on each connection, starting at 0 and increasing by one per frame. A receiver accepts a frame only if its counter exceeds the last one it accepted of that type from that connection, or, for the voice and video classes, if it is one of the 63 below that one and was not accepted before, since real-time frames may arrive out of order (§3.6). So a relay may drop frames, delay one class behind another, or reorder voice and video, but cannot replay anything, nor reorder the reliable classes. A frame that fails to decrypt is ignored. A sender that would need counter 2³² reconnects (which gives it a new sender key).
 
 | Type | Name | Class | Plaintext |
 |---|---|---|---|
@@ -204,6 +256,7 @@ Each type has its own counter on each connection, starting at 0 and increasing b
 | `0x03` | COMMAND | command | a message (§5) |
 | `0x21` | VOICE | voice | `seq[2] ‖ audio` |
 | `0x22` | DATAGRAM | voice | application data that is dropped rather than delayed (positions, poses) |
+| `0x31` | VIDEO | video | a fragment of a video frame (§7.4) |
 | `0x41` | CHAT | chat | a message (§5) |
 | `0x61` | BULK | bulk | `transfer[4] ‖ data` (§6) |
 
@@ -218,6 +271,8 @@ CONTROL kinds:
 | `0x11` | SYNC_BEGIN | `transfer[4] ‖ length[8] ‖ count[1] ‖ (incarnation[8] ‖ next[8]) × count` |
 | `0x12` | SYNC_ACK | `transfer[4] ‖ received[8]` |
 | `0x13` | SYNC_ABORT | `transfer[4]` |
+| `0x20` | VIDEO_NACK | `track[1] ‖ frame[4] ‖ index[1] × n`: fragments of our frame to send again, `0xFF` for all of them (§7.4) |
+| `0x21` | KEYFRAME_REQUEST | `track[1]`: a keyframe of this track, please (§7.4) |
 
 Channel `0x00` is commands, `0x01` is chat. Receivers MUST ignore unknown types, kinds and channels, so that later revisions can add them.
 
@@ -254,7 +309,7 @@ A newcomer with no state, or one that missed too much, asks a member for a **sna
 
 1. The newcomer picks a transfer id and sends the member SYNC_REQUEST. From now until the transfer ends, it holds every COMMAND message it receives, instead of delivering it. Chat is not held.
 2. The member's implementation reports the request to its application, and records the **frontier** at that point: its positions in every command stream it knows, its own included. The application answers with a snapshot of its state *as of that report*, having applied exactly the commands delivered before it.
-3. The member sends SYNC_BEGIN with the snapshot's length and the frontier, then the snapshot in BULK frames, in order. The newcomer sends SYNC_ACK with the bytes received after every **16 KiB** and at the end. The member keeps at most a **window** of data sent but not acknowledged, between **16 KiB and 1 MiB**, and SHOULD adapt it to the queueing delay the transfer adds to the path, since voice and commands wait in the same queues. A fixed window is either slow on a long path or, on a slow one, fills those queues for seconds.
+3. The member sends SYNC_BEGIN with the snapshot's length and the frontier, then the snapshot in BULK frames, in order. Over QUIC, BULK frames can overtake SYNC_BEGIN (§3.6): the newcomer keeps such data, up to **2 MiB** (more than any window), until SYNC_BEGIN arrives. The newcomer sends SYNC_ACK with the bytes received after every **16 KiB** and at the end. The member keeps at most a **window** of data sent but not acknowledged, between **16 KiB and 1 MiB**, and SHOULD adapt it to the queueing delay the transfer adds to the path, since voice and commands wait in the same queues. A fixed window is either slow on a long path or, on a slow one, fills those queues for seconds.
 
    The reference implementation, after LEDBAT (RFC 6817): chunks of 4 KiB (so that a voice frame behind one on a 2 Mbit/s link waits 16 ms), paced evenly over the round trip rather than sent in bursts; the delay is the smallest of the last three acknowledgements' round trips, less the smallest ever seen; the window starts at 32 KiB, grows by an eighth per round trip while that delay is under half the target, by a chunk per round trip below the target, and shrinks by a quarter, at most once per round trip, above it. The target is 50 ms by default (`Config::transfer_delay`). Measured on emulated access links with deep buffers, three members talking while one sends a 2 MB snapshot: on 20 Mbit/s and 20 ms each way, voice p99 48 ms against 45 ms without the transfer; on 2 Mbit/s and 40 ms, 140 ms against 87 ms (a fixed 256 KiB window: 920 ms); the snapshot takes 2 s and 10 s.
 4. Once the snapshot is complete, the newcomer delivers it to its application, which replaces its state with it. Then, for every stream in the frontier, it sets its position to the frontier's: held messages below it are dropped as already contained in the snapshot, those from it on are delivered. If its own position in a stream was beyond the frontier (it had delivered messages the snapshot does not contain), it sends RESEND from the frontier to get them again. Streams absent from the frontier keep their positions.
@@ -271,7 +326,7 @@ As SPEC.md §6.1: one connection at a time; reconnect with exponential backoff a
 
 ### 7.2 Sending without delay
 
-A member SHOULD keep its own queue per class in front of its WebSocket and hand the socket frames from the most urgent class first. It SHOULD hand over chat and bulk frames only while the socket has little unsent (a browser's `bufferedAmount`, say under 16 KiB), and drop a voice frame when that is already over a few kilobytes. Then a command is never stuck behind more than one bulk frame, and a stalled link loses audio instead of building up delay.
+A member SHOULD keep its own queue per class in front of its WebSocket and hand the socket frames from the most urgent class first (over QUIC, a stream per class does this, §3.6). It SHOULD hand over chat and bulk frames only while the socket has little unsent (a browser's `bufferedAmount`, say under 16 KiB), and drop a voice frame when that is already over a few kilobytes. Then a command is never stuck behind more than one bulk frame, and a stalled link loses audio instead of building up delay.
 
 Voice frames carry `seq`, the sender's count of audio frames of fixed duration (wrapping at 2¹⁶). A sender MAY skip silent frames, still counting them. Receivers use `seq` to place frames in time, and SHOULD play them out through an adaptive jitter buffer that discards frames to catch up after a stall rather than playing late.
 
@@ -286,6 +341,25 @@ Every member sees each stream in the same order, but streams from different memb
 
 Commands are signed by nobody but arrive from an admitted sender, whose identity the application knows: that is what lets it check that a command comes from someone allowed to give it.
 
+### 7.4 Video
+
+A video frame (an encoded picture) is cut into **fragments** of at most **1,000 bytes** of data, each its own VIDEO frame, so that each fits a QUIC datagram on any path; a frame has at most 255 fragments (255,000 bytes). The plaintext of each:
+
+```
+track[1] ‖ frame[4] ‖ index[1] ‖ count[1] ‖ flags[1] ‖ timestamp[4] ‖ data
+```
+
+`track` lets one member send several videos (a camera and a screen, say). `frame` numbers the track's frames, from 0, wrapping at 2³². Fragment `index` of `count` holds bytes `index × 1000` onwards of the frame. `flags` bit 0 marks a **keyframe**, which decodes on its own; other frames need every frame since the last keyframe. `timestamp` is the sender's, in its own units.
+
+A receiver delivers whole frames, in order, and only decodable ones:
+
+- A frame waits for its missing fragments. After **5 ms** without them (fragments travel together; this covers mild reordering) the receiver sends the sender VIDEO_NACK for them, or for the whole frame if none of it came, and asks once more a round trip later. Frames behind it wait.
+- A frame not whole **300 ms** after it started holding up others is given up. Since what follows cannot be decoded, the receiver drops frames until the next keyframe, and sends KEYFRAME_REQUEST, at most every **500 ms** per sender and track. So does a receiver whose first frame of a track is not a keyframe (one that joined mid-stream).
+
+A sender keeps its frames for **500 ms** (and at most 2 MiB) to answer VIDEO_NACK, resending the fragments asked for to that member alone, as VIDEO frames with the same plaintext, at most **512 KiB/s** in all. It tells its application of keyframe requests at most every 500 ms per track, however many members ask, and the application sends a keyframe soon after.
+
+The codec is the application's. Implementations that want to interoperate with the reference SDK's video use `codec[1] ‖ chunk` as each frame, where `codec` is 1 for VP8, 2 for VP9, 3 for H.264 (Annex B) or 4 for AV1, and `chunk` one encoded picture.
+
 ## 8. Limits and timers
 
 | Name | Value | Enforced by |
@@ -293,6 +367,10 @@ Commands are signed by nobody but arrive from an admitted sender, whose identity
 | Members | ≤ 32 slots; the reference relays admit 10 | relay (4429) |
 | Frame size | ≤ 16,384 bytes | relay (1009) |
 | Message payload | ≤ 16,352 bytes | senders |
+| Video frame | ≤ 255 fragments of ≤ 1,000 bytes | senders |
+| Video queued per recipient | 64 KiB, oldest dropped (reference relay) | relays |
+| Video: ask for a fragment / give a frame up / ask for a keyframe | after 5 ms / 300 ms / at most every 500 ms | receivers |
+| Video kept for resending | 500 ms, ≤ 2 MiB; resent at ≤ 512 KiB/s | senders |
 | Profile | ≤ 1,024 bytes | senders |
 | Snapshot window | 16 KiB – 1 MiB unacknowledged, adapting to the delay it adds (50 ms by default) | providers |
 | HEADS | 1 s after a member's latest stream message | senders |
@@ -301,6 +379,10 @@ Commands are signed by nobody but arrive from an admitted sender, whose identity
 | Receive timeout | 25 s | members |
 | Idle timeout | 40 s | relay (4408), optional |
 | Join timeout | 10 s | relay (4408) |
+| Voice replay window | 64 counters | receivers |
+| Snapshot data ahead of its SYNC_BEGIN | ≤ 2 MiB | receivers (over QUIC) |
+| QUIC head start | 1.5 s, then the WebSocket too | members |
+| Weekly certificate | changes every 604,800 s; valid 13 days | relays without certificate files |
 | KEY retry | 5 s without admission | members |
 | RESEND retry / give up | 3 s / 15 s | receivers |
 | Transfer stall | 15 s | both sides |
@@ -318,11 +400,13 @@ Commands are signed by nobody but arrive from an admitted sender, whose identity
 
 **Invites** are bearer credentials for as long as the group lives (§2.2). A relay cannot tell members apart beyond their join tokens, so it cannot exclude anyone; exclusion means a new secret.
 
+**Transports**: TLS, where used (`wss://`, WebTransport, raw QUIC to an `https://` relay), protects what the network sees, not what the relay sees. A member of a `quic://` relay does not verify the relay's certificate, or pins one whose key is public (§3.7), so anyone on the path can pose as the relay and learn what a relay learns; nothing members send is exposed or forgeable that way.
+
 **Denial of service**: relays bound frame size, unauthenticated time, queues and per-connection rate (§3.3), and SHOULD limit connections per address as for rooms. A member can waste others' bandwidth up to the relay's rate limit, and no further.
 
 ## 10. Conformance
 
-[`test-vectors/g1.json`](test-vectors/g1.json) gives, for fixed inputs, the group's derived keys and IDs, join tokens and JOIN frames, the KEY frames of two members, and one frame of every sealed kind: CONFIRM, stream messages, a direct message, voice, a datagram, HEADS, RESEND and the resend that answers it, RESENT, and a state transfer from request to acknowledgement, plus a declined one. Each frame was produced by a member of the reference implementation, and checked to have its effect at the other.
+[`test-vectors/g1.json`](test-vectors/g1.json) gives, for fixed inputs, the group's derived keys and IDs, join tokens and JOIN frames, the KEY frames of two members, and one frame of every sealed kind: CONFIRM, stream messages, a direct message, voice, a datagram, HEADS, RESEND and the resend that answers it, RESENT, a state transfer from request to acknowledgement, plus a declined one, and video: a keyframe's fragments, a VIDEO_NACK and the fragment resent for it, and a KEYFRAME_REQUEST. Each frame was produced by a member of the reference implementation, and checked to have its effect at the other.
 
-[`test-vectors/verify-groups.mjs`](test-vectors/verify-groups.mjs) rebuilds all of it from this document using only Node's built-in cryptography.
+[`test-vectors/verify-groups.mjs`](test-vectors/verify-groups.mjs) rebuilds all of it from this document using only Node's built-in cryptography, and the weekly certificates of [`g1-certificate.json`](test-vectors/g1-certificate.json) too (checking their signatures, since Node signs with random nonces).
 

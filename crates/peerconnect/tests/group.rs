@@ -1,6 +1,11 @@
 //! Deterministic simulation of groups: several members and a relay that
 //! follows GROUP.md (classes, purging, voice dropping, replacement), with
 //! simulated time and injected faults.
+//!
+//! With `PEERCONNECT_SIM_QUIC=<seed>`, every test runs as over QUIC (GROUP.md
+//! §3.6), where each class has its own stream: classes overtake each other
+//! at random, voice arrives out of order, and frames already sent survive
+//! the purge of a slot.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -13,7 +18,7 @@ struct Conn {
     node: usize,
     state: GroupConn,
     token: Option<[u8; 16]>,
-    queues: [VecDeque<Vec<u8>>; 4],
+    queues: [VecDeque<Vec<u8>>; Class::COUNT],
     pongs: usize,
     /// Closed by the relay with this code, to be reported to the node.
     closing: Option<u16>,
@@ -39,6 +44,38 @@ struct Relay {
     tamper: Option<Tamper>,
     /// Misbehaviour: seat every connection in a new slot, never replacing.
     no_replacement: bool,
+    /// Deliver as QUIC would: a random class each time, voice in any order,
+    /// and only commands purged (the rest is already on its way).
+    quic: Option<u64>,
+}
+
+impl Relay {
+    fn random(&mut self) -> u64 {
+        let x = self.quic.as_mut().expect("QUIC mode");
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// The next frame for a connection, most urgent first, or as QUIC mode says.
+    fn next_frame(&mut self, id: usize) -> Option<Vec<u8>> {
+        if self.quic.is_none() {
+            let queues = &mut self.conns.get_mut(&id).unwrap().queues;
+            return Class::PRIORITY.iter().find_map(|c| queues[c.index()].pop_front());
+        }
+        let ready: Vec<usize> = (0..Class::COUNT).filter(|&c| !self.conns[&id].queues[c].is_empty()).collect();
+        if ready.is_empty() {
+            return None;
+        }
+        let class = ready[(self.random() % ready.len() as u64) as usize];
+        let at = if class == Class::Voice.index() || class == Class::Video.index() {
+            (self.random() % self.conns[&id].queues[class].len() as u64) as usize
+        } else {
+            0
+        };
+        self.conns.get_mut(&id).unwrap().queues[class].remove(at)
+    }
 }
 
 impl Relay {
@@ -138,8 +175,12 @@ impl Relay {
         }
     }
 
-    /// Discards queued frames from `slot` (GROUP.md §3.2).
+    /// Discards queued frames from `slot` (GROUP.md §3.2). Over QUIC, what
+    /// was queued here may already be on its way: none is discarded.
     fn purge(&mut self, slot: u8) {
+        if self.quic.is_some() {
+            return;
+        }
         for conn in self.conns.values_mut() {
             for q in &mut conn.queues {
                 q.retain(|f| !(f[0] < 0x80 && f[1] == slot));
@@ -195,6 +236,11 @@ impl Sim {
             lose: HashMap::new(),
             tamper: None,
             no_replacement: false,
+            // The value seeds the order: `PEERCONNECT_SIM_QUIC=7`, say.
+            quic: std::env::var("PEERCONNECT_SIM_QUIC")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|seed| (seed ^ 0x9E37_79B9_7F4A_7C15).max(1)),
         };
         Sim { now: 0, relay, nodes: Vec::new(), group }
     }
@@ -282,12 +328,12 @@ impl Sim {
                 self.nodes[node].member.handle_text(self.now, "pong");
                 continue;
             }
-            if let Some(frame) = conn.queues.iter_mut().find_map(VecDeque::pop_front) {
+            if let Some(frame) = self.relay.next_frame(id) {
                 progress = true;
                 self.nodes[node].member.handle_binary(self.now, &frame);
                 continue;
             }
-            if let Some(code) = conn.closing {
+            if let Some(code) = self.relay.conns[&id].closing {
                 progress = true;
                 self.relay.conns.remove(&id);
                 if self.nodes[node].conn == Some(id) {
@@ -857,8 +903,9 @@ fn frames_replayed_within_a_session_are_ignored() {
     assert_eq!(texts(&sim.messages(b, Channel::Command), ia), numbered("a", 0..20));
     assert_eq!(texts(&sim.messages(b, Channel::Chat), ia), numbered("c", 0..20));
     let events = &sim.nodes[b].events;
-    let voices: Vec<u16> =
+    let mut voices: Vec<u16> =
         events.iter().filter_map(|e| if let Event::Voice { seq, .. } = e { Some(*seq) } else { None }).collect();
+    voices.sort(); // in any order over QUIC, but each once
     assert_eq!(voices, (0..20).collect::<Vec<_>>());
     assert_eq!(events.iter().filter(|e| matches!(e, Event::Datagram { .. })).count(), 20);
     assert_eq!(events.iter().filter(|e| matches!(e, Event::Message { direct: true, .. })).count(), 1);
@@ -1221,4 +1268,58 @@ fn frames_reordered_within_a_class_are_dropped_not_misdelivered() {
     sim.run(1000);
     assert_eq!(texts(&sim.messages(b, Channel::Command), sim.id(a)), numbered("a", 0..5));
     assert!(missed(&sim.nodes[b].events).is_empty());
+}
+
+#[test]
+fn video_through_a_lossy_relay_arrives_whole_in_order_and_recovers_with_keyframes() {
+    let mut sim = Sim::new();
+    let a = sim.add(Identity::generate(), "a");
+    let b = sim.add(Identity::generate(), "b");
+    let c = sim.add(Identity::generate(), "c");
+    sim.run(100);
+    // 8% of the video fragments to b vanish (resends too); c gets everything.
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    sim.relay.tamper = Some(Box::new(move |to, frame| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if to == b && frame[0] == wire::VIDEO && x % 100 < 8 { vec![] } else { vec![frame.to_vec()] }
+    }));
+    let ia = sim.id(a);
+    let mut keyframe_due = true;
+    let mut sent = 0u32;
+    for i in 0..300u32 {
+        // 30 frames a second: 3 fragments, or 12 for a keyframe.
+        let keyframe = keyframe_due || i % 60 == 0;
+        keyframe_due = false;
+        let data: Vec<u8> = (0..if keyframe { 12_000 } else { 3_000 }).map(|j| (i as usize ^ j) as u8).collect();
+        assert!(sim.nodes[a].member.send_video(0, keyframe, i, &data));
+        sent += 1;
+        sim.run(33);
+        if sim.take(a).iter().any(|e| matches!(e, Event::KeyframeRequest { .. })) {
+            keyframe_due = true;
+        }
+    }
+    sim.run(1000);
+    let frames = |events: Vec<Event>| -> Vec<(u32, bool, usize)> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Video { from, timestamp, keyframe, data, .. } if from == ia => {
+                    // Whole: exactly the bytes sent for that frame.
+                    let ok = data.iter().enumerate().all(|(j, &v)| v == (timestamp as usize ^ j) as u8);
+                    assert!(ok, "frame {timestamp} intact");
+                    Some((timestamp, keyframe, data.len()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let (at_b, at_c) = (frames(sim.take(b)), frames(sim.take(c)));
+    assert_eq!(at_c.len() as u32, sent, "a member losing nothing gets everything");
+    assert!(at_b.windows(2).all(|w| w[0].0 < w[1].0), "in order");
+    assert!(at_b.first().is_some_and(|f| f.1), "starting with a keyframe");
+    // Resends fill most holes; what is lost for good costs frames until the next keyframe.
+    assert!(at_b.len() as u32 >= sent * 8 / 10, "{} of {sent}", at_b.len());
+    assert!((at_b.len() as u32) < sent, "with 8% of fragments vanishing, something was lost");
 }

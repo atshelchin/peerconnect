@@ -35,6 +35,8 @@ pub const PC_SNAPSHOT: i32 = 18;
 pub const PC_SYNC_FAILED: i32 = 19;
 pub const PC_REPLACED: i32 = 20;
 pub const PC_FULL: i32 = 21;
+pub const PC_VIDEO: i32 = 22;
+pub const PC_KEYFRAME_REQUEST: i32 = 23;
 
 #[repr(C)]
 pub struct PcOutput {
@@ -49,6 +51,9 @@ pub struct PcOutput {
     pub count: u64,
     pub data: *const u8,
     pub len: usize,
+    pub track: u8,
+    pub keyframe: u8,
+    pub timestamp: u32,
 }
 
 pub struct PcMember {
@@ -225,6 +230,9 @@ pub unsafe extern "C" fn pc_member_poll(m: *mut PcMember, out: *mut PcOutput) ->
         count: 0,
         data: std::ptr::null(),
         len: 0,
+        track: 0,
+        keyframe: 0,
+        timestamp: 0,
     };
     let Some(output) = m.member.poll_output() else { return PC_NONE };
     let (kind, held) = match output {
@@ -291,6 +299,18 @@ pub unsafe extern "C" fn pc_member_poll(m: *mut PcMember, out: *mut PcOutput) ->
                 out.member = from.0;
                 (PC_SYNC_FAILED, Vec::new())
             }
+            Event::Video { from, track, keyframe, timestamp, data } => {
+                out.member = from.0;
+                out.track = track;
+                out.keyframe = keyframe as u8;
+                out.timestamp = timestamp;
+                (PC_VIDEO, data)
+            }
+            Event::KeyframeRequest { from, track } => {
+                out.member = from.0;
+                out.track = track;
+                (PC_KEYFRAME_REQUEST, Vec::new())
+            }
             Event::Replaced => (PC_REPLACED, Vec::new()),
             Event::Full => (PC_FULL, Vec::new()),
         },
@@ -345,6 +365,19 @@ pub unsafe extern "C" fn pc_member_send_datagram(m: *mut PcMember, to: *const u8
     let to = unsafe { id(to) };
     let data = unsafe { bytes(data, len) };
     unsafe { with(m, 0, |m| m.member.send_datagram(to, data) as i32) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_member_send_video(
+    m: *mut PcMember,
+    track: u8,
+    keyframe: u8,
+    timestamp: u32,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let data = unsafe { bytes(data, len) };
+    unsafe { with(m, 0, |m| m.member.send_video(track, keyframe != 0, timestamp, data) as i32) }
 }
 
 #[unsafe(no_mangle)]

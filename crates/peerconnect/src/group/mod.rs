@@ -14,11 +14,16 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 use crate::noise::hmac;
-use crate::room::{RoomId, relay_url};
+use crate::room::RoomId;
 use crate::{Error, base64};
+use transport::relay_url;
 
+#[cfg(feature = "certificate")]
+pub mod certificate;
 mod member;
 mod seal;
+pub mod transport;
+mod video;
 pub mod wire;
 
 pub use member::{Channel, Config, Event, Member, Output, SendError, State};
@@ -38,7 +43,8 @@ pub struct Group {
 }
 
 impl Group {
-    /// Creates a new group on `relay` (a `ws://` or `wss://` URL).
+    /// Creates a new group on `relay`: a `ws://` or `wss://` URL, or
+    /// `https://` or `quic://` for a relay that also offers QUIC (see [`transport`]).
     pub fn create(relay: &str) -> Result<Group, Error> {
         Ok(Group::new(relay_url(relay)?, crate::random()))
     }
@@ -67,7 +73,8 @@ impl Group {
         Ok(Group::new(relay_url(relay)?, *self.secret))
     }
 
-    /// The WebSocket URL of the group on its relay.
+    /// The URL of the group on its relay: the WebSocket to open, or, for
+    /// `https://` and `quic://` relays, what [`transport::transports`] takes.
     pub fn endpoint(&self) -> String {
         format!("{}/g1/{}", self.relay, self.id())
     }
@@ -239,7 +246,10 @@ mod tests {
         let group = Group::create("wss://a.example").unwrap();
         let moved = group.with_relay("ws://b.example/sub/").unwrap();
         assert_eq!((moved.id(), moved.relay()), (group.id(), "ws://b.example/sub"));
-        assert!(group.with_relay("https://nope").is_err());
+        assert!(group.with_relay("http://nope").is_err());
+        let quic = group.with_relay("quic://203.0.113.9:4433").unwrap();
+        assert_eq!(quic.endpoint(), format!("quic://203.0.113.9:4433/g1/{}", group.id()));
+        assert_eq!(quic.to_string().parse::<Group>().unwrap().relay(), "quic://203.0.113.9:4433");
         assert!(format!("{group:?}").starts_with("Group(wss://a.example, "));
         let identity = Identity::generate();
         let id = identity.id();

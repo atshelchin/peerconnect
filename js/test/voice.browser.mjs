@@ -6,13 +6,16 @@
 //                                       and Playwright's Chromium)
 //
 // It also plays speech-like audio through the fake microphone and checks
-// how much of it goes out and plays, over a clean path and one with TCP
-// stalls. VOICE_REMOTE=wss://relay.example.com measures only that, over a
+// how much of it goes out and plays, over a clean path, one with TCP
+// stalls, and one losing UDP packets, over WebTransport (`openssl` makes
+// the relay a certificate the browser pins by hash). VOICE_REMOTE=wss://relay.example.com measures only that, over a
 // real relay (VOICE_MAX_DELAY sets the jitter buffer's ceiling in ms).
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { createReadStream, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { createHash, X509Certificate } from "node:crypto";
+import { createSocket } from "node:dgram";
+import { createReadStream, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { createServer as createTcpServer, connect as tcpConnect } from "node:net";
@@ -24,8 +27,17 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const require = createRequire(new URL("../../website/package.json", import.meta.url));
 const { chromium } = require("playwright");
 
+// A certificate WebTransport accepts by its hash (ECDSA P-256, under 14
+// days), so the relay serves WebTransport too; ws:// works as before.
+const certDir = mkdtempSync(join(tmpdir(), "peerconnect-voice-cert-"));
+const [certFile, keyFile] = [join(certDir, "relay.crt"), join(certDir, "relay.key")];
+execFileSync("openssl", [
+  "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "10",
+  "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", keyFile, "-out", certFile,
+], { stdio: "ignore" });
+const certHash = [...createHash("sha256").update(new X509Certificate(readFileSync(certFile)).raw).digest()];
 const relayProcess = spawn(join(root, "../target/debug/peerconnect-relay"), {
-  env: { ...process.env, PEERCONNECT_LISTEN: "127.0.0.1:0" },
+  env: { ...process.env, PEERCONNECT_LISTEN: "127.0.0.1:0", PEERCONNECT_TLS_CERT: certFile, PEERCONNECT_TLS_KEY: keyFile },
 });
 const relay = await new Promise((resolve, reject) => {
   relayProcess.on("error", reject);
@@ -74,6 +86,29 @@ const proxy = createTcpServer((client) => {
 });
 await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
 const proxied = `ws://127.0.0.1:${proxy.address().port}`;
+
+// The same for UDP, for WebTransport: each datagram dropped with
+// `udpNetwork.loss`, and delayed by up to `udpNetwork.jitter` ms (so they
+// may also arrive out of order, as on a real path).
+const udpNetwork = { loss: 0, jitter: 0 };
+const udpProxy = createSocket("udp4");
+const upstreams = new Map();
+udpProxy.on("message", (message, from) => {
+  const key = `${from.address}:${from.port}`;
+  let upstream = upstreams.get(key);
+  if (!upstream) {
+    upstream = createSocket("udp4");
+    upstream.on("message", (reply) => {
+      if (random() < udpNetwork.loss) return;
+      setTimeout(() => udpProxy.send(reply, from.port, from.address), random() * udpNetwork.jitter);
+    });
+    upstreams.set(key, upstream);
+  }
+  if (random() < udpNetwork.loss) return;
+  setTimeout(() => upstream.send(message, Number(relayPort), relayHost), random() * udpNetwork.jitter);
+});
+await new Promise((resolve) => udpProxy.bind(0, "127.0.0.1", resolve));
+const proxiedQuic = `https://127.0.0.1:${udpProxy.address().port}`;
 
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript" };
 const server = createServer((req, res) => {
@@ -202,6 +237,7 @@ try {
     await browser.close();
     server.close();
     proxy.close();
+    udpProxy.close();
     relayProcess.kill();
     process.exit(0);
   }
@@ -211,6 +247,17 @@ try {
   reseed();
   const lossy = await quality("speech, TCP stalls", { relay: proxied, seconds: 25 });
   network.lossChance = 0;
+  // The same loss on UDP, over WebTransport: a lost packet costs only its
+  // own frame, which the decoder conceals, instead of holding up the rest.
+  udpNetwork.jitter = 20;
+  udpNetwork.loss = 0.02;
+  reseed();
+  const quic = await quality("speech, 2% UDP loss each way, WebTransport", {
+    relay: proxiedQuic,
+    seconds: 25,
+    webTransport: { serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(certHash) }] },
+  });
+  udpNetwork.loss = 0;
   await speech.close();
 
   if (!process.env.NO_ASSERT) {
@@ -224,10 +271,16 @@ try {
     assert.ok(clean.sender.soundSent >= clean.sender.sound * 0.99, "speech sent on a clean path");
     assert.equal(clean.lostSound, 0, "speech lost on a clean path");
     assert.ok(lossy.lostSound <= lossy.soundSent * 0.02, `speech lost to stalls: ${lossy.lostSound}/${lossy.soundSent}`);
+    assert.deepEqual(quic.via, ["webtransport", "webtransport"]);
+    // About 4% of frames lost on two lossy hops, but none late.
+    assert.ok(quic.lostSound <= quic.soundSent * 0.08, `speech lost over UDP: ${quic.lostSound}/${quic.soundSent}`);
+    assert.ok(quic.p99 < lossy.p99 / 2, `p99 over WebTransport ${quic.p99} ms, over TCP ${lossy.p99} ms`);
   }
 } finally {
   await browser.close();
   server.close();
   proxy.close();
+  udpProxy.close();
+  for (const upstream of upstreams.values()) upstream.close();
   relayProcess.kill();
 }

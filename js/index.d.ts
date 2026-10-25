@@ -122,6 +122,10 @@ export interface GroupEventMap {
   message: CustomEvent<{ from: string; channel: Channel; data: Uint8Array; direct: boolean }>;
   voice: CustomEvent<{ from: string; seq: number; data: Uint8Array }>;
   datagram: CustomEvent<{ from: string; data: Uint8Array }>;
+  /** A whole video frame, in order and decodable (it follows a keyframe without loss). */
+  video: CustomEvent<{ from: string; track: number; keyframe: boolean; timestamp: number; data: Uint8Array }>;
+  /** Members lost some of our `track` and need a keyframe: send one soon. */
+  keyframerequest: CustomEvent<{ from: string; track: number }>;
   /** `count` messages of `from`'s stream were lost (it no longer had them). */
   missed: CustomEvent<{ from: string; channel: Channel; count: number }>;
   /**
@@ -147,6 +151,8 @@ export class GroupConnection extends EventTarget {
   readonly members: Map<string, Uint8Array>;
   /** The latest round trip to the relay in milliseconds. */
   readonly rtt: number | undefined;
+  /** What the connection to the relay runs over, or null while there is none. */
+  readonly via: "webtransport" | "websocket" | null;
   /** Broadcasts a message (up to 16,352 bytes) and returns its id. */
   send(channel: Channel, data: Data): number;
   /** Sends to one member only; not resent if the connection drops. */
@@ -155,6 +161,12 @@ export class GroupConnection extends EventTarget {
   sendVoice(seq: number, data: Data): boolean;
   /** Sends data that is dropped rather than delayed; false if not sent. */
   sendDatagram(data: Data, to?: string): boolean;
+  /**
+   * Sends a video frame of `track` (up to 255,000 bytes); receivers get it
+   * whole and in order ("video"), or ask for a keyframe ("keyframerequest").
+   * False if not sent.
+   */
+  sendVideo(track: number, keyframe: boolean, timestamp: number, data: Data): boolean;
   requestSync(from: string): void;
   provideSync(to: string, transfer: number, snapshot: Data): void;
   declineSync(to: string, transfer: number): void;
@@ -168,5 +180,23 @@ export class GroupConnection extends EventTarget {
   addEventListener(type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void;
 }
 
-/** Joins a group (a `Group` or its invite). */
-export function joinGroup(group: Group | string, options?: { identity?: Identity; profile?: Data }): GroupConnection;
+/**
+ * Joins a group (a `Group` or its invite). For an `https://` relay, over
+ * WebTransport where the runtime has it, else over its `wss://` WebSocket;
+ * for a `quic://` relay, over its `ws://` WebSocket.
+ */
+export function joinGroup(
+  group: Group | string,
+  options?: {
+    identity?: Identity;
+    profile?: Data;
+    /** Passed to the `WebTransport` constructor: `serverCertificateHashes`, say. */
+    webTransport?: WebTransportOptions;
+  },
+): GroupConnection;
+
+/** The ways to reach a group endpoint, in the order they are tried (GROUP.md §3.6, §3.7). */
+export function transportsFor(url: string): { type: "webtransport" | "websocket"; url: string; weekly?: boolean }[];
+
+/** The hashes of the weekly certificates a relay without certificate files may be serving (GROUP.md §3.7). */
+export function weeklyHashes(now?: number): { algorithm: "sha-256"; value: Uint8Array }[];

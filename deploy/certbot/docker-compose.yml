@@ -1,0 +1,45 @@
+# A relay with a domain, serving TLS itself: wss:// on TCP 443, and
+# WebTransport and QUIC on UDP 443, with a Let's Encrypt certificate that
+# certbot obtains and renews. Point DOMAIN at this host, open TCP 80 and
+# 443 and UDP 443, and:
+#
+#   DOMAIN=relay.example.com EMAIL=you@example.com docker compose up -d
+#
+# Invites then start https://relay.example.com (wss://relay.example.com
+# works too). Until certbot has the certificate (a minute on the first
+# start), the relay exits and is restarted.
+services:
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    ports: ["80:80"]
+    entrypoint: ["/bin/sh", "/certbot.sh"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the relay's host name}
+      EMAIL: ${EMAIL:-}
+    volumes:
+      - ./certbot.sh:/certbot.sh:ro
+      - letsencrypt:/etc/letsencrypt
+      - certs:/certs
+  relay:
+    build: ../..
+    # Or the published image: ghcr.io/atshelchin/peerconnect-relay:main
+    restart: unless-stopped
+    ports: ["443:443", "443:443/udp"]
+    # Keep little unsent data in the kernel, so that a slow link backs up
+    # into the relay's queues, where commands overtake chat and late voice
+    # is dropped. (The relay also sets this on its own sockets.)
+    sysctls:
+      net.ipv4.tcp_notsent_lowat: "32768"
+    environment:
+      PEERCONNECT_LISTEN: "0.0.0.0:443"
+      PEERCONNECT_TLS_CERT: /certs/fullchain.pem
+      PEERCONNECT_TLS_KEY: /certs/privkey.pem
+      PEERCONNECT_MAX_CONNECTIONS: "10000"
+      PEERCONNECT_MAX_PER_ADDRESS: "256"
+      PEERCONNECT_MAX_GROUP_MEMBERS: "10"
+    volumes:
+      - certs:/certs:ro
+volumes:
+  letsencrypt:
+  certs:

@@ -1,7 +1,10 @@
 # PeerConnect relay: one static binary in an otherwise empty image.
 #
 #   docker build -t peerconnect-relay .
-#   docker run -p 8080:8080 peerconnect-relay
+#   docker run -p 8080:8080 -p 8080:8080/udp peerconnect-relay
+#
+# TCP 8080 serves WebSockets (and wss:// with PEERCONNECT_TLS_CERT/_KEY);
+# UDP 8080 serves groups over QUIC.
 #
 # Any Rust image can build it (e.g. --build-arg RUST_IMAGE=rust:1.97); the
 # binary is linked statically either way.
@@ -18,9 +21,13 @@ RUN target="$(rustc -vV | sed -n 's/^host: //p')" \
  && cp "target/$target/release/peerconnect-relay" /peerconnect-relay
 
 FROM scratch
+# Links the image to the repository on the GitHub Container Registry.
+LABEL org.opencontainers.image.source="https://github.com/atshelchin/peerconnect" \
+      org.opencontainers.image.description="PeerConnect relay: end-to-end encrypted rooms and groups over WebSocket and QUIC" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=build /peerconnect-relay /peerconnect-relay
 ENV PEERCONNECT_LISTEN=0.0.0.0:8080
-EXPOSE 8080
+EXPOSE 8080 8080/udp
 USER 65534:65534
 HEALTHCHECK --interval=30s --timeout=5s CMD ["/peerconnect-relay", "healthcheck"]
 ENTRYPOINT ["/peerconnect-relay"]

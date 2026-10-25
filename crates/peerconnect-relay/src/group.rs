@@ -10,19 +10,26 @@
 //! seconds at most; a recipient that does not catch up by then is
 //! disconnected, so one stuck member cannot hold the others up for long.
 //! A frame is shared, not copied, between its recipients.
+//!
+//! None of this depends on the transport: a connection is a [`Link`] to
+//! read from and a writer that drains its [`Outbox`], over a WebSocket here
+//! or over QUIC ([`crate::quic`]), and one group can mix both.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::stream::SplitSink;
+use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use peerconnect::RoomId;
 use peerconnect::group::{Class, wire as gwire};
 use peerconnect::relay::{GroupAction, GroupConn, Incoming};
 use peerconnect::wire::close;
 use tokio::sync::{Notify, OwnedSemaphorePermit, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -50,24 +57,31 @@ struct Seat {
     outbox: Arc<Outbox>,
 }
 
+/// A connection's queued frames, one queue per class. An empty frame is
+/// `pong`.
 pub(crate) struct Outbox {
     queues: Mutex<Queues>,
+    /// Signalled when any queue gets a frame (for a writer that drains all).
     ready: Notify,
+    /// Signalled when that class's queue gets one (for a writer per class).
+    class_ready: [Notify; Class::COUNT],
     /// Signalled when the command and chat backlog drops below [`BACKLOG`],
     /// while any sender waits for that.
     drained: Notify,
     waiting: AtomicUsize,
-    close: watch::Sender<Option<u16>>,
+    pub(crate) close: watch::Sender<Option<u16>>,
     /// Reliable bytes queued beyond which the connection is not keeping up.
     limit: usize,
     /// Command and voice bytes queued beyond which voice is dropped.
     voice_limit: usize,
+    /// Video bytes queued beyond which the oldest video is dropped.
+    video_limit: usize,
 }
 
 #[derive(Default)]
 struct Queues {
-    classes: [VecDeque<Message>; 4],
-    bytes: [usize; 4],
+    classes: [VecDeque<Bytes>; Class::COUNT],
+    bytes: [usize; Class::COUNT],
 }
 
 impl Queues {
@@ -79,29 +93,39 @@ impl Queues {
 }
 
 impl Outbox {
-    fn new(limit: usize, voice_limit: usize) -> Arc<Outbox> {
+    pub(crate) fn new(limit: usize, voice_limit: usize, video_limit: usize) -> Arc<Outbox> {
         Arc::new(Outbox {
             queues: Mutex::default(),
             ready: Notify::new(),
+            class_ready: Default::default(),
             drained: Notify::new(),
             waiting: AtomicUsize::new(0),
             close: watch::Sender::new(None),
             limit,
             voice_limit,
+            video_limit,
         })
     }
 
-    /// Queues a frame. A voice frame that would wait too long is dropped; a
-    /// reliable one that overflows the outbox closes the connection.
-    /// Returns whether the recipient is behind on commands and chat.
-    fn push(&self, class: Class, msg: Message) -> bool {
+    /// Queues a frame. A voice frame that would wait too long is dropped,
+    /// and so is the oldest video beyond its budget (an old frame is worth
+    /// less than a new one); a reliable one that overflows the outbox
+    /// closes the connection. Returns whether the recipient is behind on
+    /// commands and chat.
+    fn push(&self, class: Class, msg: Bytes) -> bool {
         let mut q = self.queues.lock().unwrap();
         let len = msg.len();
-        if class.is_realtime() {
-            if q.bytes[0] + q.bytes[1] + len > self.voice_limit {
+        if class == Class::Voice {
+            if q.bytes[Class::Command.index()] + q.bytes[Class::Voice.index()] + len > self.voice_limit {
                 return false;
             }
-        } else if q.bytes.iter().sum::<usize>() + len > self.limit {
+        } else if class == Class::Video {
+            let video = Class::Video.index();
+            while q.bytes[video] + len > self.video_limit {
+                let Some(old) = q.classes[video].pop_front() else { return false };
+                q.bytes[video] -= old.len();
+            }
+        } else if q.bytes.iter().sum::<usize>() - q.bytes[Class::Video.index()] + len > self.limit {
             drop(q);
             self.close(close::TIMEOUT);
             return false;
@@ -111,6 +135,7 @@ impl Outbox {
         let behind = q.backlog() > BACKLOG;
         drop(q);
         self.ready.notify_one();
+        self.class_ready[class.index()].notify_one();
         behind
     }
 
@@ -140,7 +165,7 @@ impl Outbox {
         let Queues { classes, bytes } = &mut *q;
         for (queue, bytes) in classes.iter_mut().zip(bytes) {
             queue.retain(|m| {
-                let stale = matches!(m, Message::Binary(f) if f.len() >= 2 && f[0] < 0x80 && f[1] == slot);
+                let stale = m.len() >= 2 && m[0] < 0x80 && m[1] == slot;
                 if stale {
                     *bytes -= m.len();
                 }
@@ -150,15 +175,24 @@ impl Outbox {
     }
 
     /// Takes up to [`BATCH`] bytes of frames, most urgent class first.
-    fn take(&self) -> Vec<Message> {
+    fn take(&self) -> Vec<Bytes> {
+        self.take_from(&Class::PRIORITY.map(Class::index))
+    }
+
+    /// Takes up to [`BATCH`] bytes of frames of one class.
+    pub(crate) fn take_class(&self, class: Class) -> Vec<Bytes> {
+        self.take_from(&[class.index()])
+    }
+
+    fn take_from(&self, classes: &[usize]) -> Vec<Bytes> {
         let mut q = self.queues.lock().unwrap();
         let mut batch = Vec::new();
         let mut taken = 0;
         while taken < BATCH {
-            let Some(class) = (0..4).find(|&c| !q.classes[c].is_empty()) else { break };
+            let Some(&class) = classes.iter().find(|&&c| !q.classes[c].is_empty()) else { break };
             let msg = q.classes[class].pop_front().unwrap();
             q.bytes[class] -= msg.len();
-            taken += msg.len();
+            taken += msg.len().max(1);
             batch.push(msg);
         }
         if q.backlog() <= BACKLOG && self.waiting.load(Ordering::SeqCst) > 0 {
@@ -167,9 +201,69 @@ impl Outbox {
         batch
     }
 
+    /// Takes frames of `class` from the front while they add up to at most
+    /// `room` bytes (none if the first does not fit).
+    pub(crate) fn take_within(&self, class: Class, room: usize) -> Vec<Bytes> {
+        let mut q = self.queues.lock().unwrap();
+        let mut batch = Vec::new();
+        let mut taken = 0;
+        let i = class.index();
+        while let Some(front) = q.classes[i].front() {
+            if taken + front.len() > room {
+                break;
+            }
+            let msg = q.classes[i].pop_front().unwrap();
+            q.bytes[i] -= msg.len();
+            taken += msg.len();
+            batch.push(msg);
+        }
+        batch
+    }
+
+    /// Whether anything of `class` is queued.
+    pub(crate) fn has(&self, class: Class) -> bool {
+        !self.queues.lock().unwrap().classes[class.index()].is_empty()
+    }
+
+    /// Waits until `class` may have frames to take.
+    pub(crate) async fn ready(&self, class: Class) {
+        self.class_ready[class.index()].notified().await
+    }
+
     /// Tells the connection to close with `code`; the first code wins.
-    fn close(&self, code: u16) {
+    pub(crate) fn close(&self, code: u16) {
         self.close.send_if_modified(|current| current.is_none() && current.replace(code).is_none());
+    }
+}
+
+/// What a connection's reader got.
+pub(crate) enum Received {
+    Binary(Bytes),
+    Text(String),
+    /// A message over the frame size limit.
+    TooBig,
+    /// Something the transport does not allow.
+    Invalid,
+    /// The connection ended or failed.
+    Closed,
+}
+
+/// Where a group connection's messages come from.
+pub(crate) trait Link: Send {
+    fn recv(&mut self) -> impl Future<Output = Received> + Send;
+}
+
+impl Link for SplitStream<Ws> {
+    async fn recv(&mut self) -> Received {
+        loop {
+            return match self.next().await {
+                Some(Ok(Message::Binary(frame))) => Received::Binary(frame),
+                Some(Ok(Message::Text(text))) => Received::Text(text.as_str().to_owned()),
+                Some(Ok(_)) => continue, // control frames are handled by the WebSocket layer
+                Some(Err(WsError::Capacity(_))) => Received::TooBig,
+                Some(Err(_)) | None => Received::Closed,
+            };
+        }
     }
 }
 
@@ -195,7 +289,7 @@ impl GroupRoom {
             }
         };
         let present = slots.iter().enumerate().filter(|(_, s)| s.is_some()).fold(0u32, |m, (i, _)| m | 1 << i);
-        outbox.push(Class::Command, Message::binary(gwire::welcome(slot as u8, present).to_vec()));
+        outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::welcome(slot as u8, present)));
         for seat in slots.iter().flatten() {
             seat.outbox.push(Class::Command, member(slot as u8, true));
         }
@@ -205,7 +299,7 @@ impl GroupRoom {
 
     /// Fans a frame out. Returns the recipients that are behind (to wait
     /// for), or `None` once this connection no longer holds its slot.
-    fn forward(&self, id: u64, slot: u8, to: Option<u8>, class: Class, msg: Message) -> Option<Vec<Arc<Outbox>>> {
+    fn forward(&self, id: u64, slot: u8, to: Option<u8>, class: Class, msg: Bytes) -> Option<Vec<Arc<Outbox>>> {
         let slots = self.slots.lock().unwrap();
         if !holds(&slots, slot, id) {
             return None;
@@ -273,15 +367,31 @@ impl Bucket {
 }
 
 impl Relay {
-    pub(crate) async fn group_connection(self: Arc<Self>, group_id: RoomId, ws: Ws, _slot: OwnedSemaphorePermit) {
-        let (sink, mut stream) = ws.split();
-        let config = &self.config;
-        let outbox = Outbox::new(config.group_queue_bytes, config.voice_queue_bytes);
-        let mut closing = outbox.close.subscribe();
+    pub(crate) async fn group_websocket(self: Arc<Self>, group_id: RoomId, ws: Ws, slot: OwnedSemaphorePermit) {
+        let (sink, stream) = ws.split();
+        let outbox = self.group_outbox();
         let writer = tokio::spawn(write(sink, outbox.clone(), self.stop.subscribe()));
+        self.group_connection(group_id, stream, outbox, writer, slot).await;
+    }
 
+    pub(crate) fn group_outbox(&self) -> Arc<Outbox> {
+        let config = &self.config;
+        Outbox::new(config.group_queue_bytes, config.voice_queue_bytes, config.video_queue_bytes)
+    }
+
+    /// Runs a group connection: reads `link`, while `writer` drains `outbox`.
+    pub(crate) async fn group_connection(
+        self: Arc<Self>,
+        group_id: RoomId,
+        mut link: impl Link,
+        outbox: Arc<Outbox>,
+        writer: JoinHandle<()>,
+        _slot: OwnedSemaphorePermit,
+    ) {
+        let config = &self.config;
+        let mut closing = outbox.close.subscribe();
         let (pending, hello) = GroupConn::new();
-        outbox.push(Class::Command, Message::binary(hello.to_vec()));
+        outbox.push(Class::Command, Bytes::copy_from_slice(&hello));
         let join_deadline = Instant::now() + gwire::JOIN_TIMEOUT;
         let mut seated: Option<(Arc<GroupRoom>, u64, u8)> = None;
         let mut bucket = Bucket::new(config.group_rate, config.group_burst);
@@ -291,23 +401,24 @@ impl Relay {
             let msg = tokio::select! {
                 biased;
                 _ = closing.changed() => break, // replaced, overflowed, or closed by the relay
-                msg = timeout_at(deadline, stream.next()) => msg,
+                msg = timeout_at(deadline, link.recv()) => msg,
             };
             let msg = match msg {
-                Ok(Some(Ok(msg))) => msg,
-                Ok(Some(Err(WsError::Capacity(_)))) => break outbox.close(close::TOO_BIG),
-                Ok(_) => break,
+                Ok(Received::Binary(frame)) => Ok(frame),
+                Ok(Received::Text(text)) => Err(text),
+                Ok(Received::TooBig) => break outbox.close(close::TOO_BIG),
+                Ok(Received::Invalid) => break outbox.close(close::PROTOCOL_ERROR),
+                Ok(Received::Closed) => break,
                 Err(_) => break outbox.close(close::TIMEOUT),
             };
             let incoming = match &msg {
-                Message::Text(text) => Incoming::Text(text),
-                Message::Binary(frame) => Incoming::Binary(frame),
-                _ => continue, // control frames are handled by the WebSocket layer
+                Ok(frame) => Incoming::Binary(frame),
+                Err(text) => Incoming::Text(text),
             };
             let conn = seated.as_ref().map_or(pending, |&(_, _, slot)| GroupConn::Seated(slot));
             match conn.receive(&group_id, incoming) {
                 GroupAction::Pong => {
-                    outbox.push(Class::Command, Message::text(gwire::PONG));
+                    outbox.push(Class::Command, Bytes::new());
                 }
                 GroupAction::Join(token) => {
                     let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -322,6 +433,7 @@ impl Relay {
                     }
                 }
                 GroupAction::Forward { to, class } => {
+                    let Ok(msg) = msg else { unreachable!("only binary frames are forwarded") };
                     let (room, id, slot) = seated.as_ref().expect("only seated connections forward");
                     match bucket.take(msg.len(), class.is_realtime()) {
                         None => continue, // over the rate: voice is dropped
@@ -386,7 +498,8 @@ async fn write(mut sink: SplitSink<Ws, Message>, outbox: Arc<Outbox>, mut stop: 
             continue;
         }
         let write = async {
-            for msg in batch {
+            for frame in batch {
+                let msg = if frame.is_empty() { Message::text(gwire::PONG) } else { Message::Binary(frame) };
                 sink.feed(msg).await?;
             }
             sink.flush().await
@@ -401,8 +514,8 @@ async fn write(mut sink: SplitSink<Ws, Message>, outbox: Arc<Outbox>, mut stop: 
     let _ = timeout(Duration::from_secs(1), sink.send(close_message(code))).await;
 }
 
-fn member(slot: u8, present: bool) -> Message {
-    Message::binary(gwire::member(slot, present).to_vec())
+fn member(slot: u8, present: bool) -> Bytes {
+    Bytes::copy_from_slice(&gwire::member(slot, present))
 }
 
 fn holds(slots: &[Option<Seat>; gwire::MAX_SLOTS], slot: u8, id: u64) -> bool {
@@ -415,49 +528,68 @@ mod tests {
 
     #[test]
     fn outbox_sends_urgent_first_and_drops_late_voice() {
-        let outbox = Outbox::new(1 << 20, 100);
-        outbox.push(Class::Bulk, Message::binary(vec![0x61, 0, 0xFF]));
-        outbox.push(Class::Chat, Message::binary(vec![0x41, 0, 0xFF]));
-        outbox.push(Class::Voice, Message::binary(vec![0x21, 0, 0xFF]));
-        outbox.push(Class::Command, Message::binary(vec![0x03, 0, 0xFF]));
-        let order: Vec<u8> = outbox.take().iter().map(|m| m.clone().into_data()[0]).collect();
-        assert_eq!(order, [0x03, 0x21, 0x41, 0x61]);
+        let outbox = Outbox::new(1 << 20, 100, 1000);
+        outbox.push(Class::Bulk, Bytes::from(vec![0x61, 0, 0xFF]));
+        outbox.push(Class::Chat, Bytes::from(vec![0x41, 0, 0xFF]));
+        outbox.push(Class::Voice, Bytes::from(vec![0x21, 0, 0xFF]));
+        outbox.push(Class::Command, Bytes::from(vec![0x03, 0, 0xFF]));
+        outbox.push(Class::Video, Bytes::from(vec![0x31, 0, 0xFF]));
+        let order: Vec<u8> = outbox.take().iter().map(|m| m[0]).collect();
+        assert_eq!(order, [0x03, 0x21, 0x41, 0x31, 0x61], "commands, voice, chat, video, bulk");
 
         for _ in 0..10 {
-            assert!(!outbox.push(Class::Voice, Message::binary(vec![0x21; 30])));
+            assert!(!outbox.push(Class::Voice, Bytes::from(vec![0x21; 30])));
         }
         assert_eq!(outbox.take().len(), 3, "voice beyond 100 queued bytes is dropped");
         // Bulk does not count against voice: it waits behind it anyway.
-        outbox.push(Class::Bulk, Message::binary(vec![0x61; 1000]));
-        outbox.push(Class::Voice, Message::binary(vec![0x21; 30]));
+        outbox.push(Class::Bulk, Bytes::from(vec![0x61; 1000]));
+        outbox.push(Class::Voice, Bytes::from(vec![0x21; 30]));
         assert_eq!(outbox.take().len(), 2);
     }
 
     #[test]
+    fn video_beyond_its_budget_loses_its_oldest() {
+        let outbox = Outbox::new(1 << 20, 100, 1000);
+        for i in 0..5u8 {
+            outbox
+                .push(Class::Video, Bytes::from(vec![0x31, i, 0xFF].into_iter().chain([0; 297]).collect::<Vec<u8>>()));
+        }
+        let kept: Vec<u8> = outbox.take().iter().map(|m| m[1]).collect();
+        assert_eq!(kept, [2, 3, 4], "1000 bytes of the newest");
+        // Video does not count towards the reliable limit, nor towards voice's.
+        for _ in 0..3 {
+            outbox.push(Class::Video, Bytes::from(vec![0x31; 300]));
+        }
+        outbox.push(Class::Voice, Bytes::from(vec![0x21; 90]));
+        assert_eq!(outbox.take().len(), 4, "the voice frame too");
+        assert_eq!(*outbox.close.borrow(), None);
+    }
+
+    #[test]
     fn outbox_overflow_closes_and_purge_forgets_a_slot() {
-        let outbox = Outbox::new(100, 100);
-        outbox.push(Class::Chat, Message::binary(vec![0x41, 3, 0xFF, 0]));
-        outbox.push(Class::Chat, Message::binary(vec![0x41, 4, 0xFF, 0]));
-        outbox.push(Class::Command, Message::binary(gwire::member(3, true).to_vec()));
+        let outbox = Outbox::new(100, 100, 1000);
+        outbox.push(Class::Chat, Bytes::from(vec![0x41, 3, 0xFF, 0]));
+        outbox.push(Class::Chat, Bytes::from(vec![0x41, 4, 0xFF, 0]));
+        outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::member(3, true)));
         outbox.purge(3);
-        let left: Vec<Vec<u8>> = outbox.take().into_iter().map(|m| m.into_data().to_vec()).collect();
+        let left: Vec<Vec<u8>> = outbox.take().into_iter().map(|m| m.to_vec()).collect();
         assert_eq!(left, [gwire::member(3, true).to_vec(), vec![0x41, 4, 0xFF, 0]]);
         assert_eq!(*outbox.close.borrow(), None);
-        outbox.push(Class::Bulk, Message::binary(vec![0x61; 101]));
+        outbox.push(Class::Bulk, Bytes::from(vec![0x61; 101]));
         assert_eq!(*outbox.close.borrow(), Some(close::TIMEOUT));
     }
 
     #[tokio::test]
     async fn a_backlog_holds_senders_back_until_it_drains() {
-        let outbox = Outbox::new(4 << 20, 100);
+        let outbox = Outbox::new(4 << 20, 100, 1000);
         let mut behind = false;
         for _ in 0..20 {
-            behind = outbox.push(Class::Chat, Message::binary(vec![0x41; 16 << 10]));
+            behind = outbox.push(Class::Chat, Bytes::from(vec![0x41; 16 << 10]));
         }
         assert!(behind);
         // Bulk does not count: it has its own window.
-        let bulk = Outbox::new(4 << 20, 100);
-        assert!(!bulk.push(Class::Bulk, Message::binary(vec![0x61; 1 << 20])));
+        let bulk = Outbox::new(4 << 20, 100, 1000);
+        assert!(!bulk.push(Class::Bulk, Bytes::from(vec![0x61; 1 << 20])));
 
         let reader = outbox.clone();
         let drain = tokio::spawn(async move {
@@ -471,9 +603,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_recipient_that_does_not_catch_up_is_dropped() {
-        let outbox = Outbox::new(4 << 20, 100);
+        let outbox = Outbox::new(4 << 20, 100, 1000);
         for _ in 0..20 {
-            outbox.push(Class::Command, Message::binary(vec![0x03; 16 << 10]));
+            outbox.push(Class::Command, Bytes::from(vec![0x03; 16 << 10]));
         }
         outbox.catch_up().await;
         assert_eq!(*outbox.close.borrow(), Some(close::TIMEOUT));

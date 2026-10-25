@@ -1,3 +1,13 @@
+{
+	# Let's Encrypt only, so that the relay finds the certificate where it
+	# looks for it (docker-compose.yml).
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+	# UDP 443 is the relay's (WebTransport and QUIC): no HTTP/3 here.
+	servers {
+		protocols h1 h2
+	}
+}
+
 {$DOMAIN} {
 	reverse_proxy relay:8080
 }

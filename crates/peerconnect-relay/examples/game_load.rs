@@ -12,9 +12,10 @@
 //! snapshot from the first player, while all of that carries on.
 //!
 //! Options: `--players N` per group (default 10), `--light` (commands only,
-//! to measure a path's own delay), `--no-sync` (no newcomers), and
+//! to measure a path's own delay), `--no-sync` (no newcomers),
 //! `--shape KBPS:MS` to put every player behind its own emulated access
-//! link of that rate and one-way delay, with a deep buffer.
+//! link of that rate and one-way delay, with a deep buffer, and `--quic`
+//! to have the spawned relay's players connect over QUIC.
 //!
 //! Reported: per class, the time from the sender's `send` to the receiver's
 //! event (both in this process, one clock), how much of what was sent
@@ -96,6 +97,9 @@ struct Stats {
     syncs_running: AtomicU64,
     snapshots: Histogram,
     failures: AtomicU64,
+    /// Players who were connected over QUIC, and over a WebSocket, when they first heard from the group.
+    over_quic: AtomicU64,
+    over_websocket: AtomicU64,
     stop: AtomicBool,
 }
 
@@ -132,6 +136,7 @@ struct Args {
     shape: Option<(u64, u64)>,
     /// No newcomers: the same traffic without state transfer, for comparison.
     no_sync: bool,
+    quic: bool,
 }
 
 fn args() -> Args {
@@ -144,6 +149,7 @@ fn args() -> Args {
         light: false,
         shape: None,
         no_sync: false,
+        quic: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -157,6 +163,7 @@ fn args() -> Args {
             // Commands only, ten a second: to tell the path's own delay from queueing.
             "--light" => args.light = true,
             "--no-sync" => args.no_sync = true,
+            "--quic" => args.quic = true,
             // Each player behind its own link of this rate and delay, with a
             // deep buffer, as home and mobile links have: e.g. 2000:40.
             "--shape" => {
@@ -190,7 +197,8 @@ async fn main() {
                 .expect("relay binary");
             relay_process = Some(child);
             tokio::time::sleep(Duration::from_millis(300)).await;
-            format!("ws://127.0.0.1:{port}")
+            // The relay serves QUIC on the UDP port of the same number.
+            format!("{}://127.0.0.1:{port}", if args.quic { "quic" } else { "ws" })
         }
         (None, None) => panic!("--relay <url> or --spawn <relay binary>"),
     };
@@ -206,6 +214,8 @@ async fn main() {
         syncs_running: AtomicU64::new(0),
         snapshots: Histogram::new(),
         failures: AtomicU64::new(0),
+        over_quic: AtomicU64::new(0),
+        over_websocket: AtomicU64::new(0),
         stop: AtomicBool::new(false),
     });
     let duration = Duration::from_secs(args.seconds);
@@ -307,6 +317,11 @@ async fn main() {
         snaps.quantile(1.0),
         stats.failures.load(Ordering::Relaxed)
     );
+    println!(
+        "players over QUIC: {}, over WebSocket: {}",
+        stats.over_quic.load(Ordering::Relaxed),
+        stats.over_websocket.load(Ordering::Relaxed)
+    );
     if !samples.is_empty() {
         let busy: Vec<&(f64, u64)> = samples.iter().skip(3).collect();
         let cpu = busy.iter().map(|s| s.0).sum::<f64>() / busy.len().max(1) as f64;
@@ -328,6 +343,7 @@ async fn player(group: Group, g: usize, m: usize, members: usize, light: bool, s
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ticks: u64 = (m as u64 * 7) % 50; // spread the players' schedules
     let mut voice_seq: u16 = 0;
+    let mut counted = false;
     let me = conn.id();
     loop {
         tokio::select! {
@@ -375,6 +391,11 @@ async fn player(group: Group, g: usize, m: usize, members: usize, light: bool, s
             event = conn.next() => match event {
                 // Count only players: newcomers do not record what they get.
                 Some(Event::Joined { member, profile }) if profile.starts_with(b"player") => {
+                    if players.is_empty() && !counted {
+                        counted = true;
+                        let over = if conn.via() == Some(group::Via::Quic) { &stats.over_quic } else { &stats.over_websocket };
+                        over.fetch_add(1, Ordering::Relaxed);
+                    }
                     players.insert(member);
                     present = players.len();
                 }

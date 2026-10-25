@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Video latency</title>
+<canvas id="b"></canvas>
+<script type="module">
+  import { Group, joinGroup } from "../../index.js";
+  import { startVideo } from "../../video.js";
+
+  // Two members in one page: a sends the (fake) camera, b decodes it. For
+  // each frame, the time from a handing it to the group to b decoding it.
+  window.run = async ({ relay, seconds, webTransport, bitrate }) => {
+    const group = Group.create(relay);
+    const a = joinGroup(group, { profile: "a", webTransport });
+    const b = joinGroup(group, { profile: "b", webTransport });
+    await new Promise((resolve) => {
+      const check = () => a.members.size && b.members.size && resolve();
+      a.addEventListener("joined", check);
+      b.addEventListener("joined", check);
+    });
+    const sentAt = new Map();
+    const send = a.sendVideo.bind(a);
+    a.sendVideo = (track, keyframe, timestamp, data) => {
+      sentAt.set(timestamp, performance.now());
+      return send(track, keyframe, timestamp, data);
+    };
+    const latencies = [];
+    const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 } });
+    const va = await startVideo(a, { stream: camera, bitrate: bitrate ?? 800_000, framerate: 20 });
+    const vb = await startVideo(b, {
+      onFrame: (member, frame) => {
+        const at = sentAt.get(Math.round(frame.timestamp / 1000) >>> 0);
+        if (at !== undefined) latencies.push(performance.now() - at);
+        frame.close();
+      },
+    });
+    await new Promise((r) => setTimeout(r, seconds * 1000));
+    const via = [a.via, b.via];
+    const sent = va.stats();
+    const received = vb.stats().members[0] ?? { received: 0, decoded: 0, errors: 0 };
+    va.stop();
+    vb.stop();
+    camera.getTracks().forEach((t) => t.stop());
+    a.leave();
+    b.leave();
+    latencies.sort((x, y) => x - y);
+    const at = (q) => latencies[Math.floor((latencies.length - 1) * q)];
+    return { via, sent, received, p50: at(0.5), p99: at(0.99), max: at(1) };
+  };
+  window.ready = true;
+</script>

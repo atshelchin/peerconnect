@@ -26,7 +26,7 @@ while let Some(event) = conn.next().await {
 }
 ```
 
-Without the `client` feature the crate does no I/O: `Peer` is a state machine that any WebSocket library and event loop can drive.
+The `client` feature's group driver (`client::group`) also speaks QUIC to relays that offer it (`https://` and `quic://` relay URLs), falling back to their WebSocket. Without the `client` feature the crate does no I/O: `Peer` is a state machine that any WebSocket library and event loop can drive.
 
 - Website, guide and live demo: <https://peerconnect.dev>
 - Specification: <https://peerconnect.dev/spec>

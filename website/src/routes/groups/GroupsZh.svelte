@@ -38,7 +38,7 @@
 	名成员：一支游戏小队、一个共享世界里的所有玩家、一个团队。成员之间互发指令、聊天、语音和状态，全程端到端加密，经过的仍是那套不受信任、不存状态的中继。
 </p>
 
-<p class="try"><a href="/zh/demo/voice">体验一下：在浏览器里进行多人语音聊天 →</a></p>
+<p class="try"><a href="/zh/demo/voice">体验一下：在浏览器里进行多人语音视频聊天 →</a></p>
 
 <h2 id="overview">群组能做什么</h2>
 <ul>
@@ -132,6 +132,11 @@
 					>文字聊天，以及其他可以让指令和语音先走的内容。</td
 				></tr
 			>
+			<tr
+				><td><strong>视频</strong></td><td>实时：宁可丢弃也不延迟</td><td
+					>视频帧，切成每片都装得进一个数据报的分片，再完整拼回；丢失的分片重传一次，彻底丢失的帧会触发关键帧请求。排在聊天之后，以免把聊天挤掉。</td
+				></tr
+			>
 			<tr><td><strong>批量</strong></td><td>可靠，端到端流量控制</td><td>状态同步用的快照。</td></tr
 			>
 		</tbody>
@@ -139,7 +144,11 @@
 </div>
 <p>
 	因此，刷屏的聊天或一份 50 MB
-	的快照都不会耽误任何一条指令，语音也不会排在聊天后面。指令流和聊天流中的每条消息最多 16,352 字节。
+	的快照都不会耽误任何一条指令，语音也不会排在聊天后面，视频也不会挤掉聊天。浏览器里，<code
+		>peerconnect/video</code
+	>
+	的 <code>startVideo</code> 通过 WebCodecs 发送摄像头画面，并把每位成员画进一个 canvas。指令流和聊天流中的每条消息最多
+	16,352 字节。
 </p>
 
 <h2 id="identities">身份与角色</h2>
@@ -437,6 +446,33 @@
 	看不到自己缓冲了多少数据，只能把每一帧立即转发：它既不能丢弃迟到的语音，也不能让指令优先，而且每个语音帧都是一条计费的
 	Durable Object 消息。大规模使用语音时，请用 Linux 中继。
 </p>
+<p>
+	Linux 中继还在同号的 UDP 端口上通过 QUIC
+	提供群组：每个类别各走一条流，语音走数据报，所以丢一个包只会挡住它所在的类别，语音也从不等待重传。邀请里的中继
+	URL 决定用什么：
+</p>
+<ul>
+	<li><code>wss://relay.example.com</code>：WebSocket，任何中继都支持。</li>
+	<li>
+		<code>https://relay.example.com</code>：浏览器用 WebTransport，Rust 用原生 QUIC，走 UDP
+		443，不通时回退到 <code>wss://</code>。中继需要浏览器信任的证书（<code
+			>PEERCONNECT_TLS_CERT</code
+		>
+		和 <code>PEERCONNECT_TLS_KEY</code>）。
+	</li>
+	<li>
+		<code>quic://203.0.113.9:8080</code>：不需要域名也不需要证书。原生客户端用原生
+		QUIC，不校验中继的证书；浏览器用
+		WebTransport，固定这类中继提供的“每周证书”的哈希，这张证书任何人都能算出来（<a
+			href="/spec/groups#sec-3-7">§3.7</a
+		>）；两者在 UDP 不通时都回退到 <code>ws://</code>。
+	</li>
+</ul>
+<p>
+	QUIC 有 1.5 秒的先手；UDP 不通的地方，成员自动改用
+	WebSocket，同一个群组里两种可以混用。在每一跳丢包 3% 的情况下，语音 p99 在 WebSocket 上是 138
+	ms，在 QUIC 上是 53 ms（<a href="/spec/groups#sec-3-6">规范</a>）。
+</p>
 
 <h2 id="latency">延迟与负载</h2>
 <p>
@@ -548,10 +584,9 @@
 <h2 id="limitations">已知限制</h2>
 <ul>
 	<li>
-		<strong>语音跑在 TCP 上。</strong>经由 WebSocket
-		传输时，一个丢失的包会挡住后面的数据，直到它被重传。抖动缓冲、丢弃迟到帧以及较小的内核缓冲区能把影响控制在一次短暂的卡顿之内，但在丢包严重的链路上，基于
-		UDP 的通话（微信、Telegram、WebRTC）表现会更平稳。WebTransport
-		数据报可以解决这个问题，目前尚未采用。
+		<strong>走 WebSocket 时，语音跑在 TCP 上。</strong>在 Cloudflare 中继上，以及 UDP
+		不通的地方，一个丢失的包会挡住后面的数据，直到它被重传。抖动缓冲和丢弃迟到帧能把影响控制在一次卡顿之内，但在丢包的链路上仍然明显。走
+		QUIC（Linux 中继）时不会这样（见<a href="#relays">中继</a>）。
 	</li>
 	<li>
 		<strong>成员之间没有统一顺序。</strong

@@ -39,7 +39,7 @@
 	through the same untrusted, stateless relays.
 </p>
 
-<p class="try"><a href="/demo/voice">Try it: talk in a group voice chat in your browser →</a></p>
+<p class="try"><a href="/demo/voice">Try it: a group voice and video chat in your browser →</a></p>
 
 <h2 id="overview">What groups are for</h2>
 <ul>
@@ -148,6 +148,13 @@
 				></tr
 			>
 			<tr
+				><td><strong>Video</strong></td><td>real-time: dropped rather than delayed</td><td
+					>Video frames, cut into fragments that each fit a datagram and put back together whole; a
+					lost fragment is resent once, and a frame lost for good brings a keyframe. After chat,
+					which it could otherwise starve.</td
+				></tr
+			>
+			<tr
 				><td><strong>Bulk</strong></td><td>reliable, flow-controlled end to end</td><td
 					>State transfer snapshots.</td
 				></tr
@@ -156,7 +163,9 @@
 	</table>
 </div>
 <p>
-	So a chat flood or a 50 MB snapshot never delays a command, and voice never waits behind chat.
+	So a chat flood or a 50 MB snapshot never delays a command, voice never waits behind chat, and
+	video never starves chat. In the browser, <code>startVideo</code> from
+	<code>peerconnect/video</code> sends the camera through WebCodecs and draws each member into a canvas.
 	Each message on the command and chat streams carries up to 16,352 bytes.
 </p>
 
@@ -486,6 +495,35 @@
 	frame at once: it can neither drop late voice nor put commands first, and every voice frame is a
 	billed Durable Object message. For voice at scale, use the Linux relay.
 </p>
+<p>
+	The Linux relay also serves groups over QUIC, on the UDP port of the same number: each class gets
+	a stream of its own and voice travels as datagrams, so a lost packet holds up only its own class
+	and voice never waits for a retransmission. The relay URL in the invite says what to use:
+</p>
+<ul>
+	<li>
+		<code>wss://relay.example.com</code>: the WebSocket, on any relay.
+	</li>
+	<li>
+		<code>https://relay.example.com</code>: WebTransport in browsers and raw QUIC in Rust, on UDP
+		443, falling back to <code>wss://</code>. The relay needs a certificate browsers trust (<code
+			>PEERCONNECT_TLS_CERT</code
+		>
+		and <code>PEERCONNECT_TLS_KEY</code>).
+	</li>
+	<li>
+		<code>quic://203.0.113.9:8080</code>: no domain and no certificate needed. Native clients use
+		raw QUIC without checking the relay’s certificate; browsers use WebTransport, pinning the weekly
+		certificate such a relay serves, which anyone can compute (<a href="/spec/groups#sec-3-7"
+			>§3.7</a
+		>); both fall back to <code>ws://</code>.
+	</li>
+</ul>
+<p>
+	QUIC gets a 1.5 s head start; where UDP does not get through, members use the WebSocket, and one
+	group can mix both. With 3% of packets lost on each hop, voice p99 was 138 ms over a WebSocket and
+	53 ms over QUIC (<a href="/spec/groups#sec-3-6">specification</a>).
+</p>
 
 <h2 id="latency">Latency and load</h2>
 <p>
@@ -621,10 +659,10 @@
 <h2 id="limitations">Limitations</h2>
 <ul>
 	<li>
-		<strong>Voice runs over TCP.</strong> Over a WebSocket, a lost packet holds up what follows it until
-		it is resent. The jitter buffer, the dropping of late frames and small kernel buffers keep that to
-		a brief glitch, but on a lossy link UDP-based calls (WeChat, Telegram, WebRTC) degrade more gracefully.
-		WebTransport datagrams would lift this; they are not used yet.
+		<strong>Over WebSockets, voice runs over TCP.</strong> On the Cloudflare relay, and wherever UDP
+		does not get through, a lost packet holds up what follows it until it is resent. The jitter
+		buffer and the dropping of late frames keep that to a glitch, but it shows on lossy links. Over
+		QUIC (the Linux relay) it does not (<a href="#relays">Relays</a>).
 	</li>
 	<li>
 		<strong>No order between members.</strong> The relay does not order one member’s commands

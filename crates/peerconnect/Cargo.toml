@@ -19,12 +19,18 @@ hmac = "0.13"
 sha2 = { version = "0.11", default-features = false }
 x25519-dalek = { version = "3", default-features = false, features = ["zeroize", "static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }
+# The `certificate` feature: the weekly WebTransport certificate (GROUP.md §3.7).
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa"] }
 
 # The `client` feature: a Tokio WebSocket driver.
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
-tokio = { version = "1", optional = true, features = ["rt", "time", "sync", "macros"] }
+tokio = { version = "1", optional = true, features = ["rt", "time", "sync", "macros", "net"] }
 tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Groups over QUIC (GROUP.md §3.6).
+bytes = { version = "1", optional = true }
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 snow = "0.10"
@@ -46,5 +52,8 @@ required-features = ["client"]
 default = ["fast"]
 # Precomputed curve tables: faster key generation and signing, ~30 KB more code.
 fast = ["ed25519-dalek/fast", "x25519-dalek/precomputed-tables"]
-# A Tokio WebSocket driver (`peerconnect::client`).
-client = ["dep:futures-util", "dep:rustls", "dep:tokio", "dep:tokio-tungstenite"]
+# The weekly certificate a relay without certificate files serves over QUIC,
+# and whose hashes browsers pin for a `quic://` relay (`group::certificate`).
+certificate = ["dep:p256"]
+# A Tokio driver (`peerconnect::client`): WebSocket, and QUIC for groups.
+client = ["dep:bytes", "dep:futures-util", "dep:quinn", "dep:rustls", "dep:tokio", "dep:tokio-tungstenite", "dep:webpki-roots"]

@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Group, Identity, joinGroup } from "../index.js";
+import { Group, Identity, joinGroup, transportsFor, weeklyHashes } from "../index.js";
 
 const target = fileURLToPath(new URL("../../target/debug/", import.meta.url));
 let relay;
@@ -178,6 +178,63 @@ test("a JavaScript member and a Rust member talk", async () => {
     const order = texts(js, rustId, 1, "command");
     rust.stdin.write("hello from rust\n!jump\n");
     assert.deepEqual([await chat, await order], [["hello from rust"], ["jump"]]);
+  } finally {
+    rust.kill();
+    js.leave();
+  }
+});
+
+test("relay URLs map to transports as in Rust (GROUP.md §3.6)", () => {
+  assert.deepEqual(transportsFor("wss://r.example/g1/x"), [{ type: "websocket", url: "wss://r.example/g1/x" }]);
+  assert.deepEqual(transportsFor("https://r.example:8443/p/g1/x"), [
+    { type: "webtransport", url: "https://r.example:8443/p/g1/x" },
+    { type: "websocket", url: "wss://r.example:8443/p/g1/x" },
+  ]);
+  // Raw QUIC is for native clients; JavaScript takes WebTransport, pinning the weekly certificate.
+  assert.deepEqual(transportsFor("quic://203.0.113.9:4433/g1/x"), [
+    { type: "webtransport", url: "https://203.0.113.9:4433/g1/x", weekly: true },
+    { type: "websocket", url: "ws://203.0.113.9:4433/g1/x" },
+  ]);
+  assert.deepEqual(transportsFor("http://r.example/g1/x"), []);
+  assert.equal(Group.create("quic://203.0.113.9:4433").relay, "quic://203.0.113.9:4433");
+});
+
+test("weekly certificate hashes follow the week", () => {
+  const week = 7 * 24 * 3600 * 1000;
+  const now = 2965 * week + 1000;
+  const [last, current, next] = weeklyHashes(now);
+  assert.equal(current.algorithm, "sha-256");
+  assert.equal(current.value.length, 32);
+  assert.deepEqual(weeklyHashes(now + week)[1], next);
+  assert.deepEqual(weeklyHashes(now - week)[1], last);
+  assert.notDeepEqual(current.value, next.value);
+});
+
+test("on a quic:// relay, JavaScript takes the WebSocket and a Rust member raw QUIC, in one group", async (t) => {
+  if (process.env.PEERCONNECT_RELAY) return t.skip("needs the in-process relay's QUIC port");
+  const group = Group.create(relay.replace("ws://", "quic://"));
+  const js = joinGroup(group, { profile: "js" });
+  const rust = spawn(`${target}examples/group`, ["join", group.toString(), "rust"]);
+  const lines = createInterface({ input: rust.stdout });
+  const line = () => new Promise((resolve) => lines.once("line", resolve));
+  let log = "";
+  const overQuic = new Promise((resolve) =>
+    rust.stderr.on("data", (data) => {
+      log += data;
+      if (log.includes("Online over Quic")) resolve();
+    }),
+  );
+  try {
+    await admitted(js, 1);
+    await overQuic;
+    assert.equal(js.via, "websocket");
+    const [rustId] = js.members.keys();
+    const heard = line();
+    js.send("command", "over TCP");
+    assert.equal(await heard, "js command: over TCP");
+    const back = texts(js, rustId, 1, "chat");
+    rust.stdin.write("over UDP\n");
+    assert.deepEqual(await back, ["over UDP"]);
   } finally {
     rust.kill();
     js.leave();

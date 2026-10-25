@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import type { GroupConnection } from 'peerconnect';
 	import type { Voice } from 'peerconnect/voice';
+	import type { Video } from 'peerconnect/video';
 	import { encode } from 'uqr';
 	import { i18n } from '#lib/i18n/current.svelte.ts';
 	import { RELAY_URL } from '#lib/site.ts';
@@ -16,10 +17,18 @@
 	const BARS = 40;
 	/** Above this level (0–1, see `level`), someone counts as speaking. */
 	const SPEAKING = 0.25;
+	/** A member's video is shown while frames keep coming: at least one in this long. */
+	const VIDEO_FRESH = 2000;
+	/**
+	 * Small video: the public relay is a Cloudflare Worker, where every
+	 * fragment is a billed message (and nothing is dropped or put last).
+	 */
+	const VIDEO = { width: 480, height: 270, framerate: 15, bitrate: 300_000, minBitrate: 100_000 };
 
 	type Sdk = typeof import('peerconnect');
 	type VoiceSdk = typeof import('peerconnect/voice');
-	type Problem = 'mic' | 'codecs' | 'full' | 'replaced' | 'link' | 'failed';
+	type VideoSdk = typeof import('peerconnect/video');
+	type Problem = 'mic' | 'camera' | 'codecs' | 'full' | 'replaced' | 'link' | 'failed';
 	interface Member {
 		id: string;
 		name: string;
@@ -33,6 +42,7 @@
 	interface Presence {
 		muted: boolean;
 		deafened: boolean;
+		camera: boolean;
 	}
 
 	const t = $derived(i18n.t.voice);
@@ -40,9 +50,14 @@
 
 	let sdk: Sdk | undefined;
 	let voiceSdk: VoiceSdk | undefined;
+	let videoSdk: VideoSdk | undefined;
 	let conn: GroupConnection | undefined;
 	let voice: Voice | undefined = $state.raw();
+	let video: Video | undefined = $state.raw();
 	let frame = 0;
+	/** When each member's latest video frame was decoded: read by the 40 ms loop, not rendered. */
+	// eslint-disable-next-line svelte/prefer-svelte-reactivity -- updated 15 times a second per member
+	const frames = new Map<string, number>();
 
 	let phase: 'loading' | 'start' | 'join' | 'starting' | 'room' | 'error' = $state('loading');
 	let problems: Problem[] = $state([]);
@@ -58,6 +73,10 @@
 	let silenced: Record<string, boolean> = $state({});
 	let muted = $state(false);
 	let deafened = $state(false);
+	let camera = $state(false);
+	let cameraStream: MediaStream | undefined = $state.raw();
+	/** Members whose video is coming in now. */
+	let watching: Record<string, boolean> = $state({});
 	let lines: Line[] = $state([]);
 	let draft = $state('');
 	let copied = $state(false);
@@ -182,6 +201,7 @@
 			if (!current()) return;
 			members = members.filter((m) => m.id !== e.detail.member);
 			delete waves[e.detail.member];
+			frames.delete(e.detail.member);
 		});
 		c.addEventListener('message', (e) => {
 			if (!current()) return;
@@ -191,7 +211,11 @@
 				try {
 					const said = JSON.parse(decoder.decode(data));
 					if (said?.type === 'presence' && from !== me) {
-						presence[from] = { muted: !!said.muted, deafened: !!said.deafened };
+						presence[from] = {
+							muted: !!said.muted,
+							deafened: !!said.deafened,
+							camera: !!said.camera
+						};
 					}
 				} catch {
 					// not a presence announcement
@@ -212,9 +236,32 @@
 				typeof AudioEncoder === 'undefined' || String(error).includes('WebCodecs');
 			raise(unsupported ? 'codecs' : 'mic');
 		}
+		// Everyone's video, drawn into their card; ours only when the camera is on.
+		if (typeof VideoDecoder === 'function') {
+			try {
+				video = await videoSdk!.startVideo(c, {
+					...VIDEO,
+					onFrame: (member, decoded) => {
+						frames.set(member, performance.now());
+						decoded.close();
+					}
+				});
+			} catch {
+				// no video in this browser: voice and chat go on
+			}
+		}
 		// Every 40 ms, one more bar in everyone's waveform.
 		let last = 0;
 		const draw = (now: number) => {
+			if (now - last >= 40) {
+				const showing: Record<string, boolean> = {};
+				for (const m of members) {
+					const at = frames.get(m.id);
+					if (m.id !== me && presence[m.id]?.camera && at && now - at < VIDEO_FRESH)
+						showing[m.id] = true;
+				}
+				if (Object.keys(showing).join() !== Object.keys(watching).join()) watching = showing;
+			}
 			if (voice && now - last >= 40) {
 				last = now;
 				const stats = voice.stats();
@@ -236,7 +283,7 @@
 	/** Tells the others whether we are muted or deafened. */
 	function announce() {
 		try {
-			conn?.send('command', JSON.stringify({ type: 'presence', muted, deafened }));
+			conn?.send('command', JSON.stringify({ type: 'presence', muted, deafened, camera }));
 		} catch {
 			// left
 		}
@@ -252,6 +299,55 @@
 		deafened = !deafened;
 		voice?.setDeafened(deafened);
 		announce();
+	}
+
+	async function toggleCamera() {
+		if (!video) return;
+		if (camera) {
+			camera = false;
+			announce();
+			await video.setStream(null);
+			cameraStream?.getTracks().forEach((t) => t.stop());
+			cameraStream = undefined;
+			return;
+		}
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({
+				video: { width: VIDEO.width, height: VIDEO.height, frameRate: VIDEO.framerate }
+			});
+			cameraStream = stream;
+			await video.setStream(stream);
+			camera = true;
+			problems = problems.filter((p) => p !== 'camera');
+			announce();
+		} catch {
+			cameraStream?.getTracks().forEach((t) => t.stop());
+			cameraStream = undefined;
+			raise('camera');
+		}
+	}
+
+	/** Draws a member's video into this canvas while it is on the page. */
+	function screen(node: HTMLCanvasElement, id: string) {
+		video?.attach(id, node);
+		return {
+			destroy() {
+				video?.attach(id, null);
+			}
+		};
+	}
+
+	/** Shows our own camera, straight from it. */
+	function preview(node: HTMLVideoElement, stream: MediaStream | undefined) {
+		node.srcObject = stream ?? null;
+		return {
+			update(next: MediaStream | undefined) {
+				node.srcObject = next ?? null;
+			},
+			destroy() {
+				node.srcObject = null;
+			}
+		};
 	}
 
 	function toggleThem(id: string) {
@@ -278,9 +374,13 @@
 
 	async function stop() {
 		cancelAnimationFrame(frame);
-		const [v, c] = [voice, conn];
+		const [v, vd, c] = [voice, video, conn];
 		voice = undefined;
+		video = undefined;
 		conn = undefined;
+		vd?.stop();
+		cameraStream?.getTracks().forEach((t) => t.stop());
+		cameraStream = undefined;
 		await v?.stop().catch(() => {});
 		c?.leave();
 	}
@@ -292,7 +392,9 @@
 		waves = {};
 		presence = {};
 		silenced = {};
-		muted = deafened = false;
+		watching = {};
+		frames.clear();
+		muted = deafened = camera = false;
 		status = 'offline';
 		problems = [];
 		invite = '';
@@ -314,7 +416,11 @@
 		let disposed = false;
 		(async () => {
 			try {
-				[sdk, voiceSdk] = await Promise.all([import('peerconnect'), import('peerconnect/voice')]);
+				[sdk, voiceSdk, videoSdk] = await Promise.all([
+					import('peerconnect'),
+					import('peerconnect/voice'),
+					import('peerconnect/video')
+				]);
 			} catch {
 				phase = 'error';
 				raise('failed');
@@ -343,10 +449,22 @@
 </script>
 
 {#snippet icon(
-	name: 'mic' | 'mic-off' | 'headphones' | 'headphones-off' | 'speaker' | 'speaker-off'
+	name:
+		| 'mic'
+		| 'mic-off'
+		| 'headphones'
+		| 'headphones-off'
+		| 'speaker'
+		| 'speaker-off'
+		| 'camera'
+		| 'camera-off'
 )}
 	<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-		{#if name === 'mic' || name === 'mic-off'}
+		{#if name === 'camera' || name === 'camera-off'}
+			<rect x="3" y="6.5" width="13" height="11" rx="2.5" />
+			<path d="M16 10.5l5-3v9l-5-3z" />
+			{#if name === 'camera-off'}<path d="M4 4l16 16" />{/if}
+		{:else if name === 'mic' || name === 'mic-off'}
 			<rect x="9" y="3" width="6" height="11" rx="3" />
 			<path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7" />
 			{#if name === 'mic-off'}<path d="M4 4l16 16" />{/if}
@@ -417,6 +535,14 @@
 					{@const off = mine ? muted : !!presence[person.id]?.muted || !!silenced[person.id]}
 					{@const talking = !off && speaking(person.id)}
 					<li class="person" class:mine class:talking class:off>
+						{#if mine && camera && cameraStream}
+							<video class="screen mirror" use:preview={cameraStream} autoplay muted playsinline
+							></video>
+						{:else if !mine && watching[person.id]}
+							<canvas class="screen" use:screen={person.id}
+								>{t.room.video.replace('{name}', person.name)}</canvas
+							>
+						{/if}
 						<span class="avatar" aria-hidden="true">{person.name.slice(0, 1).toUpperCase()}</span>
 						<span class="who">
 							<span class="name"
@@ -453,6 +579,16 @@
 										title={deafened ? t.room.hearOff : t.room.hearOn}
 										onclick={toggleSpeaker}
 										>{@render icon(deafened ? 'headphones-off' : 'headphones')}</button
+									>
+								{/if}
+								{#if video && typeof VideoEncoder === 'function'}
+									<button
+										class="toggle camera"
+										class:live={camera}
+										aria-pressed={camera}
+										aria-label={camera ? t.room.cameraOn : t.room.cameraOff}
+										title={camera ? t.room.cameraOn : t.room.cameraOff}
+										onclick={toggleCamera}>{@render icon(camera ? 'camera' : 'camera-off')}</button
 									>
 								{/if}
 							{:else}
@@ -675,6 +811,7 @@
 	.person {
 		--state: var(--muted);
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 12px;
 		padding: 10px 12px;
@@ -694,6 +831,26 @@
 
 	.person.off {
 		--state: #c2410c;
+	}
+
+	/* Video, when there is any, across the top of the card. */
+	.screen {
+		display: block;
+		flex: 1 0 100%;
+		width: 100%;
+		aspect-ratio: 16 / 9;
+		border-radius: 10px;
+		background: #000;
+		object-fit: cover;
+	}
+
+	.screen.mirror {
+		transform: scaleX(-1);
+	}
+
+	.toggle.camera.live {
+		border-color: var(--accent);
+		color: var(--accent);
 	}
 
 	.avatar {

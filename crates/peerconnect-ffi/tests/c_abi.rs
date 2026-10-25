@@ -22,6 +22,8 @@ struct Driver {
     ws: Option<Ws>,
     start: Instant,
     events: Vec<(i32, [u8; 32], Vec<u8>)>,
+    /// PC_VIDEO: track, keyframe, timestamp, data.
+    videos: Vec<(u8, u8, u32, Vec<u8>)>,
 }
 
 impl Driver {
@@ -35,7 +37,7 @@ impl Driver {
         let invite = CString::new(invite).unwrap();
         let m = unsafe { pc_member_new(invite.as_ptr(), seed.as_ptr(), name.as_ptr(), name.len(), 0) };
         assert!(!m.is_null());
-        Driver { m, seed, transfer: None, ws: None, start: Instant::now(), events: Vec::new() }
+        Driver { m, seed, transfer: None, ws: None, start: Instant::now(), events: Vec::new(), videos: Vec::new() }
     }
 
     fn now(&self) -> u64 {
@@ -76,6 +78,9 @@ impl Driver {
                 _ => {
                     if kind == PC_SYNC_REQUEST {
                         self.transfer = Some(out.transfer);
+                    }
+                    if kind == PC_VIDEO {
+                        self.videos.push((out.track, out.keyframe, out.timestamp, data.clone()));
                     }
                     self.events.push((kind, out.member, data))
                 }
@@ -147,6 +152,10 @@ async fn two_members_through_the_c_abi() {
     assert_eq!(unsafe { pc_member_send(a.m, 0, b"place block".as_ptr(), 11, &mut id) }, PC_OK);
     assert_eq!(id, 0);
     assert_eq!(unsafe { pc_member_send_voice(a.m, 3, b"opus".as_ptr(), 4) }, 1);
+    let picture: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+    assert_eq!(unsafe { pc_member_send_video(a.m, 2, 1, 4321, picture.as_ptr(), picture.len()) }, 1);
+    let too_big = vec![0u8; 300_000];
+    assert_eq!(unsafe { pc_member_send_video(a.m, 2, 0, 0, too_big.as_ptr(), too_big.len()) }, 0);
     let b_id = b.id();
     assert_eq!(unsafe { pc_member_send_to(a.m, b_id.as_ptr(), 1, b"psst".as_ptr(), 4) }, PC_OK);
     assert_eq!(unsafe { pc_member_send(a.m, 7, b"x".as_ptr(), 1, std::ptr::null_mut()) }, PC_INVALID);
@@ -155,12 +164,17 @@ async fn two_members_through_the_c_abi() {
     let stranger = [7u8; 32];
     assert_eq!(unsafe { pc_member_send_to(a.m, stranger.as_ptr(), 0, b"x".as_ptr(), 1) }, PC_NOT_PRESENT);
 
-    while !(b.has(PC_MESSAGE, b"place block") && b.has(PC_VOICE, b"opus") && b.has(PC_MESSAGE, b"psst")) {
+    while !(b.has(PC_MESSAGE, b"place block")
+        && b.has(PC_VOICE, b"opus")
+        && b.has(PC_MESSAGE, b"psst")
+        && !b.videos.is_empty())
+    {
         assert!(Instant::now() < deadline, "not delivered: {:?}", b.events);
         a.tick().await;
         b.tick().await;
     }
     assert!(a.has(PC_MESSAGE, b"place block"), "own messages are delivered too");
+    assert_eq!(b.videos, [(2, 1, 4321, picture)], "a video frame, whole");
 
     unsafe { pc_member_leave(b.m) };
     while !a.events.iter().any(|(k, m, _)| *k == PC_LEFT && *m == b_id) {

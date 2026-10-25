@@ -1,13 +1,16 @@
 //! End-to-end tests of groups over real sockets: the Tokio group client
 //! against a relay. As in `e2e.rs`, set `PEERCONNECT_RELAY` to test any
 //! relay; tests that restart the relay or change its settings only run
-//! in-process.
+//! in-process. With `PEERCONNECT_TRANSPORT=quic`, the in-process relay also
+//! serves QUIC and members connect over it (raw protocol checks still use
+//! WebSockets, so groups mix both).
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use peerconnect::client::group::{self, GroupConnection};
+use peerconnect::client::group::{self, GroupConnection, Via};
+use peerconnect::group::transport::{self, Transport};
 use peerconnect::group::{Channel, Config, Event, Group, Identity, Member, MemberId, Output, wire};
 use peerconnect::wire::close;
 use tokio::net::TcpListener;
@@ -30,16 +33,34 @@ impl Relay {
     }
 
     async fn bind_with(addr: &str, config: peerconnect_relay::Config) -> Relay {
-        let listener = TcpListener::bind(addr).await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let quic = std::env::var("PEERCONNECT_TRANSPORT").is_ok_and(|t| t == "quic");
+        // QUIC on the UDP port of the same number.
+        let (listener, udp) = loop {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            if !quic {
+                break (listener, None);
+            }
+            match std::net::UdpSocket::bind(listener.local_addr().unwrap()) {
+                Ok(udp) => break (listener, Some(udp)),
+                Err(_) if addr.ends_with(":0") => continue,
+                Err(err) => panic!("{err}"),
+            }
+        };
+        let url = format!("{}://{}", if quic { "quic" } else { "ws" }, listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
-            peerconnect_relay::serve(listener, config, async {
+            peerconnect_relay::serve_all(listener, udp, config, async {
                 let _ = stopped.await;
             })
             .await
+            .unwrap()
         });
         Relay { url, stop: Some(stop), task: Some(task) }
+    }
+
+    /// The relay's WebSocket URL.
+    fn websocket(&self) -> String {
+        websocket_url(&self.url)
     }
 
     fn external(&self) -> bool {
@@ -54,8 +75,16 @@ impl Relay {
 
 fn join(group: &Group, name: &str) -> GroupConnection {
     let config = Config { profile: name.as_bytes().to_vec(), ..Config::default() };
-    group::join(group.clone(), Identity::generate(), config).unwrap()
+    let conn = group::join(group.clone(), Identity::generate(), config).unwrap();
+    if group.relay().starts_with("quic://") {
+        OVER_QUIC.lock().unwrap().insert(conn.id());
+    }
+    conn
 }
+
+/// Members that must be connected over QUIC once admitted, not fallen back.
+static OVER_QUIC: std::sync::Mutex<std::collections::BTreeSet<MemberId>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 async fn wait(conn: &mut GroupConnection, what: impl Fn(&Event) -> bool) -> Event {
     timeout(Duration::from_secs(20), async {
@@ -80,6 +109,8 @@ async fn admitted(conn: &mut GroupConnection, count: usize) {
             _ => unreachable!(),
         };
     }
+    let expected = if OVER_QUIC.lock().unwrap().contains(&conn.id()) { Via::Quic } else { Via::WebSocket };
+    assert_eq!(conn.via(), Some(expected));
 }
 
 async fn message(conn: &mut GroupConnection, from: MemberId) -> (Channel, String) {
@@ -178,7 +209,7 @@ async fn messages_survive_a_relay_restart() {
     if relay.external() {
         return;
     }
-    let address = relay.url.trim_start_matches("ws://").to_string();
+    let address = relay.url.split_once("://").unwrap().1.to_string();
     let group = Group::create(&relay.url).unwrap();
     let mut a = join(&group, "a");
     let mut b = join(&group, "b");
@@ -282,7 +313,15 @@ async fn raw_join(group: &Group, identity: &Identity) -> (RawWs, u8, u32) {
 }
 
 async fn raw(group: &Group) -> RawWs {
-    tokio_tungstenite::connect_async(group.endpoint()).await.unwrap().0
+    tokio_tungstenite::connect_async(websocket_url(&group.endpoint())).await.unwrap().0
+}
+
+/// The WebSocket a relay URL (or a URL under one) falls back to.
+fn websocket_url(url: &str) -> String {
+    match transport::transports(url).pop() {
+        Some(Transport::WebSocket(url)) => url,
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The JOIN a member sends for this HELLO, without going through a driver.
@@ -557,7 +596,7 @@ async fn an_abruptly_cut_connection_recovers() {
     if relay.external() {
         return;
     }
-    let (proxy, cut) = cuttable_proxy(&relay.url).await;
+    let (proxy, cut) = cuttable_proxy(&relay.websocket()).await;
     let group = Group::create(&proxy).unwrap();
     let mut a = join(&group, "a");
     let mut b = join(&group, "b");

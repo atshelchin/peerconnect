@@ -1,11 +1,12 @@
 import { expect, test } from '@playwright/test';
 
-// Chromium's fake microphone (a beep) and no permission prompt.
+// Chromium's fake microphone (a beep) and camera (a moving pattern), and no
+// permission prompt.
 test.use({
 	launchOptions: {
 		args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream']
 	},
-	permissions: ['microphone']
+	permissions: ['microphone', 'camera']
 });
 
 test('the voice demo starts a room and gives a link to join it', async ({ page }) => {
@@ -93,4 +94,68 @@ test('three browsers hear each other and chat', async ({ browser }) => {
 
 	await c.getByRole('button', { name: 'Leave' }).click();
 	await expect(a.locator('.person')).toHaveCount(2, { timeout: 30_000 });
+});
+
+test('the camera turns on and off from our own card', async ({ page }) => {
+	await page.goto('/demo/voice');
+	await page.getByRole('button', { name: 'Create a room' }).click();
+	await page.getByLabel('Your name').fill('Alice');
+	await page.getByRole('button', { name: 'Join with microphone' }).click();
+	const mine = page.locator('.person.mine');
+	await expect(mine.locator('video')).toHaveCount(0); // off until asked
+	await page.getByRole('button', { name: 'Turn your camera on: everyone sees you' }).click();
+	const preview = mine.locator('video.screen');
+	await expect(preview).toBeVisible();
+	await expect
+		.poll(() => preview.evaluate((v: HTMLVideoElement) => v.videoWidth), { timeout: 10_000 })
+		.toBeGreaterThan(0);
+	await page.getByRole('button', { name: 'Turn your camera off' }).click();
+	await expect(mine.locator('video')).toHaveCount(0);
+});
+
+// Through the public relay too: run with PEERCONNECT_DEMO_E2E=1.
+test('two browsers see each other on their cards', async ({ browser }) => {
+	test.skip(
+		!process.env.PEERCONNECT_DEMO_E2E,
+		'set PEERCONNECT_DEMO_E2E=1 to use the public relay'
+	);
+	test.setTimeout(120_000);
+	const open = async () =>
+		(await browser.newContext({ permissions: ['microphone', 'camera'] })).newPage();
+	const [a, b] = [await open(), await open()];
+	await a.goto('/demo/voice');
+	await a.getByRole('button', { name: 'Create a room' }).click();
+	await expect(a).toHaveURL(/#[\w-]{43}$/);
+	await a.getByLabel('Your name').fill('Alice');
+	await a.getByRole('button', { name: 'Join with microphone' }).click();
+	await b.goto(a.url());
+	await b.getByLabel('Your name').fill('Bob');
+	await b.getByRole('button', { name: 'Join with microphone' }).click();
+	for (const page of [a, b])
+		await expect(page.locator('.person')).toHaveCount(2, { timeout: 60_000 });
+
+	await a.getByRole('button', { name: 'Turn your camera on: everyone sees you' }).click();
+	// Bob sees Alice's video on her card: a canvas with a picture in it.
+	const screen = b.locator('.person', { hasText: 'Alice' }).locator('canvas.screen');
+	await expect(screen).toBeVisible({ timeout: 30_000 });
+	await expect
+		.poll(
+			() =>
+				screen.evaluate((c: HTMLCanvasElement) => {
+					const { data } = c.getContext('2d')!.getImageData(0, 0, c.width, c.height);
+					let lit = 0;
+					for (let i = 0; i < data.length; i += 4)
+						if (data[i] + data[i + 1] + data[i + 2] > 60) lit++;
+					return lit / (data.length / 4);
+				}),
+			{ timeout: 30_000 }
+		)
+		.toBeGreaterThan(0.05);
+	// And nothing on Bob's own card, nor on Alice's view of Bob.
+	await expect(b.locator('.person.mine .screen')).toHaveCount(0);
+	await expect(a.locator('.person', { hasText: 'Bob' }).locator('.screen')).toHaveCount(0);
+
+	// When she turns it off, her video goes from Bob's page.
+	await a.getByRole('button', { name: 'Turn your camera off' }).click();
+	await expect(screen).toHaveCount(0, { timeout: 30_000 });
 });
