@@ -4,6 +4,7 @@
 		{ id: 'install', label: 'Install' },
 		{ id: 'javascript', label: 'JavaScript' },
 		{ id: 'rust', label: 'Rust' },
+		{ id: 'groups', label: 'Groups' },
 		{ id: 'relay', label: 'Run a relay' },
 		{ id: 'limits', label: 'Limits' },
 		{ id: 'security', label: 'Security checklist' },
@@ -193,6 +194,16 @@
 	then <code>… -- join '&lt;invite&gt;' room-b</code> in a second terminal.
 </p>
 
+<h2 id="groups">Groups</h2>
+<p>
+	A room is for exactly two peers. For more — a squad in a game, a shared world, a team — use a
+	<strong>group</strong>: up to 32 members (the relays admit 10 by default), each known by an
+	Ed25519 identity, with commands, chat, voice and state transfer that never get in each other’s
+	way. Groups are in the same JavaScript package and Rust crate, come with a C library for game
+	engines, and are served by the same relays.
+</p>
+<p><a href="/groups">Read the groups guide →</a></p>
+
 <h2 id="relay">Run a relay</h2>
 <p>
 	A relay forwards frames between the two seats of a room and stores nothing. It checks that each
@@ -234,6 +245,11 @@
 				></tr
 			>
 			<tr
+				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>10</code></td><td
+					>Members per group, up to 32.</td
+				></tr
+			>
+			<tr
 				><td><code>PEERCONNECT_TRUST_PROXY</code></td><td>off</td><td
 					>Set to <code>1</code> behind a proxy that appends the client address to
 					<code>X-Forwarded-For</code>.</td
@@ -249,7 +265,7 @@
 	<table>
 		<thead><tr><th>What</th><th>Limit</th></tr></thead>
 		<tbody>
-			<tr><td>Peers per room</td><td>2</td></tr>
+			<tr><td>Peers per room</td><td>2 (for more, use a <a href="/groups">group</a>)</td></tr>
 			<tr><td>Message size</td><td>16 MiB, sent in frames of up to 64 KiB</td></tr>
 			<tr
 				><td>Unacknowledged data in flight</td><td>4 MiB (a single larger message may exceed it)</td
@@ -317,5 +333,6 @@
 	</li>
 </ul>
 <p class="next">
-	The full protocol, with its threat model, is in the <a href="/spec">specification</a>.
+	The full protocol, with its threat model, is in the <a href="/spec">specification</a>; groups have
+	<a href="/spec/groups">their own</a>.
 </p>

@@ -8,12 +8,19 @@ services:
     environment:
       PEERCONNECT_MAX_CONNECTIONS: "10000"
       PEERCONNECT_MAX_PER_ADDRESS: "256"
+      PEERCONNECT_MAX_GROUP_MEMBERS: "10"
       # Caddy appends the client's address to X-Forwarded-For.
       PEERCONNECT_TRUST_PROXY: "1"
   caddy:
     image: caddy:2
     restart: unless-stopped
     ports: ["80:80", "443:443"]
+    # Keep little unsent data in the kernel towards clients, so that a slow
+    # link backs up into the relay's queues, where commands overtake chat
+    # and late voice is dropped, instead of into a socket buffer that
+    # delays everything alike. (The relay sets this on its own sockets.)
+    sysctls:
+      net.ipv4.tcp_notsent_lowat: "32768"
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN to the relay's host name}
     volumes:

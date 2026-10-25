@@ -13,6 +13,7 @@
 //! The protocol is specified in `SPEC.md` at the repository root.
 
 mod base64;
+pub mod group;
 mod noise;
 mod peer;
 pub mod relay;
@@ -37,6 +38,8 @@ pub enum Error {
     InvalidRoomId,
     /// A persisted room record that does not parse.
     InvalidRecord,
+    /// A group member profile over 1,024 bytes.
+    InvalidProfile,
 }
 
 impl std::fmt::Display for Error {
@@ -46,6 +49,7 @@ impl std::fmt::Display for Error {
             Error::InvalidInvite => "invalid invite",
             Error::InvalidRoomId => "invalid room id",
             Error::InvalidRecord => "invalid room record",
+            Error::InvalidProfile => "member profile too large",
         })
     }
 }

@@ -1,6 +1,6 @@
 # PeerConnect
 
-**Two peers, one room, end-to-end encryption and reliable delivery over an untrusted, stateless WebSocket relay.**
+**End-to-end encrypted rooms and groups over an untrusted, stateless WebSocket relay: two peers with reliable delivery, or up to 32 members with commands, chat, voice and state transfer.**
 
 PeerConnect connects two applications — a phone and a laptop, a web app and a wallet, two services in different networks — through a relay that cannot read, forge or replay what they say, and that needs no database. One side creates a room and hands the other an invite (a QR code, a link); from then on the two can reconnect whenever they like, from wherever they are, and messages sent while one of them is away arrive when it comes back.
 
@@ -17,7 +17,8 @@ PeerConnect connects two applications — a phone and a laptop, a web app and a 
 - **Stateless relay.** A room exists on a relay only while someone is connected. A relay can restart, or be replaced by another one, and peers simply reconnect: the room is defined by keys the peers hold, not by anything stored on the server.
 - **Reliable, in order, exactly once.** Messages are numbered and kept by their sender until acknowledged, then resent after any disconnection, so nothing is lost or duplicated while both peers keep running. The sender is the offline queue; the relay stores nothing.
 - **Invites expire by design.** Once paired, the peers move to a room ID derived from their two identities. A leaked invite reaches nobody.
-- **One codebase.** A Rust core with no I/O runs the Linux relay, the Cloudflare relay, the Rust client and, compiled to WebAssembly, the JavaScript client.
+- **Groups for games and teams.** Up to 32 members per group (10 by default) with [their own protocol](GROUP.md): commands, chat and voice that never get in each other's way, members known by their own keys, and state transfer that brings a newcomer up to date from the members already there. See [Groups](#groups).
+- **One codebase.** A Rust core with no I/O runs the Linux relay, the Cloudflare relay, the Rust client, the C library for game engines and, compiled to WebAssembly, the JavaScript client.
 
 ## Quick start
 
@@ -103,6 +104,101 @@ cargo run -p peerconnect --features client --example chat -- new ws://localhost:
 cargo run -p peerconnect --features client --example chat -- join '<invite>' room-b
 ```
 
+## Groups
+
+A group is a squad, a team, a shared world: everyone holding its invite can join, up to 32 members at once (the relays admit 10 by default). It is a separate protocol, [GROUP.md](GROUP.md), on its own endpoint (`/g1/<id>`), served by the same relays.
+
+- **Members are keys.** Each member has an Ed25519 identity that the application keeps (one per player, say). Others see it, proven, as the member's ID, so the application can decide who owns what and who is only visiting. The relay never sees identities.
+- **Four classes of traffic, most urgent first:** commands, voice, chat, bulk. Each has its own queue on the sender, in the relay, and its own counters in the encryption. A burst of chat or a state transfer never holds up a command, and voice never waits behind chat.
+- **Commands and chat are reliable streams.** Numbered, kept by the sender, resent after a reconnection, delivered to everyone (the sender included) in order and exactly once while both keep running. Messages sent while offline go out on reconnection.
+- **Voice and datagrams are real-time.** Anyone along the way drops them rather than delay them: the sender when its socket backs up, the relay when a recipient is behind. Late audio is worse than lost audio. Datagrams carry things like positions, where only the latest value matters.
+- **State transfer.** A newcomer asks a member for a snapshot of the application's state. The SDK records exactly which commands the snapshot contains, holds back the live ones meanwhile, and then delivers the snapshot followed by every later command, and nothing twice. The snapshot is the application's bytes: a saved world, a document, a game state.
+- **Untrusted relay, again.** Every frame is encrypted with a fresh per-connection key that its sender's identity signs for; admission uses a fresh challenge, so a relay cannot replay an earlier session. The relay sees slots, sizes and timing.
+
+How to build a multiplayer game or collaborative app on top, including who decides what when two members change the same thing, is in [docs/multiplayer.md](docs/multiplayer.md).
+
+### JavaScript
+
+```js
+import { Group, Identity, joinGroup } from "peerconnect";
+import { startVoice } from "peerconnect/voice";
+
+const group = Group.create("wss://relay.example.com"); // group.toString() is the invite: hand it to the members
+const me = Identity.generate();                         // persist me.seed to be recognised next time
+const conn = joinGroup(group, { identity: me, profile: "alice" });
+
+conn.addEventListener("joined", (e) => console.log("joined:", e.detail.member));
+conn.addEventListener("message", (e) => {
+  const { from, channel, data } = e.detail;             // channel: "command" | "chat"; our own messages too
+  if (channel === "command") applyCommand(from, data); else showChat(from, data);
+});
+conn.send("command", JSON.stringify({ op: "place", block: 7 }));
+conn.send("chat", "on my way");
+
+// Bring a newcomer up to date: members answer with a snapshot of their state…
+conn.addEventListener("syncrequest", (e) => conn.provideSync(e.detail.from, e.detail.transfer, saveWorld()));
+// …and the newcomer asks one of them.
+conn.addEventListener("snapshot", (e) => loadWorld(e.detail.data)); // later commands follow, exactly once
+conn.requestSync(hostId);
+
+// Voice (call from a click): Opus over WebCodecs, sent only while speaking.
+const voice = await startVoice(conn);
+voice.addEventListener("speaking", (e) => highlight(e.detail.member, e.detail.speaking));
+voice.setMuted(true);
+```
+
+### Rust and game engines
+
+```rust
+use peerconnect::client::group;
+use peerconnect::group::{Channel, Config, Event, Identity};
+
+let config = Config { profile: b"alice".to_vec(), ..Config::default() };
+let mut conn = group::join(invite.parse()?, identity, config)?;
+conn.send(Channel::Command, b"place 7".to_vec()).await?;
+while let Some(event) = conn.next().await {
+    match event {
+        Event::Message { from, channel, data, .. } => apply(from, channel, &data),
+        Event::Voice { from, seq, data } => jitter_buffer.push(from, seq, data),
+        _ => {}
+    }
+}
+```
+
+Engines with their own event loop drive [`group::Member`](crates/peerconnect/src/group/member.rs) directly, without Tokio: it is a state machine, fed by any WebSocket and polled once per frame (Godot's `WebSocketPeer` from a GDExtension, for example). Other engines and languages (Unity, Unreal, C, C++) use the same machine through the C library, [`crates/peerconnect-ffi`](crates/peerconnect-ffi) ([header](crates/peerconnect-ffi/include/peerconnect.h)). The terminal group chat: `cargo run -p peerconnect --features client --example group -- new ws://localhost:8080 alice`.
+
+### Latency and load
+
+Measured on one Apple M2 Pro with the [game load test](crates/peerconnect-relay/examples/game_load.rs): every player is a real end-to-end encrypted WebSocket client; each sends its position 20 times a second, a game command twice a second and a chat line every 10 s; three players per group talk at once (50 voice frames a second); halfway through, a newcomer joins every group and loads a 2 MB snapshot. Latency is from the sender's `send` to the receiver's event.
+
+| Load (Linux relay, release build) | Commands p50 / p99 | Voice p50 / p99 | Voice p99 while snapshots load | Relay |
+|---|---|---|---|---|
+| 10 groups, 100 players | 0.95 / 2.6 ms | 0.80 / 2.4 ms | 6.0 ms | 0.4 cores, 6 MB |
+| 50 groups, 500 players | 0.92 / 3.5 ms | 0.77 / 3.3 ms | 2.7 ms | 1.7 cores, 19 MB |
+| 100 groups, 1,000 players | 1.6 / 17 ms | 1.4 / 15 ms | 19 ms | 4.1 cores, 35 MB |
+
+Everything reliable arrived, exactly once (save what was still in flight when the run stopped); so did the voice and positions. At 100 groups the machine is saturated: the load generator itself uses five to six of its cores. That forwarding is about 70,000 frames a second in and 335,000 out.
+
+Real networks, emulated per player: each player behind its own access link of the given rate and one-way delay, with a deep buffer like real home and mobile links (`--shape`), three players and a newcomer loading 2 MB:
+
+| Link per player | Voice p50 | Voice p99 | Voice p99 while the snapshot loads | Snapshot |
+|---|---|---|---|---|
+| 20 Mbit/s, 20 ms each way | 43 ms | 47 ms | 59 ms | 2.1 s |
+| 2 Mbit/s, 40 ms each way | 84 ms | 89 ms | 144 ms | 10.4 s |
+| 1 Mbit/s, 60 ms each way | 125 ms | 131 ms | 197 ms | 21 s |
+
+The path's own delay is the floor (40, 80 and 120 ms there); the relay and SDK add about a millisecond. State transfer paces itself by the delay it adds ([GROUP.md §6](GROUP.md)): with a fixed 256 KiB window instead, voice p99 on the 2 Mbit/s link was 920 ms while the snapshot loaded.
+
+Browser voice (headless Chromium, 20 ms Opus frames, through the relay):
+
+| Measurement | Result |
+|---|---|
+| End of capture to start of playout | p50 18–29 ms |
+| Through a link adding 0–60 ms of jitter each way | p50 110–140 ms; the jitter buffer adapts to about 120 ms; nothing lost |
+| After a 1 s stall | back to p50 50–70 ms within 2 s (frames dropped to catch up, not played late) |
+
+Mouth to ear adds the 20 ms frame being captured and the audio hardware's own latency (about 10–30 ms), plus the network. Through the Cloudflare Worker in local `workerd`, a voice frame takes p50 1.7 ms, p99 5.9 ms; deployed, a Durable Object sits in one location, so players far from it pay the distance, and it can neither put commands first nor drop late voice (see Limitations).
+
 ## How it works
 
 1. **Room.** The inviter draws a random 32-byte room secret. From it derive an Ed25519 key whose public half is the **invite ID**, and a pre-shared key for the handshake. The invite is `relay URL # base64url(secret ‖ inviter's public key)`.
@@ -119,11 +215,13 @@ The design decisions, and how they differ from the original draft, are explained
 | Path | What |
 |---|---|
 | [`SPEC.md`](SPEC.md) | The protocol, version 1 |
+| [`GROUP.md`](GROUP.md) | Groups, version 1 |
 | [`test-vectors/`](test-vectors) | Conformance vectors, and an independent checker written from the spec |
 | [`crates/peerconnect`](crates/peerconnect) | Protocol core (no I/O), plus the optional Tokio client |
 | [`crates/peerconnect-relay`](crates/peerconnect-relay) | Relay for Linux and Docker (Tokio, hyper, tungstenite) |
 | [`crates/peerconnect-worker`](crates/peerconnect-worker) | Relay for Cloudflare Workers and Durable Objects |
-| [`crates/peerconnect-wasm`](crates/peerconnect-wasm), [`js/`](js) | JavaScript SDK |
+| [`crates/peerconnect-wasm`](crates/peerconnect-wasm), [`js/`](js) | JavaScript SDK, and browser voice ([`js/voice.js`](js/voice.js)) |
+| [`crates/peerconnect-ffi`](crates/peerconnect-ffi) | C library for game engines and other languages |
 | [`deploy/`](deploy) | docker-compose with automatic HTTPS |
 | [`website/`](website) | [peerconnect.dev](https://peerconnect.dev): introduction, guide, specification and live demo, in English and Chinese |
 
@@ -132,8 +230,12 @@ The design decisions, and how they differ from the original draft, are explained
 ```sh
 cargo test                              # unit tests, deterministic simulation, end-to-end over real sockets
 node test-vectors/verify.mjs            # re-derives every test vector with node:crypto only
+node test-vectors/verify-groups.mjs     # the same for groups (g1.json)
 PEERCONNECT_RELAY=ws://127.0.0.1:8787 cargo test -p peerconnect-relay --test e2e   # same suite against any relay
 cd js && npm run build && npm test      # JavaScript SDK, including interop with the Rust client
+cd js && npm run test:voice             # browser voice in headless Chromium: latency, jitter, stalls
+cargo build --release -p peerconnect-relay --examples && target/release/examples/game_load \
+  --spawn target/release/peerconnect-relay --groups 100 --seconds 20   # a game's traffic, over real sockets
 ```
 
 What is covered:
@@ -150,6 +252,7 @@ What is covered:
 - **Flow control.** Regression tests send 16 MiB both ways at once, echo from inside the event loop, starve a sender with a peer that stops reading, and (opt-in, 80 s) trickle 16 MiB to a slow reader.
 - **End-to-end suite.** The same tests pass against the Linux relay and against the Cloudflare Worker running in local `workerd`, including a long idle test that confirms Durable Object hibernation and recovery.
 - **JavaScript SDK.** Tested in Node 22, Deno 2.7, Bun 1.4 and headless Chrome 155, against both relays, and talking to the Rust client.
+- **Groups.** A deterministic simulation (`crates/peerconnect/tests/group.rs`) runs up to ten members through admission, reconnection, backlogs resent in bursts, messages beyond what a sender keeps, replacement, a full group, voice floods, state transfer while commands flow (also from a member that is behind), a failed transfer, a relay that loses the end of a stream, and a relay replaying an earlier session. End-to-end tests (`crates/peerconnect-relay/tests/group_e2e.rs`) pass against both relays: ten members talking, a relay restart, a 4 MiB state transfer, the relay's wire behaviour, a member that stops reading, and commands overtaking a backlog of chat. The C library is driven through its C functions against a real relay, and its header compiled from C. Every kind of group frame is in the test vectors (`test-vectors/g1.json`), produced by the implementation and reproduced by an independent one written from GROUP.md (`verify-groups.mjs`). Line coverage of the group code by these tests: the member state machine 97%, the relay 99%, the Tokio driver 97%, the C library 92% (`cargo llvm-cov`). The [game load test](crates/peerconnect-relay/examples/game_load.rs) runs up to a thousand players over real sockets, optionally behind emulated access links.
 
 ## Performance
 
@@ -180,6 +283,14 @@ These are loopback numbers: they show the protocol's and the relay's own overhea
   - It enforces the idle timeout lazily (when a room next wakes up), to keep hibernating rooms free.
   - It cannot apply backpressure (the runtime does not say how much it buffers). The 4 MiB window bounds honest peers; a dishonest one can at worst exhaust its own room's Durable Object.
   - Unjoined connections are capped per client address (4) and per room (64). Someone who knows a room ID and controls many addresses can still delay the room's peers; add Cloudflare rate-limiting rules if that matters.
+- **Groups.**
+  - Voice runs over TCP (WebSocket), where a lost packet holds up what follows it until it is resent. The jitter buffer, the dropping of late frames and small kernel buffers keep that to a brief glitch, but on a lossy link UDP-based calls (WeChat, Telegram, WebRTC) degrade more gracefully. WebTransport datagrams would lift this; they are not used yet.
+  - State transfer yields to everything else: on long, jittery paths it slows down rather than delay voice. From this machine to the Cloudflare relay (a proxied path to San Jose, 300–450 ms round trips with heavy jitter), 512 KB took 24 s. Keep snapshots compressed (a few hundred kilobytes), and raise `Config::transfer_delay` on the providing side where loading fast matters more.
+  - The relay does not order commands from different members against each other: each member's stream arrives in order, but two members' streams interleave differently at different receivers. Applications whose commands do not commute need a rule on top ([docs/multiplayer.md](docs/multiplayer.md)).
+  - Any member can read and send everything; roles are the application's to enforce, by member ID. Excluding someone means moving the group to a new secret.
+  - Sender keys are fresh per connection but travel under a key derived from the group secret: no forward secrecy against someone who records the traffic and later learns the secret.
+  - The Cloudflare relay forwards every frame at once: it cannot drop late voice or put commands first, and each voice frame is a billed Durable Object message. For voice at scale, use the Linux relay.
+  - Browser voice needs WebCodecs audio with Opus (`startVoice` checks, and throws where it is missing; tested in Chromium). Echo cancellation is the browser's; headphones avoid echo entirely.
 - **Not yet independently audited.** The design has had several rounds of adversarial review, and its vectors are reproduced by a second implementation written from the spec. Neither replaces an external cryptographic audit.
 
 ## License

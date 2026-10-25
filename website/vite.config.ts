@@ -15,13 +15,13 @@ export default defineConfig({
 			prerender: {
 				// The Chinese pages are reached through the language switch, but list
 				// them anyway so that none is missed.
-				entries: ['*', '/zh', '/zh/docs', '/zh/demo', '/sitemap.xml']
+				entries: ['*', '/zh', '/zh/docs', '/zh/groups', '/zh/demo', '/sitemap.xml']
 			},
 			// Small stylesheets go inline, saving a render-blocking request.
 			inlineStyleThreshold: 16 * 1024
 		})
 	],
-	// The specification page reads ../SPEC.md.
+	// The specification pages read ../SPEC.md and ../GROUP.md.
 	server: { fs: { allow: ['..'] } },
 	test: {
 		expect: { requireAssertions: true },

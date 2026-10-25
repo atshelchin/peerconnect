@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Voice latency</title>
+<script type="module">
+  import { Group, joinGroup } from "../../index.js";
+  import { startVoice } from "../../voice.js";
+
+  // Two members in one page; measures, per frame of a's voice, the time from
+  // the end of its capture to the start of its playout at b.
+  window.run = async ({ relay, seconds, vad, minDelay }) => {
+    const group = Group.create(relay);
+    const a = joinGroup(group, { profile: "a" });
+    const b = joinGroup(group, { profile: "b" });
+    await new Promise((resolve) => {
+      const check = () => a.members.size && b.members.size && resolve();
+      a.addEventListener("joined", check);
+      b.addEventListener("joined", check);
+    });
+    let sent = 0;
+    let received = 0;
+    const send = a.sendVoice.bind(a);
+    a.sendVoice = (seq, data) => (sent++, send(seq, data));
+    b.addEventListener("voice", () => received++);
+    const captured = new Map();
+    const latencies = [];
+    const tail = []; // the last 2 s
+    let end = 0;
+    const va = await startVoice(a, { vad, onCapture: (seq, now) => captured.set(seq, now) });
+    const vb = await startVoice(b, {
+      vad,
+      minDelay,
+      onPlay: (member, seq, now) => {
+        if (member === a.id && captured.has(seq)) {
+          latencies.push(now - captured.get(seq));
+          if (now > end - 2000) tail.push(now - captured.get(seq));
+        }
+      },
+    });
+    end = performance.now() + seconds * 1000;
+    await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+    const stats = Object.fromEntries(vb.stats());
+    const context = new AudioContext();
+    const output = { base: context.baseLatency, output: context.outputLatency };
+    await context.close();
+    await va.stop();
+    await vb.stop();
+    a.leave();
+    b.leave();
+    latencies.sort((x, y) => x - y);
+    const at = (q) => latencies[Math.floor((latencies.length - 1) * q)];
+    tail.sort((x, y) => x - y);
+    return {
+      frames: latencies.length,
+      p50: at(0.5),
+      p90: at(0.9),
+      p99: at(0.99),
+      max: at(1),
+      tail: tail[Math.floor(tail.length / 2)],
+      stats: stats[a.id],
+      output,
+      sent,
+      received,
+    };
+  };
+  window.ready = true;
+</script>

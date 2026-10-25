@@ -21,6 +21,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 peerconnect = { path = "../peerconnect", features = ["client"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }

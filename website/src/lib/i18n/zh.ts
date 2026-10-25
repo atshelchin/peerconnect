@@ -13,6 +13,11 @@ export const zh: Dict = {
 			description:
 				'用 JavaScript 或 Rust 接入 PeerConnect，并在 Cloudflare Workers、Docker 或单个二进制文件上运行你自己的中继。'
 		},
+		groups: {
+			title: '群组：多人游戏、语音与状态同步 — PeerConnect',
+			description:
+				'最多 32 名成员的端到端加密群组：指令、聊天、语音和状态同步，全部经由不受信任的中继传输。面向游戏与团队协作的 JavaScript、Rust 和 C 开发指南。'
+		},
 		demo: {
 			title: '在线演示：配对两个浏览器 — PeerConnect',
 			description:
@@ -23,6 +28,11 @@ export const zh: Dict = {
 			description:
 				'PeerConnect v1 协议规范：房间与邀请、无状态中继准入、Noise IKpsk1 握手、可靠消息流与安全考量。'
 		},
+		specGroups: {
+			title: '群组协议规范 v1 — PeerConnect',
+			description:
+				'PeerConnect 群组协议 v1 规范：群组密钥与身份、席位准入、发送方密钥、四种流量类别、可靠消息流与状态同步。'
+		},
 		notFound: {
 			title: '页面不存在 — PeerConnect',
 			description: '你访问的页面不存在。'
@@ -31,6 +41,7 @@ export const zh: Dict = {
 	nav: {
 		home: '首页',
 		docs: '文档',
+		groups: '群组',
 		demo: '演示',
 		spec: '规范',
 		github: 'GitHub',
@@ -145,7 +156,7 @@ export const zh: Dict = {
 				},
 				{
 					title: '单个二进制文件',
-					text: '一条命令：<code>cargo install peerconnect-relay</code>。四个环境变量即可配置，内置按客户端地址的连接数限制。'
+					text: '一条命令：<code>cargo install peerconnect-relay</code>。五个环境变量即可配置，内置按客户端地址的连接数限制。'
 				}
 			],
 			public:
@@ -185,6 +196,32 @@ export const zh: Dict = {
 				}
 			]
 		},
+		groups: {
+			eyebrow: '群组',
+			title: '不止两个？那就建个群组。',
+			intro:
+				'游戏小队、共享世界、协作团队：一个端到端加密的群组最多容纳 32 名成员，用的还是同一套中继。它为游戏而设计——指令绝不能排在聊天消息后面。',
+			items: [
+				{
+					title: '成员就是密钥',
+					text: '每个成员都是一个由应用保管的 Ed25519 身份，比如每位玩家一个。其他成员看到的是经过证明的身份，应用据此决定谁拥有什么、谁只是来参观。'
+				},
+				{
+					title: '四种流量，各走各的道',
+					text: '指令、语音、聊天、批量数据，按紧急程度排序，在发送方和中继里各有各的队列。刷屏的聊天或庞大的快照永远不会拖慢一条指令。'
+				},
+				{
+					title: '新成员精确追上进度',
+					text: '已有成员发来应用状态的快照，并标明其中包含了哪些指令。新成员先拿到快照，再收到之后的每一条指令，不多也不重。'
+				},
+				{
+					title: '语音：浏览器与游戏引擎通用',
+					text: '基于 WebCodecs 的 Opus 编码，配合自适应抖动缓冲，只在说话时发送。Rust 以及供 Unity、Unreal、Godot 使用的 C 库采用相同的帧格式。'
+				}
+			],
+			guide: '阅读群组指南',
+			spec: '群组协议规范'
+		},
 		faq: {
 			eyebrow: 'FAQ',
 			title: '常见问题',
@@ -208,6 +245,10 @@ export const zh: Dict = {
 				{
 					q: '中继重启了会怎样？',
 					a: '你什么都不用处理。房间并不存储在中继上：两端会重新连接、重新认证并继续消息流，不丢失也不重复任何一条消息。'
+				},
+				{
+					q: '一个房间能容纳两个以上的应用吗？',
+					a: '房间只供两方使用。需要更多成员时，请使用群组：最多 32 名成员（中继默认允许 10 名），支持指令、聊天、语音与状态同步，并且使用同一套中继。具体做法见群组指南。'
 				},
 				{
 					q: '可以用于生产环境吗？',
@@ -313,6 +354,7 @@ export const zh: Dict = {
 		project: '项目',
 		resources: '资源',
 		publicRelay: '公共中继',
+		groupSpec: '群组协议规范',
 		status: '规范 v1 · 草案'
 	}
 };

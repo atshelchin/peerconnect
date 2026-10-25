@@ -83,3 +83,90 @@ export class Connection extends EventTarget {
 
 /** Connects to a room (a `Room` or its saved string). */
 export function connect(room: Room | string): Connection;
+
+/** A group: its relay and secret. `toString()` is the invite, a secret for the group's members. */
+export class Group {
+  private constructor();
+  /** Creates a new group on a relay (`ws://` or `wss://` URL). */
+  static create(relay: string): Group;
+  /** Parses an invite. */
+  static parse(invite: string): Group;
+  /** The invite. */
+  toString(): string;
+  readonly id: string;
+  readonly relay: string;
+  free(): void;
+}
+
+/** A member identity (an Ed25519 key pair). Persist `seed` to be recognised again. */
+export class Identity {
+  private constructor();
+  static generate(): Identity;
+  static fromSeed(seed: Uint8Array): Identity;
+  readonly seed: Uint8Array;
+  /** The member ID others know this identity by. */
+  readonly id: string;
+  free(): void;
+}
+
+export type GroupState = "offline" | "online" | "closed";
+export type Channel = "command" | "chat";
+export type Data = Uint8Array | ArrayBuffer | string;
+
+export interface GroupEventMap {
+  state: Event;
+  /** A member was admitted (its identity is proven). */
+  joined: CustomEvent<{ member: string; profile: Uint8Array }>;
+  left: CustomEvent<{ member: string }>;
+  /** A message, in its stream's order (our own included), or to us alone (`direct`). */
+  message: CustomEvent<{ from: string; channel: Channel; data: Uint8Array; direct: boolean }>;
+  voice: CustomEvent<{ from: string; seq: number; data: Uint8Array }>;
+  datagram: CustomEvent<{ from: string; data: Uint8Array }>;
+  /** `count` messages of `from`'s stream were lost (it no longer had them). */
+  missed: CustomEvent<{ from: string; channel: Channel; count: number }>;
+  /**
+   * `from` asks for a snapshot: take it now, in this handler, so that it holds
+   * exactly the commands delivered so far, then call `provideSync` (or `declineSync`).
+   */
+  syncrequest: CustomEvent<{ from: string; transfer: number }>;
+  /** The snapshot asked for: replace the application state with it. The commands that follow are exactly those it lacks. */
+  snapshot: CustomEvent<{ from: string; data: Uint8Array }>;
+  syncfailed: CustomEvent<{ from: string }>;
+  /** Our identity joined from elsewhere and took our slot; we retry in 30–60 s (call `leave()` to stop). */
+  replaced: CustomEvent<{}>;
+  /** The group is full on this relay; we retry later. */
+  full: CustomEvent<{}>;
+}
+
+/** A group membership. It reconnects on its own until left. */
+export class GroupConnection extends EventTarget {
+  readonly state: GroupState;
+  /** Our member ID. */
+  readonly id: string;
+  /** The admitted members: member ID → profile. */
+  readonly members: Map<string, Uint8Array>;
+  /** The latest round trip to the relay in milliseconds. */
+  readonly rtt: number | undefined;
+  /** Broadcasts a message (up to 16,352 bytes) and returns its id. */
+  send(channel: Channel, data: Data): number;
+  /** Sends to one member only; not resent if the connection drops. */
+  sendTo(member: string, channel: Channel, data: Data): void;
+  /** Sends a voice frame; false if not sent. */
+  sendVoice(seq: number, data: Data): boolean;
+  /** Sends data that is dropped rather than delayed; false if not sent. */
+  sendDatagram(data: Data, to?: string): boolean;
+  requestSync(from: string): void;
+  provideSync(to: string, transfer: number, snapshot: Data): void;
+  declineSync(to: string, transfer: number): void;
+  leave(): void;
+
+  addEventListener<K extends keyof GroupEventMap>(
+    type: K,
+    listener: (event: GroupEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void;
+}
+
+/** Joins a group (a `Group` or its invite). */
+export function joinGroup(group: Group | string, options?: { identity?: Identity; profile?: Data }): GroupConnection;

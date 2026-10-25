@@ -38,6 +38,10 @@ features = ["client"]
 name = "chat"
 required-features = ["client"]
 
+[[example]]
+name = "group"
+required-features = ["client"]
+
 [features]
 default = ["fast"]
 # Precomputed curve tables: faster key generation and signing, ~30 KB more code.

@@ -6,6 +6,7 @@
 //! - `PEERCONNECT_MAX_CONNECTIONS` — concurrent WebSockets (default 10000)
 //! - `PEERCONNECT_MAX_PER_ADDRESS` — concurrent WebSockets per client
 //!   address, IPv6 counted per /64 (default 256)
+//! - `PEERCONNECT_MAX_GROUP_MEMBERS` — members per group, up to 32 (default 10)
 //! - `PEERCONNECT_TRUST_PROXY=1` — take the client address from the last
 //!   `X-Forwarded-For` entry (only behind a proxy that sets it)
 //!
@@ -33,6 +34,7 @@ async fn main() -> ExitCode {
     for (name, value) in [
         ("PEERCONNECT_MAX_CONNECTIONS", &mut config.max_connections),
         ("PEERCONNECT_MAX_PER_ADDRESS", &mut config.max_per_address),
+        ("PEERCONNECT_MAX_GROUP_MEMBERS", &mut config.max_group_members),
     ] {
         if let Ok(text) = env::var(name) {
             match text.parse() {
@@ -53,11 +55,12 @@ async fn main() -> ExitCode {
         }
     };
     eprintln!(
-        "peerconnect relay {} listening on {} (max {} connections, {} per address{})",
+        "peerconnect relay {} listening on {} (max {} connections, {} per address, {} per group{})",
         env!("CARGO_PKG_VERSION"),
         listener.local_addr().map_or(listen, |a| a.to_string()),
         config.max_connections,
         config.max_per_address,
+        config.max_group_members,
         if config.trust_proxy { ", client address from X-Forwarded-For" } else { "" }
     );
 

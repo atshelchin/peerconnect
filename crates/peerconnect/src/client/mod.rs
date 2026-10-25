@@ -43,6 +43,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::{CloseReason, Event, Output, Peer, Room, SendError, State, wire};
 
+pub mod group;
+
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Connecting = Pin<Box<dyn Future<Output = Option<Ws>> + Send>>;
 type Reply = oneshot::Sender<Result<u64, SendError>>;
@@ -338,9 +340,11 @@ async fn write(
 }
 
 async fn open(url: String) -> Option<Ws> {
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(wire::MAX_FRAME_LEN))
-        .max_frame_size(Some(wire::MAX_FRAME_LEN));
+    open_with(url, wire::MAX_FRAME_LEN).await
+}
+
+async fn open_with(url: String, max_frame: usize) -> Option<Ws> {
+    let config = WebSocketConfig::default().max_message_size(Some(max_frame)).max_frame_size(Some(max_frame));
     let (ws, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), true).await.ok()?;
     Some(ws)
 }

@@ -15,6 +15,11 @@ export const en = {
 			description:
 				'Build with PeerConnect in JavaScript or Rust, and run your own relay on Cloudflare Workers, Docker or a single binary.'
 		},
+		groups: {
+			title: 'Groups: multiplayer, voice and state sync — PeerConnect',
+			description:
+				'End-to-end encrypted groups of up to 32 members: commands, chat, voice and state transfer over an untrusted relay. Built for games and teams: JavaScript, Rust and C.'
+		},
 		demo: {
 			title: 'Live demo: pair two browsers — PeerConnect',
 			description:
@@ -25,6 +30,11 @@ export const en = {
 			description:
 				'The PeerConnect v1 specification: rooms and invites, stateless relay admission, the Noise IKpsk1 handshake, the reliable stream and its security considerations.'
 		},
+		specGroups: {
+			title: 'Groups specification v1 — PeerConnect',
+			description:
+				'The PeerConnect Groups v1 specification: group secrets and identities, slot admission, sender keys, four traffic classes, reliable streams and state transfer.'
+		},
 		notFound: {
 			title: 'Page not found — PeerConnect',
 			description: 'This page does not exist.'
@@ -33,6 +43,7 @@ export const en = {
 	nav: {
 		home: 'Home',
 		docs: 'Docs',
+		groups: 'Groups',
 		demo: 'Demo',
 		spec: 'Spec',
 		github: 'GitHub',
@@ -150,7 +161,7 @@ export const en = {
 				},
 				{
 					title: 'Single binary',
-					text: 'One command: <code>cargo install peerconnect-relay</code>. Four environment variables, connection limits per client address included.'
+					text: 'One command: <code>cargo install peerconnect-relay</code>. Five environment variables, connection limits per client address included.'
 				}
 			],
 			public:
@@ -198,6 +209,32 @@ export const en = {
 				}
 			]
 		},
+		groups: {
+			eyebrow: 'Groups',
+			title: 'More than two? Make it a group.',
+			intro:
+				'Squads, shared worlds, teams: up to 32 members in one end-to-end encrypted group, on the same relays. Built for games, where a command must never wait behind a chat message.',
+			items: [
+				{
+					title: 'Members are keys',
+					text: 'Each member is an Ed25519 identity that the app keeps, one per player say. The others see it, proven, so the app decides who owns what and who is only visiting.'
+				},
+				{
+					title: 'Four classes of traffic',
+					text: 'Commands, voice, chat and bulk, most urgent first, each with its own queue at the sender and in the relay. A chat flood or a snapshot never holds up a command.'
+				},
+				{
+					title: 'Newcomers catch up exactly',
+					text: 'A member sends a snapshot of the app’s state, marked with the commands it contains. The newcomer gets the snapshot, then every later command, none twice.'
+				},
+				{
+					title: 'Voice, in browsers and engines',
+					text: 'Opus over WebCodecs with an adaptive jitter buffer, sent only while you speak. Rust and a C library for Unity, Unreal and Godot use the same frame format.'
+				}
+			],
+			guide: 'Read the groups guide',
+			spec: 'Groups specification'
+		},
 		faq: {
 			eyebrow: 'FAQ',
 			title: 'Questions',
@@ -221,6 +258,10 @@ export const en = {
 				{
 					q: 'What happens when the relay restarts?',
 					a: 'Nothing you need to handle. Rooms are not stored on the relay: peers reconnect, authenticate again and resume the stream without losing or duplicating a message.'
+				},
+				{
+					q: 'Can more than two apps share a room?',
+					a: 'A room is for exactly two. For more, use a group: up to 32 members (relays admit 10 by default), with commands, chat, voice and state transfer, through the same relays. The groups guide explains how.'
 				},
 				{
 					q: 'Is it ready for production?',
@@ -328,6 +369,7 @@ export const en = {
 		project: 'Project',
 		resources: 'Resources',
 		publicRelay: 'Public relay',
+		groupSpec: 'Groups specification',
 		status: 'Spec v1 · draft'
 	}
 };

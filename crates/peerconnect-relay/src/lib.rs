@@ -7,6 +7,8 @@
 //! memory, and one that accepts nothing for 30 s is disconnected rather than
 //! allowed to hold its partner hostage. The only shared state is the seat
 //! table, one small mutex per room.
+//!
+//! Groups (`/g1/<id>`) work differently, without backpressure: see [`group`].
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -35,6 +37,8 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role as WsRole, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+mod group;
+
 /// A connection that accepts nothing forwarded to it for this long is closed.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// A connection the relay has written nothing to for this long gets a `pong`,
@@ -58,11 +62,33 @@ pub struct Config {
     /// Bytes queued towards one connection before its partner is held back.
     /// Worst-case buffer memory is about `max_connections × queue_bytes`.
     pub queue_bytes: usize,
+    /// Members per group, at most 32; more are refused with close code 4429.
+    pub max_group_members: usize,
+    /// Reliable bytes queued towards one group connection beyond which it
+    /// is not keeping up and is closed.
+    pub group_queue_bytes: usize,
+    /// Command and voice bytes queued towards a group connection beyond
+    /// which voice frames for it are dropped: bounds how late audio gets.
+    pub voice_queue_bytes: usize,
+    /// What one group connection may send, in bytes per second, sustained
+    /// and in bursts. Beyond it voice is dropped and the rest delayed.
+    pub group_rate: usize,
+    pub group_burst: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_connections: 10_000, max_per_address: 256, trust_proxy: false, queue_bytes: 256 << 10 }
+        Config {
+            max_connections: 10_000,
+            max_per_address: 256,
+            trust_proxy: false,
+            queue_bytes: 256 << 10,
+            max_group_members: 10,
+            group_queue_bytes: 2 << 20,
+            voice_queue_bytes: 8 << 10,
+            group_rate: 2 << 20,
+            group_burst: 4 << 20,
+        }
     }
 }
 
@@ -71,6 +97,7 @@ impl Default for Config {
 pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<Output = ()>) {
     let relay = Arc::new(Relay {
         rooms: Mutex::new(HashMap::new()),
+        groups: Mutex::new(HashMap::new()),
         addresses: Arc::new(Mutex::new(HashMap::new())),
         slots: Arc::new(Semaphore::new(config.max_connections)),
         next_id: AtomicU64::new(0),
@@ -83,6 +110,7 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
+                limit_unsent(&stream);
                 tokio::spawn(relay.clone().http(stream, peer.ip()));
             }
             () = &mut shutdown => break,
@@ -95,6 +123,7 @@ pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<
 
 struct Relay {
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
+    groups: Mutex<HashMap<RoomId, Arc<group::GroupRoom>>>,
     /// Open WebSockets per client address.
     addresses: Arc<Mutex<HashMap<IpAddr, usize>>>,
     slots: Arc<Semaphore>,
@@ -165,7 +194,7 @@ impl Outbox {
     }
 }
 
-type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
+pub(crate) type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 impl Relay {
     async fn http(self: Arc<Self>, stream: tokio::net::TcpStream, peer: IpAddr) {
@@ -187,8 +216,10 @@ impl Relay {
         if path == "/" || path == "/healthz" {
             return text(StatusCode::OK, "peerconnect relay\n");
         }
-        let Some(room) = relay::room_from_path(path) else {
-            return text(StatusCode::NOT_FOUND, "not found\n");
+        let endpoint = match (relay::room_from_path(path), relay::group_from_path(path)) {
+            (Some(room), _) => Endpoint::Room(room),
+            (_, Some(group)) => Endpoint::Group(group),
+            _ => return text(StatusCode::NOT_FOUND, "not found\n"),
         };
         let Some(key) = websocket_key(&req) else {
             return text(StatusCode::UPGRADE_REQUIRED, "expected a WebSocket upgrade\n");
@@ -204,14 +235,22 @@ impl Relay {
         let upgrade = hyper::upgrade::on(req);
         tokio::spawn(async move {
             let Ok(upgraded) = upgrade.await else { return };
-            // Small buffers: most connections are idle, and frames are at most 64 KiB.
+            // Small buffers: most connections are idle, and frames are at
+            // most 64 KiB (16 KiB in groups).
+            let max = match endpoint {
+                Endpoint::Room(_) => wire::MAX_FRAME_LEN,
+                Endpoint::Group(_) => peerconnect::group::wire::MAX_FRAME_LEN,
+            };
             let config = WebSocketConfig::default()
                 .read_buffer_size(16 << 10)
                 .write_buffer_size(16 << 10)
-                .max_message_size(Some(wire::MAX_FRAME_LEN))
-                .max_frame_size(Some(wire::MAX_FRAME_LEN));
+                .max_message_size(Some(max))
+                .max_frame_size(Some(max));
             let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
-            self.connection(room, ws, slot).await;
+            match endpoint {
+                Endpoint::Room(room) => self.connection(room, ws, slot).await,
+                Endpoint::Group(group) => self.group_connection(group, ws, slot).await,
+            }
             drop(per_address);
         });
         let mut res = Response::new(Full::default());
@@ -420,7 +459,42 @@ fn receive(conn: &Conn, room: &RoomId, msg: &Message) -> Option<Action> {
     })
 }
 
-fn close_message(code: u16) -> Message {
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Room(RoomId),
+    Group(RoomId),
+}
+
+/// Keeps little unsent data in the kernel's send buffer, so that it waits in
+/// the relay's queues instead, where urgent frames overtake the rest and
+/// late voice is dropped. Throughput is unaffected: this bounds only what
+/// has not been sent yet, not what is in flight.
+fn limit_unsent(stream: &tokio::net::TcpStream) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd;
+        // Not in the libc crate on every platform.
+        #[cfg(target_os = "linux")]
+        const TCP_NOTSENT_LOWAT: libc::c_int = 25;
+        #[cfg(target_os = "macos")]
+        const TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
+        let lowat: libc::c_int = 32 << 10;
+        // SAFETY: a valid socket descriptor and a correctly sized option value.
+        unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                TCP_NOTSENT_LOWAT,
+                (&lowat as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = stream;
+}
+
+pub(crate) fn close_message(code: u16) -> Message {
     Message::Close(Some(CloseFrame { code: code.into(), reason: "".into() }))
 }
 

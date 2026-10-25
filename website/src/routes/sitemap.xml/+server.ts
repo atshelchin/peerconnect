@@ -6,8 +6,10 @@ export const prerender = true;
 const PAGES: { path: string; translated: boolean; priority: string }[] = [
 	{ path: '/', translated: true, priority: '1.0' },
 	{ path: '/docs', translated: true, priority: '0.9' },
+	{ path: '/groups', translated: true, priority: '0.9' },
 	{ path: '/demo', translated: true, priority: '0.8' },
-	{ path: '/spec', translated: false, priority: '0.8' }
+	{ path: '/spec', translated: false, priority: '0.8' },
+	{ path: '/spec/groups', translated: false, priority: '0.7' }
 ];
 
 const url = (path: string) => SITE_URL + (path === '/' ? '/' : path);

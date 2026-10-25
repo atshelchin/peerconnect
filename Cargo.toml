@@ -1,8 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["crates/peerconnect", "crates/peerconnect-relay", "crates/peerconnect-worker", "crates/peerconnect-wasm"]
+members = [
+    "crates/peerconnect",
+    "crates/peerconnect-relay",
+    "crates/peerconnect-worker",
+    "crates/peerconnect-wasm",
+    "crates/peerconnect-ffi",
+]
 # The worker and the JS bindings only build for wasm32.
-default-members = ["crates/peerconnect", "crates/peerconnect-relay"]
+default-members = ["crates/peerconnect", "crates/peerconnect-relay", "crates/peerconnect-ffi"]
 
 [workspace.package]
 version = "0.1.0"

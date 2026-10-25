@@ -4,6 +4,7 @@
 		{ id: 'install', label: '安装' },
 		{ id: 'javascript', label: 'JavaScript' },
 		{ id: 'rust', label: 'Rust' },
+		{ id: 'groups', label: '群组' },
 		{ id: 'relay', label: '运行中继' },
 		{ id: 'limits', label: '限制参数' },
 		{ id: 'security', label: '安全清单' },
@@ -179,6 +180,15 @@
 	<code>… -- join '&lt;invite&gt;' room-b</code>。
 </p>
 
+<h2 id="groups">群组</h2>
+<p>
+	房间只供两个端使用。需要更多成员时——游戏小队、共享世界、团队——请使用<strong>群组</strong>：最多 32
+	名成员（中继默认允许 10 名），每个成员以一个 Ed25519
+	身份相互识别，指令、聊天、语音和状态同步互不干扰。群组就在同一个 JavaScript 包和 Rust crate
+	里，另有供游戏引擎使用的 C 库，并且由同一套中继提供服务。
+</p>
+<p><a href="/zh/groups">阅读群组指南 →</a></p>
+
 <h2 id="relay">运行中继</h2>
 <p>
 	中继在房间的两个席位之间转发帧，不存储任何东西。它会检查每个连接是否持有房间密钥，但自己并不知道这个密钥，因此不需要账号，也不需要任何配置。公共中继
@@ -220,6 +230,11 @@
 				></tr
 			>
 			<tr
+				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>10</code></td><td
+					>每个群组的成员数，最多 32。</td
+				></tr
+			>
+			<tr
 				><td><code>PEERCONNECT_TRUST_PROXY</code></td><td>关闭</td><td
 					>如果前面的反向代理会把客户端地址追加到 <code>X-Forwarded-For</code>，设为
 					<code>1</code>。</td
@@ -235,7 +250,7 @@
 	<table>
 		<thead><tr><th>项目</th><th>上限</th></tr></thead>
 		<tbody>
-			<tr><td>每个房间的端数</td><td>2</td></tr>
+			<tr><td>每个房间的端数</td><td>2（需要更多时请使用<a href="/zh/groups">群组</a>）</td></tr>
 			<tr><td>单条消息大小</td><td>16 MiB，以最大 64 KiB 的帧发送</td></tr>
 			<tr><td>在途未确认数据</td><td>4 MiB（单条更大的消息可以超出）</td></tr>
 			<tr
@@ -290,4 +305,8 @@
 		>设计经历了多轮对抗性评审，测试向量也由独立实现复现，但这些都不能代替外部的密码学审计。
 	</li>
 </ul>
-<p class="next">完整的协议及其威胁模型见<a href="/spec">协议规范</a>（英文）。</p>
+<p class="next">
+	完整的协议及其威胁模型见<a href="/spec">协议规范</a>（英文）；群组另有<a href="/spec/groups"
+		>单独的规范</a
+	>。
+</p>
