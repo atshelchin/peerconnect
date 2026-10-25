@@ -88,5 +88,35 @@
       via,
     };
   };
+  // Listening only until the microphone is turned on, and released again when it is turned off.
+  window.microphone = async ({ relay }) => {
+    const calls = [];
+    const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = async (c) => {
+      const stream = await real(c);
+      calls.push(stream);
+      return stream;
+    };
+    const group = Group.create(relay);
+    const a = joinGroup(group, { profile: "a" });
+    let sent = 0;
+    const send = a.sendVoice.bind(a);
+    a.sendVoice = (seq, data) => (sent++, send(seq, data));
+    const voice = await startVoice(a, { microphone: false, vad: false });
+    await new Promise((r) => setTimeout(r, 500));
+    const before = { asked: calls.length, sent, on: voice.microphone };
+    await voice.setMicrophone(true);
+    await new Promise((r) => setTimeout(r, 500));
+    const during = { asked: calls.length, sent, on: voice.microphone };
+    await voice.setMicrophone(false);
+    const ended = calls[0]?.getAudioTracks()[0]?.readyState;
+    const atOff = sent;
+    await new Promise((r) => setTimeout(r, 500));
+    const after = { sentSinceOff: sent - atOff, on: voice.microphone, ended };
+    await voice.stop();
+    a.leave();
+    navigator.mediaDevices.getUserMedia = real;
+    return { before, during, after };
+  };
   window.ready = true;
 </script>

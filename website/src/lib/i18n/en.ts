@@ -291,8 +291,8 @@ export const en = {
 		lead: 'Talk with up to ten people at once, and turn the camera on to see each other, end-to-end encrypted. Create a room, send the link to a friend or open it on your phone, and speak.',
 		steps: [
 			'Create a room, and share the link.',
-			'Everyone who opens it enters a name and joins with their microphone.',
-			'Speak, and turn your camera on from your card if you like. Use headphones if you are in the same room, or the microphones hear each other.'
+			'Everyone who opens it enters a name, checks their microphone, camera and speakers if they like, and joins.',
+			'Turn your microphone on from your card and speak, and your camera if you like. Use headphones if you are in the same room, or the microphones hear each other.'
 		],
 		note: 'The real thing: the Rust core in WebAssembly, Opus and VP8 through WebCodecs, an adaptive jitter buffer per speaker, video put back together whole from its fragments, all through the public relay <code>{relay}</code>, which forwards only ciphertext. The room key is in the link after <code>#</code>, which browsers never send to a server.',
 		noscript: 'The demo needs JavaScript and WebAssembly.',
@@ -303,12 +303,28 @@ export const en = {
 			create: 'Create a room'
 		},
 		join: {
-			title: 'Join the voice room',
+			title: 'Join the room',
 			name: 'Your name',
 			namePlaceholder: 'e.g. Alice',
-			button: 'Join with microphone',
-			starting: 'Starting the microphone…',
-			hint: 'Your browser will ask for the microphone. Nothing is recorded or stored.'
+			button: 'Join',
+			starting: 'Joining…',
+			hint: 'Your microphone and camera stay off until you turn them on. Nothing is recorded or stored.'
+		},
+		devices: {
+			title: 'Check your devices (optional)',
+			hint: 'Try them before you join: nothing here is sent to anyone.',
+			mic: 'Microphone',
+			camera: 'Camera',
+			speakers: 'Speakers',
+			default: 'Default',
+			device: 'Device',
+			testMic: 'Test',
+			testCamera: 'Test',
+			testSpeakers: 'Play a sound',
+			stop: 'Stop',
+			level: 'Microphone level',
+			micOnJoin: 'Microphone on when I join',
+			cameraOnJoin: 'Camera on when I join'
 		},
 		problems: {
 			mic: 'The microphone is not available (permission denied, or none found). You can still listen and chat.',
@@ -330,8 +346,8 @@ export const en = {
 			you: 'you',
 			alone: 'Nobody else is here yet. Share the link.',
 			leave: 'Leave',
-			micOn: 'Mute your microphone: nobody hears you',
-			micOff: 'Unmute your microphone',
+			micOn: 'Turn your microphone off',
+			micOff: 'Turn your microphone on: everyone hears you',
 			hearOn: 'Turn your headphones off: you hear nobody',
 			hearOff: 'Hear everyone again',
 			muteThem: 'Stop hearing {name} (only for you)',

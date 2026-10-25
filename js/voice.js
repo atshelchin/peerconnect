@@ -227,6 +227,8 @@ registerProcessor("peerconnect-playback", Playback);
  *   steady network it stays near the lower; the upper is how far it may grow
  *   on a bad one, trading delay for audio that does not break up.
  * - `stream`: a MediaStream to send instead of the microphone.
+ * - `microphone: false`: start listening only, without asking for the
+ *   microphone; `setMicrophone(true)` turns it on later.
  * - `context`: an AudioContext to use (48 kHz).
  * - `onCapture(seq, now)`, `onPlay(member, seq, now)`: called as each of our
  *   frames is captured, and as each frame of another member starts to
@@ -251,6 +253,18 @@ export async function startVoice(conn, options = {}) {
   return voice;
 }
 
+function microphone(deviceId) {
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+      ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    },
+  });
+}
+
 export class Voice extends EventTarget {
   /** Whether the microphone is muted (nothing is sent). */
   muted = false;
@@ -264,8 +278,9 @@ export class Voice extends EventTarget {
   #frameUs;
   #context;
   #ownsContext;
-  #stream;
-  #ownsStream;
+  #stream = null;
+  #ownsStream = false;
+  #source = null;
   #capture;
   #playback;
   #output;
@@ -299,21 +314,16 @@ export class Voice extends EventTarget {
     } finally {
       URL.revokeObjectURL(url);
     }
-    this.#ownsStream = !this.#options.stream;
-    this.#stream =
-      this.#options.stream ??
-      (await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-      }));
-
     this.#capture = new AudioWorkletNode(context, "peerconnect-capture", {
       numberOfOutputs: 1,
       processorOptions: { frame: this.#frame },
     });
     // A capture node must be pulled by the graph to run: through silence.
     const silent = new GainNode(context, { gain: 0 });
-    context.createMediaStreamSource(this.#stream).connect(this.#capture).connect(silent).connect(context.destination);
+    this.#capture.connect(silent).connect(context.destination);
     this.#capture.port.onmessage = ({ data }) => this.#captured(data);
+    if (this.#options.stream) this.#attach(this.#options.stream, false);
+    else if (this.#options.microphone !== false) this.#attach(await microphone(), true);
 
     const delay = { min: (this.#options.minDelay ?? 30) / 1000, max: (this.#options.maxDelay ?? 500) / 1000 };
     this.#playback = new AudioWorkletNode(context, "peerconnect-playback", {
@@ -334,6 +344,46 @@ export class Voice extends EventTarget {
     this.#listen("voice", (e) => this.#received(e.detail));
     this.#listen("left", (e) => this.#forget(e.detail.member));
     if (context.state === "suspended") await context.resume();
+  }
+
+  /** Whether a microphone (or stream) is being captured. */
+  get microphone() {
+    return this.#stream !== null;
+  }
+
+  /**
+   * Turns the microphone on (asking for it, from `deviceId` if given) or
+   * off (releasing it: the browser stops showing it in use).
+   */
+  async setMicrophone(on, { deviceId } = {}) {
+    if (!on) return this.#detach();
+    this.#attach(await microphone(deviceId), true);
+  }
+
+  /** Sends `stream` instead of the microphone; `null` sends nothing. */
+  setStream(stream) {
+    if (stream) this.#attach(stream, false);
+    else this.#detach();
+  }
+
+  #attach(stream, owned) {
+    this.#detach();
+    this.#stream = stream;
+    this.#ownsStream = owned;
+    this.#source = this.#context.createMediaStreamSource(stream);
+    this.#source.connect(this.#capture);
+  }
+
+  #detach() {
+    this.#source?.disconnect();
+    this.#source = null;
+    if (this.#ownsStream) for (const track of this.#stream?.getTracks() ?? []) track.stop();
+    this.#stream = null;
+    this.#ownsStream = false;
+    this.#active = 0;
+    this.#micLevel = 0;
+    this.#transmitting = false;
+    this.#setSpeaking(this.#conn.id, false);
   }
 
   /** Mutes or unmutes the microphone. */
@@ -387,7 +437,7 @@ export class Voice extends EventTarget {
     if (this.#encoder?.state !== "closed") this.#encoder?.close();
     for (const { decoder } of this.#decoders.values()) if (decoder.state !== "closed") decoder.close();
     this.#decoders.clear();
-    if (this.#ownsStream) for (const track of this.#stream?.getTracks() ?? []) track.stop();
+    this.#detach();
     if (this.#ownsContext) await this.#context?.close();
   }
 

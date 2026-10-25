@@ -189,6 +189,13 @@ try {
         `concealed ${r.stats.concealed}, dropped ${r.stats.dropped}, late ${r.stats.late}; sent ${r.sent}, received ${r.received}`,
     );
 
+  // The microphone only when asked for, and let go when turned off.
+  const mic = await page.evaluate((relay) => window.microphone({ relay }), relay);
+  console.log("microphone:", JSON.stringify(mic));
+  assert.deepEqual(mic.before, { asked: 0, sent: 0, on: false }, "listening only: no microphone asked for");
+  assert.ok(mic.during.asked === 1 && mic.during.sent > 10 && mic.during.on, "on when turned on");
+  assert.ok(mic.after.sentSinceOff <= 1 && !mic.after.on && mic.after.ended === "ended", "released when turned off");
+
   const direct = await run({ relay, vad: false });
   report("direct", direct);
   const vad = await run({ relay, vad: true });

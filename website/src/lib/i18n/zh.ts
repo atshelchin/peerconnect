@@ -278,8 +278,8 @@ export const zh: Dict = {
 		lead: '最多十人同时语音，也可以打开摄像头互相看见，端到端加密。创建一个房间，把链接发给朋友或者在手机上打开，然后开口说话。',
 		steps: [
 			'创建房间，分享链接。',
-			'打开链接的人输入名字，开启麦克风加入。',
-			'开始说话，想露脸就在自己的卡片上打开摄像头。如果几台设备在同一个房间里，请戴耳机，否则麦克风会互相拾音。'
+			'打开链接的人输入名字，可以先检查麦克风、摄像头和扬声器，然后加入。',
+			'在自己的卡片上打开麦克风就能说话，想露脸再打开摄像头。如果几台设备在同一个房间里，请戴耳机，否则麦克风会互相拾音。'
 		],
 		note: '这是真实的协议：Rust 内核编译成 WebAssembly，用 WebCodecs 编码 Opus 和 VP8，每个说话人一个自适应抖动缓冲，视频由分片完整拼回，全部经公共中继 <code>{relay}</code> 转发，中继只看得到密文。房间密钥在链接 <code>#</code> 之后的部分，浏览器不会把它发给任何服务器。',
 		noscript: '本演示需要 JavaScript 和 WebAssembly。',
@@ -290,12 +290,28 @@ export const zh: Dict = {
 			create: '创建房间'
 		},
 		join: {
-			title: '加入语音房间',
+			title: '加入房间',
 			name: '你的名字',
 			namePlaceholder: '例如：小明',
-			button: '开启麦克风并加入',
-			starting: '正在开启麦克风…',
-			hint: '浏览器会请求麦克风权限。不会录音，也不会保存任何内容。'
+			button: '加入',
+			starting: '正在加入…',
+			hint: '麦克风和摄像头在你主动打开之前都保持关闭。不会录音，也不会保存任何内容。'
+		},
+		devices: {
+			title: '检查设备（可选）',
+			hint: '加入前先试一试：这里的一切都不会发给任何人。',
+			mic: '麦克风',
+			camera: '摄像头',
+			speakers: '扬声器',
+			default: '默认',
+			device: '设备',
+			testMic: '测试',
+			testCamera: '测试',
+			testSpeakers: '播放提示音',
+			stop: '停止',
+			level: '麦克风音量',
+			micOnJoin: '加入时打开麦克风',
+			cameraOnJoin: '加入时打开摄像头'
 		},
 		problems: {
 			mic: '麦克风不可用（权限被拒绝或未找到设备）。你仍然可以收听和打字聊天。',
@@ -317,8 +333,8 @@ export const zh: Dict = {
 			you: '你',
 			alone: '还没有其他人。把链接分享出去吧。',
 			leave: '离开',
-			micOn: '关闭麦克风：别人听不到你',
-			micOff: '打开麦克风',
+			micOn: '关闭麦克风',
+			micOff: '打开麦克风：大家都能听到你',
 			hearOn: '关闭耳机：你听不到任何人',
 			hearOff: '打开耳机，恢复收听',
 			muteThem: '不听 {name}（只对你生效）',

@@ -18,6 +18,8 @@ export interface VoiceOptions {
   maxDelay?: number;
   /** A stream to send instead of the microphone. */
   stream?: MediaStream;
+  /** `false`: start listening only, without asking for the microphone (`setMicrophone(true)` later). */
+  microphone?: boolean;
   /** An AudioContext to use (48 kHz); one is created otherwise. */
   context?: AudioContext;
   /** Called as each of our frames is captured (`now` from `performance.now()`). */
@@ -59,6 +61,12 @@ export class Voice extends EventTarget {
   /** Who is speaking now. */
   readonly speaking: Set<string>;
   setMuted(muted: boolean): void;
+  /** Whether a microphone (or stream) is being captured. */
+  readonly microphone: boolean;
+  /** Turns the microphone on (asking for it, from `deviceId` if given) or off (releasing it). */
+  setMicrophone(on: boolean, options?: { deviceId?: string }): Promise<void>;
+  /** Sends `stream` instead of the microphone; `null` sends nothing. */
+  setStream(stream: MediaStream | null): void;
   setDeafened(deafened: boolean): void;
   /** One member's volume: 1 is normal, 0 silent. */
   setVolume(member: string, gain: number): void;

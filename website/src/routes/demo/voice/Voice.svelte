@@ -71,7 +71,30 @@
 	let presence: Record<string, Presence> = $state({});
 	/** Members we muted for ourselves. */
 	let silenced: Record<string, boolean> = $state({});
-	let muted = $state(false);
+	/** Our microphone is off (it is until we turn it on). */
+	let muted = $state(true);
+	/** An AudioContext playing to the chosen speakers, if one was chosen. */
+	let output: AudioContext | undefined;
+
+	// The device check before joining: nothing is turned on unless asked.
+	interface Devices {
+		mic: MediaDeviceInfo[];
+		camera: MediaDeviceInfo[];
+		speakers: MediaDeviceInfo[];
+	}
+	let devices: Devices = $state.raw({ mic: [], camera: [], speakers: [] });
+	let micDevice = $state('');
+	let cameraDevice = $state('');
+	let speakerDevice = $state('');
+	let micOnJoin = $state(false);
+	let cameraOnJoin = $state(false);
+	let testMic: MediaStream | undefined = $state.raw();
+	let testCamera: MediaStream | undefined = $state.raw();
+	let testLevel = $state(0);
+	let testContext: AudioContext | undefined;
+	let testFrame = 0;
+	const canChooseSpeakers =
+		typeof AudioContext === 'function' && 'setSinkId' in AudioContext.prototype;
 	let deafened = $state(false);
 	let camera = $state(false);
 	let cameraStream: MediaStream | undefined = $state.raw();
@@ -163,6 +186,122 @@
 		return !!wave && wave.slice(-4).some((v) => v > SPEAKING);
 	}
 
+	async function listDevices() {
+		try {
+			const all = await navigator.mediaDevices.enumerateDevices();
+			devices = {
+				mic: all.filter((d) => d.kind === 'audioinput'),
+				camera: all.filter((d) => d.kind === 'videoinput'),
+				speakers: all.filter((d) => d.kind === 'audiooutput')
+			};
+		} catch {
+			// no devices to list: the defaults it is
+		}
+	}
+
+	function label(device: MediaDeviceInfo, i: number): string {
+		return device.label || `${t.devices.device} ${i + 1}`;
+	}
+
+	/** Listens to the chosen microphone, showing its level, until stopped. */
+	async function testMicrophone() {
+		if (testMic) return stopMicTest();
+		// Made within the click, so that the browser lets it run.
+		const context = new AudioContext();
+		try {
+			testMic = await navigator.mediaDevices.getUserMedia({
+				audio: micDevice ? { deviceId: { exact: micDevice } } : true
+			});
+		} catch {
+			void context.close();
+			raise('mic');
+			return;
+		}
+		problems = problems.filter((p) => p !== 'mic');
+		void listDevices();
+		testContext = context;
+		void context.resume();
+		const analyser = new AnalyserNode(testContext, { fftSize: 1024 });
+		testContext.createMediaStreamSource(testMic).connect(analyser);
+		const samples = new Float32Array(analyser.fftSize);
+		testFrame = window.setInterval(() => {
+			analyser.getFloatTimeDomainData(samples);
+			let sum = 0;
+			for (const v of samples) sum += v * v;
+			// Held at its peak, falling slowly, so that a short sound shows.
+			testLevel = Math.max(level(Math.sqrt(sum / samples.length)), testLevel * 0.85);
+		}, 50);
+	}
+
+	function stopMicTest() {
+		clearInterval(testFrame);
+		testMic?.getTracks().forEach((track) => track.stop());
+		testMic = undefined;
+		void testContext?.close();
+		testContext = undefined;
+		testLevel = 0;
+	}
+
+	/** Shows the chosen camera, until stopped. */
+	async function testCameraNow() {
+		if (testCamera) return stopCameraTest();
+		try {
+			testCamera = await navigator.mediaDevices.getUserMedia({
+				video: cameraDevice
+					? { deviceId: { exact: cameraDevice }, width: VIDEO.width, height: VIDEO.height }
+					: { width: VIDEO.width, height: VIDEO.height }
+			});
+		} catch {
+			raise('camera');
+			return;
+		}
+		problems = problems.filter((p) => p !== 'camera');
+		void listDevices();
+	}
+
+	function stopCameraTest() {
+		testCamera?.getTracks().forEach((track) => track.stop());
+		testCamera = undefined;
+	}
+
+	/** A short chime on the chosen speakers. */
+	async function testSpeakers() {
+		const context = new AudioContext();
+		void context.resume();
+		if (speakerDevice && canChooseSpeakers) {
+			await (context as AudioContext & { setSinkId(id: string): Promise<void> })
+				.setSinkId(speakerDevice)
+				.catch(() => {});
+		}
+		const gain = new GainNode(context, { gain: 0 });
+		gain.connect(context.destination);
+		const now = context.currentTime;
+		for (const [i, f] of [523.25, 659.25, 783.99].entries()) {
+			const tone = new OscillatorNode(context, { frequency: f });
+			tone.connect(gain);
+			tone.start(now + i * 0.18);
+			tone.stop(now + i * 0.18 + 0.16);
+		}
+		gain.gain.setValueAtTime(0, now);
+		gain.gain.linearRampToValueAtTime(0.25, now + 0.02);
+		gain.gain.setValueAtTime(0.25, now + 0.5);
+		gain.gain.linearRampToValueAtTime(0, now + 0.6);
+		setTimeout(() => void context.close(), 1000);
+	}
+
+	/** Shows a stream in a <video>, while it is on the page. */
+	function preview(node: HTMLVideoElement, stream: MediaStream | undefined) {
+		node.srcObject = stream ?? null;
+		return {
+			update(next: MediaStream | undefined) {
+				node.srcObject = next ?? null;
+			},
+			destroy() {
+				node.srcObject = null;
+			}
+		};
+	}
+
 	function create() {
 		const group = sdk!.Group.create(RELAY_URL);
 		invite = group.toString();
@@ -177,6 +316,8 @@
 		write(NAME_KEY, chosen);
 		phase = 'starting';
 		problems = problems.filter((p) => p === 'codecs');
+		stopMicTest();
+		stopCameraTest();
 
 		const c = sdk!.joinGroup(invite, {
 			identity: identity(),
@@ -229,12 +370,17 @@
 		c.addEventListener('full', () => current() && raise('full'));
 		c.addEventListener('replaced', () => current() && raise('replaced'));
 
+		// Listening at once; the microphone only if asked for.
 		try {
-			voice = await voiceSdk!.startVoice(c);
-		} catch (error) {
-			const unsupported =
-				typeof AudioEncoder === 'undefined' || String(error).includes('WebCodecs');
-			raise(unsupported ? 'codecs' : 'mic');
+			if (speakerDevice && canChooseSpeakers) {
+				output = new AudioContext({ sampleRate: 48_000, latencyHint: 'interactive' });
+				await (output as AudioContext & { setSinkId(id: string): Promise<void> })
+					.setSinkId(speakerDevice)
+					.catch(() => {});
+			}
+			voice = await voiceSdk!.startVoice(c, { microphone: false, context: output });
+		} catch {
+			raise('codecs');
 		}
 		// Everyone's video, drawn into their card; ours only when the camera is on.
 		if (typeof VideoDecoder === 'function') {
@@ -278,6 +424,8 @@
 		};
 		frame = requestAnimationFrame(draw);
 		phase = 'room';
+		if (micOnJoin) await toggleMic();
+		if (cameraOnJoin) await toggleCamera();
 	}
 
 	/** Tells the others whether we are muted or deafened. */
@@ -289,9 +437,16 @@
 		}
 	}
 
-	function toggleMic() {
-		muted = !muted;
-		voice?.setMuted(muted);
+	/** Turns the microphone on (asking for it) or off (letting it go). */
+	async function toggleMic() {
+		if (!voice) return;
+		try {
+			await voice.setMicrophone(muted, { deviceId: micDevice || undefined });
+			muted = !muted;
+			problems = problems.filter((p) => p !== 'mic');
+		} catch {
+			raise('mic');
+		}
 		announce();
 	}
 
@@ -313,7 +468,12 @@
 		}
 		try {
 			const stream = await navigator.mediaDevices.getUserMedia({
-				video: { width: VIDEO.width, height: VIDEO.height, frameRate: VIDEO.framerate }
+				video: {
+					width: VIDEO.width,
+					height: VIDEO.height,
+					frameRate: VIDEO.framerate,
+					...(cameraDevice ? { deviceId: { exact: cameraDevice } } : {})
+				}
 			});
 			cameraStream = stream;
 			await video.setStream(stream);
@@ -376,6 +536,8 @@
 		cameraStream?.getTracks().forEach((t) => t.stop());
 		cameraStream = undefined;
 		await v?.stop().catch(() => {});
+		void output?.close();
+		output = undefined;
 		c?.leave();
 	}
 
@@ -388,7 +550,8 @@
 		silenced = {};
 		watching = {};
 		frames.clear();
-		muted = deafened = camera = false;
+		deafened = camera = false;
+		muted = true;
 		status = 'offline';
 		problems = [];
 		invite = '';
@@ -435,8 +598,13 @@
 				phase = 'start';
 			}
 		})();
+		void listDevices();
+		navigator.mediaDevices?.addEventListener('devicechange', listDevices);
 		return () => {
 			disposed = true;
+			navigator.mediaDevices?.removeEventListener('devicechange', listDevices);
+			stopMicTest();
+			stopCameraTest();
 			void stop();
 		};
 	});
@@ -517,6 +685,84 @@
 			</button>
 		</div>
 		<p class="hint">{t.join.hint}</p>
+
+		<fieldset class="devices">
+			<legend>{t.devices.title}</legend>
+			<p class="hint">{t.devices.hint}</p>
+
+			<div class="device">
+				<span class="kind">{@render icon('mic')}{t.devices.mic}</span>
+				<select
+					bind:value={micDevice}
+					aria-label={t.devices.mic}
+					onchange={() => testMic && (stopMicTest(), testMicrophone())}
+				>
+					<option value="">{t.devices.default}</option>
+					{#each devices.mic as d, i (d.deviceId)}
+						{#if d.deviceId && d.deviceId !== 'default'}<option value={d.deviceId}
+								>{label(d, i)}</option
+							>{/if}
+					{/each}
+				</select>
+				<button type="button" class="button secondary small" onclick={testMicrophone}
+					>{testMic ? t.devices.stop : t.devices.testMic}</button
+				>
+				{#if testMic}
+					<span
+						class="meter"
+						role="meter"
+						aria-label={t.devices.level}
+						aria-valuemin="0"
+						aria-valuemax="1"
+						aria-valuenow={testLevel}
+						><span style:width="{Math.round(testLevel * 100)}%"></span></span
+					>
+				{/if}
+				<label class="check"
+					><input type="checkbox" bind:checked={micOnJoin} />{t.devices.micOnJoin}</label
+				>
+			</div>
+
+			<div class="device">
+				<span class="kind">{@render icon('camera')}{t.devices.camera}</span>
+				<select
+					bind:value={cameraDevice}
+					aria-label={t.devices.camera}
+					onchange={() => testCamera && (stopCameraTest(), testCameraNow())}
+				>
+					<option value="">{t.devices.default}</option>
+					{#each devices.camera as d, i (d.deviceId)}
+						{#if d.deviceId}<option value={d.deviceId}>{label(d, i)}</option>{/if}
+					{/each}
+				</select>
+				<button type="button" class="button secondary small" onclick={testCameraNow}
+					>{testCamera ? t.devices.stop : t.devices.testCamera}</button
+				>
+				{#if testCamera}
+					<video class="test-preview" use:preview={testCamera} autoplay muted playsinline></video>
+				{/if}
+				<label class="check"
+					><input type="checkbox" bind:checked={cameraOnJoin} />{t.devices.cameraOnJoin}</label
+				>
+			</div>
+
+			<div class="device">
+				<span class="kind">{@render icon('speaker')}{t.devices.speakers}</span>
+				{#if canChooseSpeakers && devices.speakers.length}
+					<select bind:value={speakerDevice} aria-label={t.devices.speakers}>
+						<option value="">{t.devices.default}</option>
+						{#each devices.speakers as d, i (d.deviceId)}
+							{#if d.deviceId && d.deviceId !== 'default'}<option value={d.deviceId}
+									>{label(d, i)}</option
+								>{/if}
+						{/each}
+					</select>
+				{/if}
+				<button type="button" class="button secondary small" onclick={testSpeakers}
+					>{t.devices.testSpeakers}</button
+				>
+			</div>
+		</fieldset>
 	</form>
 {:else}
 	<div class="room">
@@ -706,13 +952,115 @@
 	.start,
 	.join {
 		display: grid;
+		grid-template-columns: minmax(0, 1fr);
 		justify-items: start;
 		gap: 14px;
 		max-width: 640px;
 	}
 
-	.join label {
+	.join > label {
 		font-weight: 600;
+	}
+
+	.devices {
+		display: grid;
+		gap: 12px;
+		width: 100%;
+		/* A fieldset is as wide as its content unless told otherwise. */
+		min-width: 0;
+		grid-template-columns: minmax(0, 1fr);
+		margin: 8px 0 0;
+		padding: 16px;
+		border: 1px solid var(--line);
+		border-radius: 16px;
+	}
+
+	.devices legend {
+		padding: 0 6px;
+		font-weight: 600;
+	}
+
+	.devices .hint {
+		margin: 0;
+	}
+
+	.device {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 12px;
+	}
+
+	.kind {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 7.5em;
+		font-weight: 600;
+	}
+
+	select {
+		flex: 1 1 8em;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 38px;
+		padding: 0 12px;
+		border: 1px solid var(--line-strong);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--ink);
+		font: inherit;
+		font-size: 0.9rem;
+	}
+
+	.small {
+		min-height: 38px;
+		padding: 0 14px;
+		font-size: 0.85rem;
+	}
+
+	.meter {
+		flex: 1 0 100%;
+		height: 8px;
+		overflow: hidden;
+		border-radius: 999px;
+		background: var(--line);
+	}
+
+	.meter span {
+		display: block;
+		height: 100%;
+		border-radius: inherit;
+		background: var(--accent);
+		transition: width 0.06s linear;
+	}
+
+	.test-preview {
+		flex: 1 0 100%;
+		width: 100%;
+		min-width: 0;
+		max-width: 320px;
+		border-radius: 10px;
+		background: #000;
+		transform: scaleX(-1);
+	}
+
+	.check {
+		display: inline-flex;
+		flex: 1 0 100%;
+		align-items: center;
+		gap: 8px;
+		font-size: 0.9rem;
+		cursor: pointer;
+	}
+
+	.check input {
+		flex: none;
+		padding: 0;
+		width: 18px;
+		height: 18px;
+		min-height: 0;
+		accent-color: var(--accent);
 	}
 
 	.hint {
