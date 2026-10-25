@@ -5,7 +5,8 @@ const PAGES = [
 	{ path: '/', zh: '/zh' },
 	{ path: '/docs', zh: '/zh/docs' },
 	{ path: '/groups', zh: '/zh/groups' },
-	{ path: '/demo', zh: '/zh/demo' }
+	{ path: '/demo', zh: '/zh/demo' },
+	{ path: '/demo/voice', zh: '/zh/demo/voice' }
 ];
 const ENGLISH_ONLY = ['/spec', '/spec/groups'];
 
@@ -96,6 +97,8 @@ test('the sitemap lists every page, and each one exists', async ({ request }) =>
 			'/zh/groups',
 			'/demo',
 			'/zh/demo',
+			'/demo/voice',
+			'/zh/demo/voice',
 			'/spec',
 			'/spec/groups'
 		]

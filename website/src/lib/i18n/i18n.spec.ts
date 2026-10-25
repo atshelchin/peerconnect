@@ -13,7 +13,7 @@ describe('language routing', () => {
 	});
 
 	it('maps paths to and from each language', () => {
-		for (const path of ['/', '/docs', '/groups', '/demo', '/spec/groups']) {
+		for (const path of ['/', '/docs', '/groups', '/demo', '/demo/voice', '/spec/groups']) {
 			for (const lang of LANGS) {
 				const localized = localize(path, lang);
 				expect(langOf(localized)).toBe(lang);

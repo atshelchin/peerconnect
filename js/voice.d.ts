@@ -9,7 +9,11 @@ export interface VoiceOptions {
   vad?: boolean;
   /** Level in dBFS above which the microphone counts as speech (default -50). */
   threshold?: number;
-  /** Bounds of the adaptive jitter buffer, in ms (default 30 and 250). */
+  /**
+   * Bounds of the adaptive jitter buffer, in ms (default 30 and 500). It stays near the lower
+   * bound on a steady network; the upper one is what it may grow to on a bad one, trading
+   * delay for audio that does not break up.
+   */
   minDelay?: number;
   maxDelay?: number;
   /** A stream to send instead of the microphone. */

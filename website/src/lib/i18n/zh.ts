@@ -23,6 +23,11 @@ export const zh: Dict = {
 			description:
 				'用二维码配对两个浏览器，通过公共 PeerConnect 中继进行端到端加密聊天。演示运行的是编译为 WebAssembly 的真实协议实现。'
 		},
+		voice: {
+			title: '在线演示：多人语音聊天 — PeerConnect',
+			description:
+				'最多十人一起语音，端到端加密，经公共 PeerConnect 中继转发：Opus 语音、自适应抖动缓冲，外加文字聊天。在两台设备上打开即可体验。'
+		},
 		spec: {
 			title: '协议规范 v1 — PeerConnect',
 			description:
@@ -267,12 +272,85 @@ export const zh: Dict = {
 		copy: '复制',
 		copied: '已复制'
 	},
+	voice: {
+		eyebrow: '在线演示',
+		title: '多人语音聊天',
+		lead: '最多十人同时语音，端到端加密。创建一个房间，把链接发给朋友或者在手机上打开，然后开口说话。',
+		steps: [
+			'创建房间，分享链接。',
+			'打开链接的人输入名字，开启麦克风加入。',
+			'开始说话。如果几台设备在同一个房间里，请戴耳机，否则麦克风会互相拾音。'
+		],
+		note: '这是真实的协议：Rust 内核编译成 WebAssembly，用 WebCodecs 编码 Opus，每个说话人一个自适应抖动缓冲，全部经公共中继 <code>{relay}</code> 转发，中继只看得到密文。房间密钥在链接 <code>#</code> 之后的部分，浏览器不会把它发给任何服务器。',
+		noscript: '本演示需要 JavaScript 和 WebAssembly。',
+		loading: '加载中…',
+		start: {
+			title: '创建语音房间',
+			text: '你会得到一个可以分享的链接。持有链接的人都能加入，同时最多十人，所以请私下分享。',
+			create: '创建房间'
+		},
+		join: {
+			title: '加入语音房间',
+			name: '你的名字',
+			namePlaceholder: '例如：小明',
+			button: '开启麦克风并加入',
+			starting: '正在开启麦克风…',
+			hint: '浏览器会请求麦克风权限。不会录音，也不会保存任何内容。'
+		},
+		problems: {
+			mic: '麦克风不可用（权限被拒绝或未找到设备）。你仍然可以收听和打字聊天。',
+			codecs:
+				'这个浏览器无法编码 Opus 音频（WebCodecs）。文字聊天可用；语音请使用较新的 Chrome、Edge 或 Firefox。',
+			full: '房间已满（十人）。页面会继续尝试加入。',
+			replaced: '这个房间已在别处用同一身份打开。',
+			link: '这不是一个有效的房间链接。',
+			failed: '演示无法在这个浏览器中启动。'
+		},
+		state: {
+			offline: '连接中…',
+			online: '已连接 · 端到端加密',
+			closed: '已离开'
+		},
+		room: {
+			people: '房间里',
+			you: '你',
+			alone: '还没有其他人。把链接分享出去吧。',
+			rtt: '到中继的往返时间',
+			buffer: '缓冲',
+			lost: '丢失',
+			skipped: '跳过',
+			volume: '{name} 的音量'
+		},
+		controls: {
+			mute: '静音',
+			unmute: '取消静音',
+			deafen: '屏蔽他人',
+			undeafen: '取消屏蔽',
+			ptt: '按住说话',
+			pttHint: '按住空格键或下方按钮说话。',
+			hold: '按住说话',
+			leave: '离开'
+		},
+		invite: {
+			title: '邀请',
+			copy: '复制链接',
+			copied: '已复制'
+		},
+		chat: {
+			title: '聊天',
+			placeholder: '输入消息',
+			send: '发送',
+			empty: '还没有消息。'
+		},
+		again: '重新开始'
+	},
 	demo: {
 		eyebrow: '在线演示',
 		title: '配对两个浏览器',
 		lead: '在手机和电脑上（或两个浏览器窗口中）打开本页，用二维码把它们连起来，然后进行端到端加密聊天。',
 		note: '这里运行的是真实协议：Rust 核心编译成 WebAssembly，通过公共中继 <code>{relay}</code> 通信。每个浏览器标签页都是一个独立的端，刷新标签页不会丢失房间。',
 		noscript: '演示需要 JavaScript 和 WebAssembly。',
+		voiceLink: '不止两个人？试试多人语音聊天演示 →',
 		steps: [
 			'在一台设备上创建房间。',
 			'用另一台设备扫描二维码，或在那里打开链接。',

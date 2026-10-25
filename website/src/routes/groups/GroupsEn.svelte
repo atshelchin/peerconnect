@@ -39,6 +39,8 @@
 	through the same untrusted, stateless relays.
 </p>
 
+<p class="try"><a href="/demo/voice">Try it: talk in a group voice chat in your browser →</a></p>
+
 <h2 id="overview">What groups are for</h2>
 <ul>
 	<li>

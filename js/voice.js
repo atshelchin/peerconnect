@@ -194,7 +194,9 @@ registerProcessor("peerconnect-playback", Playback);
  *   and add latency.
  * - `threshold`: the level, in dBFS, above which the microphone counts as
  *   speech (default -50). `vad: false` sends all the time.
- * - `minDelay`, `maxDelay`: bounds of the jitter buffer in ms (30, 250).
+ * - `minDelay`, `maxDelay`: bounds of the jitter buffer in ms (30, 500). On a
+ *   steady network it stays near the lower; the upper is how far it may grow
+ *   on a bad one, trading delay for audio that does not break up.
  * - `stream`: a MediaStream to send instead of the microphone.
  * - `context`: an AudioContext to use (48 kHz).
  * - `onCapture(seq, now)`, `onPlay(member, seq, now)`: called as each of our
@@ -282,7 +284,7 @@ export class Voice extends EventTarget {
     context.createMediaStreamSource(this.#stream).connect(this.#capture).connect(silent).connect(context.destination);
     this.#capture.port.onmessage = ({ data }) => this.#captured(data);
 
-    const delay = { min: (this.#options.minDelay ?? 30) / 1000, max: (this.#options.maxDelay ?? 250) / 1000 };
+    const delay = { min: (this.#options.minDelay ?? 30) / 1000, max: (this.#options.maxDelay ?? 500) / 1000 };
     this.#playback = new AudioWorkletNode(context, "peerconnect-playback", {
       numberOfInputs: 0,
       outputChannelCount: [context.destination.channelCount >= 2 ? 2 : 1],
