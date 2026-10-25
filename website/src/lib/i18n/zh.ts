@@ -315,21 +315,15 @@ export const zh: Dict = {
 			people: '房间里',
 			you: '你',
 			alone: '还没有其他人。把链接分享出去吧。',
-			rtt: '到中继的往返时间',
-			buffer: '缓冲',
-			lost: '丢失',
-			skipped: '跳过',
-			volume: '{name} 的音量'
-		},
-		controls: {
-			mute: '静音',
-			unmute: '取消静音',
-			deafen: '屏蔽他人',
-			undeafen: '取消屏蔽',
-			ptt: '按住说话',
-			pttHint: '按住空格键或下方按钮说话。',
-			hold: '按住说话',
-			leave: '离开'
+			leave: '离开',
+			micOn: '关闭麦克风：别人听不到你',
+			micOff: '打开麦克风',
+			hearOn: '关闭耳机：你听不到任何人',
+			hearOff: '打开耳机，恢复收听',
+			muteThem: '不听 {name}（只对你生效）',
+			unmuteThem: '恢复收听 {name}',
+			theirMicOff: '{name} 关了麦克风',
+			theirHearingOff: '{name} 关了耳机，听不到大家'
 		},
 		invite: {
 			title: '邀请',

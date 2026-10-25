@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { SvelteSet } from 'svelte/reactivity';
 	import type { GroupConnection } from 'peerconnect';
 	import type { Voice } from 'peerconnect/voice';
 	import { encode } from 'uqr';
@@ -13,6 +12,10 @@
 	const IDENTITY_KEY = 'peerconnect-voice:identity';
 	const NAME_KEY = 'peerconnect-voice:name';
 	const CAPACITY = 10;
+	/** Bars in a waveform, one every 40 ms: the last 1.6 s. */
+	const BARS = 40;
+	/** Above this level (0–1, see `level`), someone counts as speaking. */
+	const SPEAKING = 0.25;
 
 	type Sdk = typeof import('peerconnect');
 	type VoiceSdk = typeof import('peerconnect/voice');
@@ -22,15 +25,14 @@
 		name: string;
 	}
 	interface Line {
-		from: string;
 		name: string;
 		text: string;
 		me: boolean;
 	}
-	interface Stats {
-		target: number;
-		concealed: number;
-		dropped: number;
+	/** What a member says about itself, so that the others can show it. */
+	interface Presence {
+		muted: boolean;
+		deafened: boolean;
 	}
 
 	const t = $derived(i18n.t.voice);
@@ -40,7 +42,7 @@
 	let voiceSdk: VoiceSdk | undefined;
 	let conn: GroupConnection | undefined;
 	let voice: Voice | undefined = $state.raw();
-	let statsTimer: ReturnType<typeof setInterval> | undefined;
+	let frame = 0;
 
 	let phase: 'loading' | 'start' | 'join' | 'starting' | 'room' | 'error' = $state('loading');
 	let problems: Problem[] = $state([]);
@@ -49,14 +51,13 @@
 	let me = $state('');
 	let status: 'offline' | 'online' | 'closed' = $state('offline');
 	let members: Member[] = $state([]);
-	const speaking = new SvelteSet<string>();
-	let stats: Record<string, Stats> = $state({});
-	let volumes: Record<string, number> = $state({});
+	/** Recent levels (0–1) per member, newest last: the waveforms. */
+	let waves: Record<string, number[]> = $state({});
+	let presence: Record<string, Presence> = $state({});
+	/** Members we muted for ourselves. */
+	let silenced: Record<string, boolean> = $state({});
 	let muted = $state(false);
 	let deafened = $state(false);
-	let ptt = $state(false);
-	let holding = $state(false);
-	let rtt: number | undefined = $state();
 	let lines: Line[] = $state([]);
 	let draft = $state('');
 	let copied = $state(false);
@@ -70,7 +71,11 @@
 		data.forEach((row, y) => row.forEach((dark, x) => dark && (d += `M${x} ${y}h1v1h-1z`)));
 		return { d, size };
 	});
-	const others = $derived(members.filter((m) => m.id !== me));
+	// Ourselves first, then the others in the order they came.
+	const people = $derived([
+		...members.filter((m) => m.id === me),
+		...members.filter((m) => m.id !== me)
+	]);
 
 	function read(key: string): string | null {
 		try {
@@ -129,6 +134,16 @@
 		if (!problems.includes(problem)) problems = [...problems, problem];
 	}
 
+	/** An RMS level as 0–1 on a decibel scale: −60 dBFS is silence, −10 loud. */
+	function level(rms: number): number {
+		return Math.min(1, Math.max(0, (20 * Math.log10(rms + 1e-9) + 60) / 50));
+	}
+
+	function speaking(id: string): boolean {
+		const wave = waves[id];
+		return !!wave && wave.slice(-4).some((v) => v > SPEAKING);
+	}
+
 	function create() {
 		const group = sdk!.Group.create(RELAY_URL);
 		invite = group.toString();
@@ -161,16 +176,30 @@
 			if (!current()) return;
 			const { member, profile } = e.detail;
 			members = [...members.filter((m) => m.id !== member), { id: member, name: nameOf(profile) }];
+			announce(); // so that the newcomer knows whether we are muted
 		});
 		c.addEventListener('left', (e) => {
 			if (!current()) return;
 			members = members.filter((m) => m.id !== e.detail.member);
+			delete waves[e.detail.member];
 		});
 		c.addEventListener('message', (e) => {
-			if (!current() || e.detail.channel !== 'chat') return;
-			const from = e.detail.from;
+			if (!current()) return;
+			const { from, channel, data } = e.detail;
+			if (channel === 'command') {
+				// Members announce whether they are muted, as a command.
+				try {
+					const said = JSON.parse(decoder.decode(data));
+					if (said?.type === 'presence' && from !== me) {
+						presence[from] = { muted: !!said.muted, deafened: !!said.deafened };
+					}
+				} catch {
+					// not a presence announcement
+				}
+				return;
+			}
 			const who = members.find((m) => m.id === from)?.name ?? '?';
-			lines = [...lines, { from, name: who, text: decoder.decode(e.detail.data), me: from === me }];
+			lines = [...lines, { name: who, text: decoder.decode(data), me: from === me }];
 			void scrollDown();
 		});
 		c.addEventListener('full', () => current() && raise('full'));
@@ -178,60 +207,56 @@
 
 		try {
 			voice = await voiceSdk!.startVoice(c);
-			voice.addEventListener('speaking', (e) => {
-				if (e.detail.speaking) speaking.add(e.detail.member);
-				else speaking.delete(e.detail.member);
-			});
-			applyMute();
 		} catch (error) {
 			const unsupported =
 				typeof AudioEncoder === 'undefined' || String(error).includes('WebCodecs');
 			raise(unsupported ? 'codecs' : 'mic');
 		}
-		statsTimer = setInterval(() => {
-			rtt = conn?.rtt;
-			if (voice) stats = Object.fromEntries(voice.stats());
-		}, 500);
+		// Every 40 ms, one more bar in everyone's waveform.
+		let last = 0;
+		const draw = (now: number) => {
+			if (voice && now - last >= 40) {
+				last = now;
+				const stats = voice.stats();
+				const next: Record<string, number[]> = {};
+				for (const m of members) {
+					// Off is a flat line: our microphone muted, theirs, or them muted for us.
+					const off = m.id === me ? muted : presence[m.id]?.muted || silenced[m.id];
+					const rms = off ? 0 : m.id === me ? voice.micLevel : (stats.get(m.id)?.rms ?? 0);
+					next[m.id] = [...(waves[m.id] ?? Array(BARS).fill(0)).slice(1 - BARS), level(rms)];
+				}
+				waves = next;
+			}
+			frame = requestAnimationFrame(draw);
+		};
+		frame = requestAnimationFrame(draw);
 		phase = 'room';
 	}
 
-	function applyMute() {
-		voice?.setMuted(muted || (ptt && !holding));
+	/** Tells the others whether we are muted or deafened. */
+	function announce() {
+		try {
+			conn?.send('command', JSON.stringify({ type: 'presence', muted, deafened }));
+		} catch {
+			// left
+		}
 	}
 
-	function toggleMute() {
+	function toggleMic() {
 		muted = !muted;
-		applyMute();
+		voice?.setMuted(muted);
+		announce();
 	}
 
-	function toggleDeafen() {
+	function toggleSpeaker() {
 		deafened = !deafened;
 		voice?.setDeafened(deafened);
+		announce();
 	}
 
-	function togglePtt() {
-		ptt = !ptt;
-		holding = false;
-		applyMute();
-	}
-
-	function hold(down: boolean) {
-		if (!ptt || holding === down) return;
-		holding = down;
-		applyMute();
-	}
-
-	function onKey(event: KeyboardEvent, down: boolean) {
-		if (event.code !== 'Space' || !ptt || phase !== 'room') return;
-		const target = event.target as HTMLElement | null;
-		if (target && ['INPUT', 'TEXTAREA', 'BUTTON'].includes(target.tagName)) return;
-		event.preventDefault();
-		hold(down);
-	}
-
-	function setVolume(id: string, value: number) {
-		volumes[id] = value;
-		voice?.setVolume(id, value);
+	function toggleThem(id: string) {
+		silenced[id] = !silenced[id];
+		voice?.setVolume(id, silenced[id] ? 0 : 1);
 	}
 
 	async function scrollDown() {
@@ -252,7 +277,7 @@
 	}
 
 	async function stop() {
-		clearInterval(statsTimer);
+		cancelAnimationFrame(frame);
 		const [v, c] = [voice, conn];
 		voice = undefined;
 		conn = undefined;
@@ -264,8 +289,10 @@
 		await stop();
 		members = [];
 		lines = [];
-		speaking.clear();
-		stats = {};
+		waves = {};
+		presence = {};
+		silenced = {};
+		muted = deafened = false;
 		status = 'offline';
 		problems = [];
 		invite = '';
@@ -308,18 +335,35 @@
 				phase = 'start';
 			}
 		})();
-		const down = (e: KeyboardEvent) => onKey(e, true);
-		const up = (e: KeyboardEvent) => onKey(e, false);
-		window.addEventListener('keydown', down);
-		window.addEventListener('keyup', up);
 		return () => {
 			disposed = true;
-			window.removeEventListener('keydown', down);
-			window.removeEventListener('keyup', up);
 			void stop();
 		};
 	});
 </script>
+
+{#snippet icon(
+	name: 'mic' | 'mic-off' | 'headphones' | 'headphones-off' | 'speaker' | 'speaker-off'
+)}
+	<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+		{#if name === 'mic' || name === 'mic-off'}
+			<rect x="9" y="3" width="6" height="11" rx="3" />
+			<path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7" />
+			{#if name === 'mic-off'}<path d="M4 4l16 16" />{/if}
+		{:else if name === 'headphones' || name === 'headphones-off'}
+			<path d="M4 15v-3a8 8 0 0 1 16 0v3" />
+			<path d="M4 15h3v5H5a1 1 0 0 1-1-1zM20 15h-3v5h2a1 1 0 0 0 1-1z" />
+			{#if name === 'headphones-off'}<path d="M4 4l16 16" />{/if}
+		{:else}
+			<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" />
+			{#if name === 'speaker'}
+				<path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11" />
+			{:else}
+				<path d="M16 9.5l5 5M21 9.5l-5 5" />
+			{/if}
+		{/if}
+	</svg>
+{/snippet}
 
 {#if problems.length}
 	<div class="problems" role="status">
@@ -364,86 +408,88 @@
 			<header class="bar">
 				<span class="status {status}">{t.state[status]}</span>
 				<span class="count">{members.length} / {CAPACITY}</span>
-				{#if rtt !== undefined}<span class="rtt" title={t.room.rtt}>{t.room.rtt}: {rtt} ms</span
-					>{/if}
+				<button class="button danger leave" onclick={leave}>{t.room.leave}</button>
 			</header>
 
 			<ul class="members">
-				{#each members as member (member.id)}
-					{@const isMe = member.id === me}
-					{@const s = stats[member.id]}
-					<li class="member" class:speaking={speaking.has(member.id)}>
-						<span class="avatar" aria-hidden="true">{member.name.slice(0, 1).toUpperCase()}</span>
+				{#each people as person (person.id)}
+					{@const mine = person.id === me}
+					{@const off = mine ? muted : !!presence[person.id]?.muted || !!silenced[person.id]}
+					{@const talking = !off && speaking(person.id)}
+					<li class="person" class:mine class:talking class:off>
+						<span class="avatar" aria-hidden="true">{person.name.slice(0, 1).toUpperCase()}</span>
 						<span class="who">
 							<span class="name"
-								>{member.name}{#if isMe}<em>&nbsp;· {t.room.you}</em>{/if}</span
+								>{person.name}{#if mine}<em>&nbsp;· {t.room.you}</em>{/if}</span
 							>
-							{#if !isMe && s}
-								<span class="meta"
-									>{t.room.buffer}
-									{Math.round(s.target * 1000)} ms · {t.room.lost}
-									{s.concealed} · {t.room.skipped}
-									{s.dropped}</span
-								>
+							<svg
+								class="wave"
+								viewBox="0 0 {BARS * 4} 24"
+								preserveAspectRatio="none"
+								aria-hidden="true"
+							>
+								{#each waves[person.id] ?? [] as v, i (i)}
+									{@const h = Math.max(2, v * 22)}
+									<rect x={i * 4 + 0.5} y={12 - h / 2} width="3" height={h} rx="1.5" />
+								{/each}
+							</svg>
+						</span>
+						<span class="actions">
+							{#if mine}
+								{#if voice}
+									<button
+										class="toggle"
+										class:on={muted}
+										aria-pressed={muted}
+										aria-label={muted ? t.room.micOff : t.room.micOn}
+										title={muted ? t.room.micOff : t.room.micOn}
+										onclick={toggleMic}>{@render icon(muted ? 'mic-off' : 'mic')}</button
+									>
+									<button
+										class="toggle"
+										class:on={deafened}
+										aria-pressed={deafened}
+										aria-label={deafened ? t.room.hearOff : t.room.hearOn}
+										title={deafened ? t.room.hearOff : t.room.hearOn}
+										onclick={toggleSpeaker}
+										>{@render icon(deafened ? 'headphones-off' : 'headphones')}</button
+									>
+								{/if}
+							{:else}
+								{#if presence[person.id]?.muted}
+									<span class="state" title={t.room.theirMicOff.replace('{name}', person.name)}
+										>{@render icon('mic-off')}<span class="sr"
+											>{t.room.theirMicOff.replace('{name}', person.name)}</span
+										></span
+									>
+								{/if}
+								{#if presence[person.id]?.deafened}
+									<span class="state" title={t.room.theirHearingOff.replace('{name}', person.name)}
+										>{@render icon('headphones-off')}<span class="sr"
+											>{t.room.theirHearingOff.replace('{name}', person.name)}</span
+										></span
+									>
+								{/if}
+								{#if voice}
+									{@const label = (
+										silenced[person.id] ? t.room.unmuteThem : t.room.muteThem
+									).replace('{name}', person.name)}
+									<button
+										class="toggle"
+										class:on={silenced[person.id]}
+										aria-pressed={!!silenced[person.id]}
+										aria-label={label}
+										title={label}
+										onclick={() => toggleThem(person.id)}
+										>{@render icon(silenced[person.id] ? 'speaker-off' : 'speaker')}</button
+									>
+								{/if}
 							{/if}
 						</span>
-						{#if !isMe && voice}
-							<input
-								class="volume"
-								type="range"
-								min="0"
-								max="2"
-								step="0.05"
-								value={volumes[member.id] ?? 1}
-								aria-label={t.room.volume.replace('{name}', member.name)}
-								oninput={(e) => setVolume(member.id, Number(e.currentTarget.value))}
-							/>
-						{/if}
 					</li>
 				{/each}
 			</ul>
-			{#if !others.length}<p class="hint">{t.room.alone}</p>{/if}
-
-			<div class="controls">
-				{#if voice}
-					<button
-						class="button secondary"
-						class:active={muted}
-						aria-pressed={muted}
-						onclick={toggleMute}
-					>
-						{muted ? t.controls.unmute : t.controls.mute}
-					</button>
-					<button
-						class="button secondary"
-						class:active={deafened}
-						aria-pressed={deafened}
-						onclick={toggleDeafen}
-					>
-						{deafened ? t.controls.undeafen : t.controls.deafen}
-					</button>
-					<button
-						class="button secondary"
-						class:active={ptt}
-						aria-pressed={ptt}
-						onclick={togglePtt}
-					>
-						{t.controls.ptt}
-					</button>
-				{/if}
-				<button class="button danger" onclick={leave}>{t.controls.leave}</button>
-			</div>
-			{#if voice && ptt}
-				<button
-					class="button primary hold"
-					class:holding
-					onpointerdown={() => hold(true)}
-					onpointerup={() => hold(false)}
-					onpointerleave={() => hold(false)}
-					onpointercancel={() => hold(false)}>{t.controls.hold}</button
-				>
-				<p class="hint">{t.controls.pttHint}</p>
-			{/if}
+			{#if people.length < 2}<p class="hint">{t.room.alone}</p>{/if}
 		</section>
 
 		<section class="card panel chat" aria-label={t.chat.title}>
@@ -538,7 +584,7 @@
 		width: 100%;
 	}
 
-	input:not([type='range']) {
+	input {
 		flex: 1;
 		min-width: 0;
 		min-height: 46px;
@@ -605,49 +651,73 @@
 		color: var(--accent);
 	}
 
-	.count,
-	.rtt {
+	.count {
 		color: var(--muted);
+	}
+
+	.leave {
+		margin-left: auto;
+		min-height: 36px;
+		padding: 0 16px;
+		font-size: 0.85rem;
 	}
 
 	.members {
 		display: grid;
-		gap: 8px;
+		gap: 10px;
 		margin: 0;
 		padding: 0;
 		list-style: none;
 	}
 
-	.member {
+	/* One card per person. Grey when quiet, green while speaking, red when
+	   their microphone is off; our own card has a tinted background. */
+	.person {
+		--state: var(--muted);
 		display: flex;
 		align-items: center;
 		gap: 12px;
 		padding: 10px 12px;
 		border: 1px solid var(--line);
-		border-radius: 14px;
+		border-radius: 16px;
+		transition: border-color 0.15s;
+	}
+
+	.person.mine {
+		background: color-mix(in srgb, var(--accent) 7%, transparent);
+	}
+
+	.person.talking {
+		--state: var(--accent);
+		border-color: var(--accent);
+	}
+
+	.person.off {
+		--state: #c2410c;
 	}
 
 	.avatar {
 		display: grid;
 		place-items: center;
 		flex: none;
-		width: 38px;
-		height: 38px;
+		width: 40px;
+		height: 40px;
 		border-radius: 50%;
 		background: var(--line);
 		font-weight: 700;
 		transition: box-shadow 0.15s;
 	}
 
-	.member.speaking .avatar {
+	.person.talking .avatar {
 		background: var(--accent);
 		color: var(--bg);
-		box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 35%, transparent);
+		box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 30%, transparent);
 	}
 
 	.who {
 		display: grid;
 		flex: 1;
+		gap: 4px;
 		min-width: 0;
 	}
 
@@ -664,36 +734,77 @@
 		font-style: normal;
 	}
 
-	.meta {
-		color: var(--muted);
-		font-size: 0.8rem;
-	}
-
-	.volume {
-		width: 96px;
-		accent-color: var(--accent);
-	}
-
-	.controls {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 10px;
-	}
-
-	.button.active {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.hold {
+	.wave {
 		width: 100%;
-		min-height: 64px;
-		touch-action: none;
-		user-select: none;
+		height: 24px;
+		fill: var(--state);
+		transition: fill 0.15s;
 	}
 
-	.hold.holding {
-		filter: brightness(1.15);
+	.person.off .wave {
+		opacity: 0.4;
+	}
+
+	.actions {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.icon {
+		width: 20px;
+		height: 20px;
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 1.8;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+
+	.toggle,
+	.state {
+		display: grid;
+		place-items: center;
+		width: 40px;
+		height: 40px;
+		border-radius: 50%;
+	}
+
+	.toggle {
+		border: 1px solid var(--line-strong);
+		background: var(--bg);
+		color: var(--ink);
+		cursor: pointer;
+	}
+
+	.toggle:hover {
+		border-color: var(--accent);
+	}
+
+	.toggle.on {
+		border-color: #c2410c;
+		background: color-mix(in srgb, #c2410c 12%, var(--bg));
+		color: #c2410c;
+	}
+
+	.state {
+		width: 28px;
+		height: 28px;
+		color: #c2410c;
+	}
+
+	.state .icon {
+		width: 18px;
+		height: 18px;
+	}
+
+	.sr {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
 	}
 
 	.log {

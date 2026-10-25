@@ -164,7 +164,7 @@ class Playback extends AudioWorkletProcessor {
     }
     for (const channel of outputs[0].slice(1)) channel.set(out);
     if (started.length) this.port.postMessage({ type: "played", started, time: currentTime });
-    if (currentTime - this.reported >= 0.1) {
+    if (currentTime - this.reported >= 0.04) {
       this.reported = currentTime;
       const levels = [];
       for (const [member, s] of this.speakers) {
@@ -244,6 +244,8 @@ export class Voice extends EventTarget {
   #decoders = new Map();
   #seq = 0;
   #active = 0; // frames of speech still to send (hangover)
+  #micLevel = 0;
+  #transmitting = false;
   #preroll = [];
   #speaking = new Set();
   #levels = new Map();
@@ -322,6 +324,16 @@ export class Voice extends EventTarget {
     this.#playback.port.postMessage({ type: "gain", member, gain });
   }
 
+  /** The microphone's level over the latest frame (RMS, 0–1), muted or not. */
+  get micLevel() {
+    return this.#micLevel;
+  }
+
+  /** Whether our voice is being sent right now: unmuted, and speaking (or `vad: false`). */
+  get transmitting() {
+    return this.#transmitting;
+  }
+
   /** Who is speaking right now (our own ID included). */
   get speaking() {
     return new Set(this.#speaking);
@@ -365,6 +377,8 @@ export class Voice extends EventTarget {
     if (this.muted) this.#active = 0;
     else if (loud) this.#active = Math.ceil(300 / (this.#frameUs / 1000)); // 300 ms hangover
     else if (this.#active > 0) this.#active--;
+    this.#micLevel = rms;
+    this.#transmitting = this.#active > 0;
     this.#setSpeaking(this.#conn.id, this.#active > 0);
     this.#options.onCapture?.(seq & 0xffff, performance.now(), time);
     this.#encoder.encode(

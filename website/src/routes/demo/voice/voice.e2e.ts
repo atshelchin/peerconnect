@@ -52,19 +52,45 @@ test('three browsers hear each other and chat', async ({ browser }) => {
 	await c.getByRole('button', { name: 'Join with microphone' }).click();
 
 	for (const page of [a, b, c]) {
-		await expect(page.locator('.member')).toHaveCount(3, { timeout: 60_000 });
+		await expect(page.locator('.person')).toHaveCount(3, { timeout: 60_000 });
 		await expect(page.locator('.status.online')).toBeVisible();
 	}
-	await expect(a.locator('.member .name')).toContainText(['Alice', '小明', 'Carol']);
+	// Ourselves first, then the others (in the order they happened to arrive).
+	await expect(a.locator('.person').first()).toHaveClass(/mine/);
+	await expect(a.locator('.person').first()).toContainText('Alice');
+	for (const name of ['小明', 'Carol'])
+		await expect(a.locator('.person', { hasText: name })).toHaveCount(1);
 
-	// The fake microphone beeps: someone else is heard speaking, with stats.
-	await expect(a.locator('.member.speaking')).not.toHaveCount(0, { timeout: 30_000 });
-	await expect(a.locator('.member .meta').first()).toContainText('ms', { timeout: 30_000 });
+	// The fake microphones beep: our own card lights up as we speak, and so
+	// do the others' as we hear them.
+	await expect(a.locator('.person.mine.talking')).toBeVisible({ timeout: 30_000 });
+	await expect(a.locator('.person:not(.mine).talking')).not.toHaveCount(0, { timeout: 30_000 });
+
+	// Carol turns her microphone off, then stops listening: everyone sees it on her card.
+	const carol = a.locator('.person', { hasText: 'Carol' });
+	await c.getByRole('button', { name: 'Mute your microphone: nobody hears you' }).click();
+	await expect(c.locator('.person.mine')).toHaveClass(/off/);
+	// Off is a flat line: every bar of the waveform at its minimum.
+	await c.waitForTimeout(2000);
+	const heights = await c
+		.locator('.person.mine .wave rect')
+		.evaluateAll((bars) => bars.map((bar) => Number(bar.getAttribute('height'))));
+	expect(Math.max(...heights)).toBe(2);
+	await expect(carol.locator('.state')).toHaveCount(1, { timeout: 30_000 });
+	await expect(carol).toHaveClass(/off/);
+	await c.getByRole('button', { name: 'Turn your headphones off: you hear nobody' }).click();
+	await expect(carol.locator('.state')).toHaveCount(2, { timeout: 30_000 });
+	await c.getByRole('button', { name: 'Unmute your microphone' }).click();
+	await expect(carol.locator('.state')).toHaveCount(1, { timeout: 30_000 });
+
+	// Muting someone for oneself is on their card.
+	await a.getByRole('button', { name: 'Stop hearing 小明 (only for you)' }).click();
+	await expect(a.locator('.person', { hasText: '小明' })).toHaveClass(/off/);
 
 	await b.locator('#voice-message').fill('你好');
 	await b.locator('#voice-message').press('Enter');
 	for (const page of [a, b, c]) await expect(page.locator('.line')).toContainText(['小明 你好']);
 
 	await c.getByRole('button', { name: 'Leave' }).click();
-	await expect(a.locator('.member')).toHaveCount(2, { timeout: 30_000 });
+	await expect(a.locator('.person')).toHaveCount(2, { timeout: 30_000 });
 });

@@ -52,6 +52,10 @@ export interface VoiceEventMap {
 export class Voice extends EventTarget {
   readonly muted: boolean;
   readonly deafened: boolean;
+  /** The microphone's level over the latest frame (RMS, 0–1), muted or not: for a level meter. */
+  readonly micLevel: number;
+  /** Whether our voice is being sent right now: unmuted, and speaking (or `vad: false`). */
+  readonly transmitting: boolean;
   /** Who is speaking now. */
   readonly speaking: Set<string>;
   setMuted(muted: boolean): void;

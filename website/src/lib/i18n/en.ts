@@ -328,21 +328,15 @@ export const en = {
 			people: 'In the room',
 			you: 'you',
 			alone: 'Nobody else is here yet. Share the link.',
-			rtt: 'Round trip to the relay',
-			buffer: 'buffer',
-			lost: 'lost',
-			skipped: 'skipped',
-			volume: 'Volume for {name}'
-		},
-		controls: {
-			mute: 'Mute',
-			unmute: 'Unmute',
-			deafen: 'Mute others',
-			undeafen: 'Unmute others',
-			ptt: 'Push to talk',
-			pttHint: 'Hold Space, or hold the button, to talk.',
-			hold: 'Hold to talk',
-			leave: 'Leave'
+			leave: 'Leave',
+			micOn: 'Mute your microphone: nobody hears you',
+			micOff: 'Unmute your microphone',
+			hearOn: 'Turn your headphones off: you hear nobody',
+			hearOff: 'Hear everyone again',
+			muteThem: 'Stop hearing {name} (only for you)',
+			unmuteThem: 'Hear {name} again',
+			theirMicOff: '{name} muted their microphone',
+			theirHearingOff: '{name} turned their headphones off and hears nobody'
 		},
 		invite: {
 			title: 'Invite',
