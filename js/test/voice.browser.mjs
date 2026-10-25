@@ -4,10 +4,16 @@
 //
 //   node test/voice.browser.mjs        (needs ../target/debug/peerconnect-relay
 //                                       and Playwright's Chromium)
+//
+// It also plays speech-like audio through the fake microphone and checks
+// how much of it goes out and plays, over a clean path and one with TCP
+// stalls. VOICE_REMOTE=wss://relay.example.com measures only that, over a
+// real relay (VOICE_MAX_DELAY sets the jitter buffer's ceiling in ms).
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { createServer as createTcpServer, connect as tcpConnect } from "node:net";
 import { createRequire } from "node:module";
@@ -32,7 +38,11 @@ const relay = await new Promise((resolve, reject) => {
 // A proxy in front of the relay that delays what it forwards like a jittery
 // TCP path: each chunk by up to `network.jitter` ms more, never reordered,
 // and holds everything back while `network.stallUntil` is in the future.
-const network = { jitter: 0, stallUntil: 0 };
+const network = { jitter: 0, stallUntil: 0, lossChance: 0 };
+// Seeded, so that runs see the same stalls and can be compared.
+let state = 1;
+const random = () => ((state = (state * 48271) % 2147483647) / 2147483647);
+const reseed = () => (state = 1);
 const [relayHost, relayPort] = relay.slice("ws://".length).split(":");
 const proxy = createTcpServer((client) => {
   const upstream = tcpConnect(Number(relayPort), relayHost);
@@ -48,7 +58,9 @@ const proxy = createTcpServer((client) => {
       if (queue.length) timer = setTimeout(release, queue[0].at - Date.now());
     };
     from.on("data", (chunk) => {
-      const at = Math.max(last, Date.now() + Math.random() * network.jitter, network.stallUntil);
+      // A lost segment on a TCP path: everything waits for its retransmission.
+      const stall = random() < network.lossChance ? 100 + random() * 200 : 0;
+      const at = Math.max(last, Date.now() + random() * network.jitter + stall, network.stallUntil);
       last = at;
       queue.push({ at, chunk });
       if (!timer) timer = setTimeout(release, at - Date.now());
@@ -74,6 +86,52 @@ const server = createServer((req, res) => {
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const page_url = `http://127.0.0.1:${server.address().port}/test/browser-voice/index.html`;
+
+// Speech-like audio for the fake microphone: syllables at levels from loud
+// to barely audible, with pauses, over faint background noise.
+function speechWav() {
+  const rate = 48_000;
+  const samples = new Float32Array(rate * 12);
+  let seed = 7;
+  const random = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+  let t = 0.3;
+  while (t < 11.5) {
+    const words = 2 + Math.floor(random() * 5);
+    for (let w = 0; w < words && t < 11.5; w++) {
+      const length = 0.15 + random() * 0.25;
+      const db = [-18, -24, -30, -36, -42, -48][Math.floor(random() * 6)];
+      const amplitude = 10 ** (db / 20) * Math.SQRT2;
+      const f0 = 110 + random() * 110;
+      for (let i = 0; i < length * rate; i++) {
+        const x = i / rate;
+        const envelope = Math.min(1, x / 0.02, (length - x) / 0.04);
+        let v = 0;
+        for (let h = 1; h <= 6; h++) v += Math.sin(2 * Math.PI * f0 * h * x * (1 + 0.01 * Math.sin(6 * x))) / h;
+        samples[Math.floor((t + x) * rate)] += (amplitude * envelope * v) / 1.6;
+      }
+      t += length + 0.05 + random() * 0.2;
+    }
+    t += 0.4 + random() * 0.8; // between sentences
+  }
+  for (let i = 0; i < samples.length; i++) samples[i] += (random() - 0.5) * 2 * 10 ** (-66 / 20);
+  const data = Buffer.alloc(44 + samples.length * 2);
+  data.write("RIFF", 0);
+  data.writeUInt32LE(36 + samples.length * 2, 4);
+  data.write("WAVEfmt ", 8);
+  data.writeUInt32LE(16, 16);
+  data.writeUInt16LE(1, 20); // PCM
+  data.writeUInt16LE(1, 22); // mono
+  data.writeUInt32LE(rate, 24);
+  data.writeUInt32LE(rate * 2, 28);
+  data.writeUInt16LE(2, 32);
+  data.writeUInt16LE(16, 34);
+  data.write("data", 36);
+  data.writeUInt32LE(samples.length * 2, 40);
+  samples.forEach((v, i) => data.writeInt16LE(Math.round(Math.max(-1, Math.min(1, v)) * 32767), 44 + i * 2));
+  const path = join(mkdtempSync(join(tmpdir(), "peerconnect-voice-")), "speech.wav");
+  writeFileSync(path, data);
+  return path;
+}
 
 const browser = await chromium.launch({
   args: [
@@ -108,12 +166,64 @@ try {
   const stall = await run({ relay: proxied, vad: false, seconds: 8 });
   report("1 s stall, then 0-10 ms jitter", stall);
 
+  // Speech: how much of it goes out, and how smoothly it plays, on a clean
+  // path and on one where TCP stalls for a retransmission now and then.
+  const speech = await chromium.launch({
+    args: [
+      "--use-fake-ui-for-media-stream",
+      "--use-fake-device-for-media-stream",
+      `--use-file-for-fake-audio-capture=${speechWav()}`,
+      "--autoplay-policy=no-user-gesture-required",
+    ],
+  });
+  const quality = async (name, options) => {
+    const p = await speech.newPage();
+    await p.goto(page_url);
+    await p.waitForFunction(() => window.ready);
+    const r = await p.evaluate((o) => window.run(o), { seconds: 12, minDelay: 30, vad: true, ...options });
+    const s = r.stats ?? {};
+    console.log(
+      `${name}: speech frames sent ${r.sender.soundSent}/${r.sender.sound} ` +
+        `(${((100 * r.sender.soundSent) / Math.max(1, r.sender.sound)).toFixed(1)}%); ` +
+        `sound sent but never played ${r.lostSound}/${r.soundSent}; played ${s.played}, ` +
+        `concealed ${s.concealed}, dropped ${s.dropped}, late ${s.late}, underruns ${s.underruns}; ` +
+        `latency p50 ${r.p50?.toFixed(0)} ms, p99 ${r.p99?.toFixed(0)} ms`,
+    );
+    await p.close();
+    return r;
+  };
+  network.jitter = 0;
+  network.stallUntil = 0;
+  // VOICE_REMOTE=wss://… measures speech over a real relay instead, and stops.
+  if (process.env.VOICE_REMOTE) {
+    const maxDelay = Number(process.env.VOICE_MAX_DELAY) || undefined;
+    for (let i = 0; i < 2; i++) await quality(`speech via ${process.env.VOICE_REMOTE}`, { relay: process.env.VOICE_REMOTE, seconds: 25, maxDelay });
+    await speech.close();
+    await browser.close();
+    server.close();
+    proxy.close();
+    relayProcess.kill();
+    process.exit(0);
+  }
+  const clean = await quality("speech, clean path", { relay });
+  network.jitter = 20;
+  network.lossChance = 0.02; // about one stall every two seconds at this traffic
+  reseed();
+  const lossy = await quality("speech, TCP stalls", { relay: proxied, seconds: 25 });
+  network.lossChance = 0;
+  await speech.close();
+
   if (!process.env.NO_ASSERT) {
     assert.ok(direct.frames > 150 && direct.p50 < 40, "direct");
     assert.ok(vad.frames > 5 && vad.p50 < 80, "only speech");
     assert.ok(jitter.frames > 150 && jitter.p50 < 250 && jitter.stats.target < 0.25, "jitter");
     // After the stall the buffer catches up: latency at the end is back down.
     assert.ok(stall.tail < 150, `tail after a stall: ${stall.tail} ms`);
+    // Speech goes out whole, and plays whole: catching up after stalls
+    // shortens pauses and drops quiet frames, not words.
+    assert.ok(clean.sender.soundSent >= clean.sender.sound * 0.99, "speech sent on a clean path");
+    assert.equal(clean.lostSound, 0, "speech lost on a clean path");
+    assert.ok(lossy.lostSound <= lossy.soundSent * 0.02, `speech lost to stalls: ${lossy.lostSound}/${lossy.soundSent}`);
   }
 } finally {
   await browser.close();

@@ -19,6 +19,8 @@ const RATE = 48_000;
 // speakers through per-speaker jitter buffers.
 const WORKLET = String.raw`
 const RATE = 48000;
+// A frame quieter than this (RMS, about -50 dBFS) can be dropped unheard.
+const QUIET = 0.0032;
 
 class Capture extends AudioWorkletProcessor {
   constructor(options) {
@@ -53,6 +55,8 @@ class Speaker {
     this.seconds = frame / RATE;
     this.config = config;
     this.frames = new Map();
+    this.quiet = new Set(); // buffered frames with little sound in them
+    this.skip = new Set(); // frames dropped to catch up: pass over them without a gap
     this.next = null; // the frame to play next, while playing
     this.current = null;
     this.position = 0;
@@ -61,7 +65,7 @@ class Speaker {
     this.gain = 1;
     this.energy = 0;
     this.samples = 0;
-    this.stats = { late: 0, concealed: 0, dropped: 0, played: 0 };
+    this.stats = { late: 0, concealed: 0, dropped: 0, played: 0, underruns: 0 };
   }
   push(seq, pcm, hold) {
     if (this.next !== null && seq < this.next) {
@@ -69,6 +73,9 @@ class Speaker {
       return;
     }
     this.frames.set(seq, pcm);
+    let energy = 0;
+    for (const v of pcm) energy += v * v;
+    if (Math.sqrt(energy / pcm.length) < QUIET) this.quiet.add(seq);
     // Jitter: the spread of (arrival - seq × frame - time the sender held
     // it) over the last 2 s.
     this.offsets.push(currentTime - seq * this.seconds - hold);
@@ -87,9 +94,22 @@ class Speaker {
     let i = 0;
     while (i < out.length) {
       if (!this.current) {
+        if (this.skip.delete(this.next)) {
+          this.next++; // dropped to catch up: no gap
+          continue;
+        }
         const pcm = this.frames.get(this.next);
+        const behind = this.buffered() > this.target + 2 * this.seconds;
+        if (!pcm && behind && this.frames.size) {
+          // A pause between words (the sender sent nothing) while we are
+          // behind: shorten it, which nobody hears, rather than play it out.
+          this.next = Math.min(...this.frames.keys());
+          this.stats.shortened = (this.stats.shortened ?? 0) + 1;
+          continue;
+        }
         if (pcm) {
           this.frames.delete(this.next);
+          this.quiet.delete(this.next);
           this.current = pcm;
           this.position = 0;
           this.stats.played++;
@@ -98,6 +118,7 @@ class Speaker {
           // Underrun: the talk spurt is over, or the network stalled.
           // Wait to rebuffer.
           this.next = null;
+          this.stats.underruns++;
           return;
         } else {
           // A frame lost on the way: play silence in its place.
@@ -120,12 +141,20 @@ class Speaker {
         this.next++;
       }
     }
-    // Behind after a stall: skip ahead rather than play late.
+    // Behind after a stall: catch up rather than play late. Drop quiet
+    // frames first, wherever they are; speech only when far behind.
+    if (this.next !== null) for (const seq of this.skip) if (seq < this.next) this.skip.delete(seq);
     while (this.buffered() > this.target + 2 * this.seconds) {
-      const oldest = Math.min(...this.frames.keys());
-      this.frames.delete(oldest);
+      let victim = null;
+      for (const seq of this.quiet) if (victim === null || seq < victim) victim = seq;
+      if (victim === null) {
+        if (this.buffered() <= this.target + 10 * this.seconds) break;
+        victim = Math.min(...this.frames.keys());
+      }
+      this.frames.delete(victim);
+      this.quiet.delete(victim);
+      this.skip.add(victim);
       this.stats.dropped++;
-      if (this.next !== null && oldest >= this.next) this.next = oldest + 1;
     }
   }
 }
@@ -379,6 +408,7 @@ export class Voice extends EventTarget {
     else if (this.#active > 0) this.#active--;
     this.#micLevel = rms;
     this.#transmitting = this.#active > 0;
+    this.#options.onFrame?.({ seq: seq & 0xffff, rms, sending: this.#transmitting });
     this.#setSpeaking(this.#conn.id, this.#active > 0);
     this.#options.onCapture?.(seq & 0xffff, performance.now(), time);
     this.#encoder.encode(

@@ -7,7 +7,9 @@
 
   // Two members in one page; measures, per frame of a's voice, the time from
   // the end of its capture to the start of its playout at b.
-  window.run = async ({ relay, seconds, vad, minDelay }) => {
+  window.run = async ({ relay, seconds, vad, minDelay, maxDelay }) => {
+    // Frames with sound in them (over -55 dBFS), and how many of those went out.
+    const sender = { sound: 0, soundSent: 0, sent: 0 };
     const group = Group.create(relay);
     const a = joinGroup(group, { profile: "a" });
     const b = joinGroup(group, { profile: "b" });
@@ -18,18 +20,37 @@
     });
     let sent = 0;
     let received = 0;
+    // Which frames went out with sound in them, and which of those played.
+    const soundSeqs = new Set();
+    const playedSeqs = new Set();
     const send = a.sendVoice.bind(a);
-    a.sendVoice = (seq, data) => (sent++, send(seq, data));
+    a.sendVoice = (seq, data) => {
+      sent++;
+      return send(seq, data);
+    };
     b.addEventListener("voice", () => received++);
     const captured = new Map();
     const latencies = [];
     const tail = []; // the last 2 s
     let end = 0;
-    const va = await startVoice(a, { vad, onCapture: (seq, now) => captured.set(seq, now) });
+    const va = await startVoice(a, {
+      vad,
+      onCapture: (seq, now) => captured.set(seq, now),
+      onFrame: ({ seq, rms, sending }) => {
+        if (end && sending && rms > 10 ** (-55 / 20) && performance.now() < end - 1000) soundSeqs.add(seq);
+        // From a second after the measurement starts.
+        if (end && performance.now() > end - seconds * 1000 + 1000) {
+          if (rms > 10 ** (-55 / 20)) (sender.sound++, sending && sender.soundSent++);
+          if (sending) sender.sent++;
+        }
+      },
+    });
     const vb = await startVoice(b, {
       vad,
       minDelay,
+      maxDelay,
       onPlay: (member, seq, now) => {
+        if (member === a.id) playedSeqs.add(seq);
         if (member === a.id && captured.has(seq)) {
           latencies.push(now - captured.get(seq));
           if (now > end - 2000) tail.push(now - captured.get(seq));
@@ -60,6 +81,9 @@
       output,
       sent,
       received,
+      sender,
+      lostSound: [...soundSeqs].filter((s) => !playedSeqs.has(s)).length,
+      soundSent: soundSeqs.size,
     };
   };
   window.ready = true;
