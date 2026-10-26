@@ -382,7 +382,13 @@ export const en = {
 			},
 			switchCamera: 'Switch camera (front and back)',
 			rotateMine: 'Turn your picture a quarter turn, for everyone',
-			rotateTheirs: 'Turn {name}’s picture a quarter turn (only for you)'
+			rotateTheirs: 'Turn {name}’s picture a quarter turn (only for you)',
+			network: {
+				good: 'Network: good',
+				fair: 'Network: fair',
+				poor: 'Network: poor'
+			},
+			videoPaused: 'Your connection is slow: video is paused, voice continues.'
 		},
 		invite: {
 			title: 'Invite',

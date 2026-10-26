@@ -60,6 +60,11 @@ test('three browsers hear each other and chat', async ({ browser }) => {
 		await expect(page.locator('.person')).toHaveCount(3, { timeout: 60_000 });
 		await expect(page.locator('.status.online')).toBeVisible();
 	}
+	// The network on each card, in each page's language.
+	await expect(b.locator('.person.mine').getByRole('img', { name: /^网络：/ })).toBeVisible();
+	await expect(
+		b.locator('.person', { hasText: 'Alice' }).getByRole('img', { name: /^网络：/ })
+	).toBeVisible({ timeout: 30_000 });
 	// Ourselves first, then the others (in the order they happened to arrive).
 	await expect(a.locator('.person').first()).toHaveClass(/mine/);
 	await expect(a.locator('.person').first()).toContainText('Alice');
@@ -142,6 +147,12 @@ test('two browsers see each other on their cards', async ({ browser }) => {
 	await b.getByRole('button', { name: 'Join', exact: true }).click();
 	for (const page of [a, b])
 		await expect(page.locator('.person')).toHaveCount(2, { timeout: 60_000 });
+	// Each card shows its member's network: ours as we judge it, theirs as they say.
+	const network = /^Network: (good|fair|poor)$/;
+	await expect(a.locator('.person.mine').getByRole('img', { name: network })).toBeVisible();
+	await expect(
+		b.locator('.person', { hasText: 'Alice' }).getByRole('img', { name: network })
+	).toBeVisible({ timeout: 30_000 });
 
 	await a.getByRole('button', { name: 'Turn your camera on: everyone sees you' }).click();
 	// Bob sees Alice's video on her card: a canvas with a picture in it.

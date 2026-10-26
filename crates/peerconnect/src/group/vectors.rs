@@ -357,6 +357,9 @@ fn generate() -> String {
     field("subscribe_r", text(&hex(&wire::subscribe(2, Some(2)))));
     field("subscribe_r_none", text(&hex(&wire::subscribe(2, None))));
     field("demand_s", text(&hex(&wire::demand(0b110))));
+    // The relay tells R its link takes layers up to 1 now, then none.
+    field("limit_r", text(&hex(&wire::limit(Some(1)))));
+    field("limit_r_none", text(&hex(&wire::limit(None))));
     field("member_arrived", text(&hex(&wire::member(2, true))));
     field("member_left", text(&hex(&wire::member(2, false))));
     out.push_str("  \"frames\": [\n");

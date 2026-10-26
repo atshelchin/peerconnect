@@ -221,6 +221,12 @@ export class GroupConnection extends EventTarget {
   id;
   /** Which of our video layers the relay last said are wanted (bit n: layer n), if it has. */
   videoDemand = undefined;
+  /**
+   * The largest video layer our link takes now, as the relay last said
+   * ("videolimit"): 3, all of them, until it says otherwise; `null`, none
+   * (the link is too slow: audio only).
+   */
+  videoLimit = 3;
 
   #member;
   /** The open session to the relay. */
@@ -230,6 +236,8 @@ export class GroupConnection extends EventTarget {
   #webTransport;
   #timer = undefined;
   #epoch = performance.now();
+  /** Video bytes dropped by sessions before the open one. */
+  #videoDropped = 0;
 
   constructor(group, identity, profile, webTransport) {
     super();
@@ -247,6 +255,17 @@ export class GroupConnection extends EventTarget {
   /** The latest round trip to the relay, in milliseconds. */
   get rtt() {
     return this.#member.rtt;
+  }
+
+  /**
+   * How far our own video is backed up on the way out: bytes waiting to be
+   * sent now, and bytes dropped (the oldest, past the backlog) since we
+   * joined. Cheap to read: `peerconnect/video` reads it every frame to stop
+   * its largest layer while the uplink cannot carry them all.
+   */
+  get videoBacklog() {
+    const link = this.#link;
+    return { queued: link?.videoQueued ?? 0, dropped: this.#videoDropped + (link?.videoDropped ?? 0) };
   }
 
   /**
@@ -357,6 +376,9 @@ export class GroupConnection extends EventTarget {
           this.videoDemand = out.layers;
           this.#emit(out);
           break;
+        case "videolimit":
+          this.#limit(out.layer);
+          break;
         default:
           this.#emit(out);
       }
@@ -379,6 +401,12 @@ export class GroupConnection extends EventTarget {
     this.dispatchEvent(new CustomEvent(type, { detail }));
   }
 
+  #limit(layer) {
+    if (layer === this.videoLimit) return;
+    this.videoLimit = layer;
+    this.dispatchEvent(new CustomEvent("videolimit", { detail: { layer } }));
+  }
+
   #send(frame, kind) {
     this.#link?.send(frame, kind);
   }
@@ -391,6 +419,8 @@ export class GroupConnection extends EventTarget {
         if (link !== this.#opening) return link.close();
         this.#opening = null;
         this.#link = link;
+        // The relay starts each session with no limit, and says only when it sets one.
+        this.#limit(3);
         this.#member.handleOpen(this.#now());
         this.#pump();
       },
@@ -405,7 +435,10 @@ export class GroupConnection extends EventTarget {
         this.#pump();
       },
       close: (link, code) => {
-        if (link === this.#link) this.#link = null;
+        if (link === this.#link) {
+          this.#link = null;
+          this.#videoDropped += link.videoDropped;
+        }
         else if (link === this.#opening) this.#opening = null;
         else return;
         this.#member.handleClose(this.#now(), code);
@@ -426,6 +459,7 @@ export class GroupConnection extends EventTarget {
   #disconnect() {
     const [opening, link] = [this.#opening, this.#link];
     this.#opening = this.#link = null;
+    this.#videoDropped += link?.videoDropped ?? 0;
     opening?.close();
     link?.close();
   }
@@ -449,6 +483,8 @@ class WebTransportLink {
   /** Video frames waiting for room among the datagrams. */
   #video = [];
   #videoBytes = 0;
+  /** Video bytes dropped from that queue, for falling behind. */
+  #videoDropped = 0;
   #pacing = false;
 
   constructor(url, on, options) {
@@ -484,7 +520,11 @@ class WebTransportLink {
     if (kind === 4) {
       this.#video.push(frame);
       this.#videoBytes += frame.length;
-      while (this.#videoBytes > VIDEO_BACKLOG) this.#videoBytes -= this.#video.shift().length;
+      while (this.#videoBytes > VIDEO_BACKLOG) {
+        const dropped = this.#video.shift().length;
+        this.#videoBytes -= dropped;
+        this.#videoDropped += dropped;
+      }
       this.#paceVideo();
       return;
     }
@@ -499,6 +539,15 @@ class WebTransportLink {
 
   ping() {
     this.#queue(0, new Uint8Array(0));
+  }
+
+  /** Video bytes waiting for room among the datagrams (or on the video stream). */
+  get videoQueued() {
+    return this.#videoBytes + this.#queued[4];
+  }
+
+  get videoDropped() {
+    return this.#videoDropped;
   }
 
   /**

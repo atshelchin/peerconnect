@@ -1,7 +1,10 @@
 // Video in a real browser (headless Chromium, its fake camera, WebCodecs):
 // two members in one page through the Rust relay over WebTransport, then
 // through a path that loses UDP datagrams; then simulcast, three members,
-// each receiver getting the layer that suits the size it shows the video at.
+// each receiver getting the layer that suits the size it shows the video at;
+// then a receiver behind a slow downlink, which the relay moves to a smaller
+// layer and back, and a sender behind a slow uplink, which stops its largest
+// layer and starts it again.
 //
 //   cargo build -p peerconnect-relay && node test/video.browser.mjs
 //
@@ -49,23 +52,39 @@ const port = await new Promise((resolve, reject) => {
 let state = 1;
 const random = () => (state = (state * 48271) % 2147483647) / 2147483647;
 
-// UDP, each datagram lost with `udp.loss` and delayed by up to 10 ms.
-const udp = { loss: 0 };
+// UDP, each datagram lost with `udp.loss` and delayed by up to 10 ms; or,
+// with `udp.up` or `udp.down` (bits per second, towards the relay and back),
+// through a link of that rate with a buffer of `BUFFERED` ms, beyond which
+// datagrams are dropped, as a slow link's router would.
+const udp = { loss: 0, up: 0, down: 0 };
+const BUFFERED = 500;
 const udpProxy = createSocket("udp4");
 const upstreams = new Map();
+/** Delivers datagrams as the proxy's settings say, `rate()` being this direction's. */
+function pipe(rate, deliver) {
+  let free = 0; // when the link is next free to start a datagram
+  return (datagram) => {
+    if (random() < udp.loss) return;
+    const bps = rate();
+    if (!bps) return setTimeout(() => deliver(datagram), random() * 10);
+    const now = performance.now();
+    const at = Math.max(now, free);
+    if (at - now > BUFFERED) return;
+    free = at + (datagram.length * 8 * 1000) / bps;
+    setTimeout(() => deliver(datagram), free - now);
+  };
+}
 udpProxy.on("message", (message, from) => {
   const k = `${from.address}:${from.port}`;
   let up = upstreams.get(k);
   if (!up) {
-    up = createSocket("udp4");
-    up.on("message", (reply) => {
-      if (random() < udp.loss) return;
-      setTimeout(() => udpProxy.send(reply, from.port, from.address), random() * 10);
-    });
+    const socket = createSocket("udp4");
+    const back = pipe(() => udp.down, (reply) => udpProxy.send(reply, from.port, from.address));
+    socket.on("message", back);
+    up = { socket, send: pipe(() => udp.up, (datagram) => socket.send(datagram, port, "127.0.0.1")) };
     upstreams.set(k, up);
   }
-  if (random() < udp.loss) return;
-  setTimeout(() => up.send(message, port, "127.0.0.1"), random() * 10);
+  up.send(message);
 });
 await new Promise((r) => udpProxy.bind(0, "127.0.0.1", r));
 
@@ -128,6 +147,105 @@ try {
   console.log(`simulcast, b small: demand ${demand(sim.bSmall)}, encoders ${encoders(sim.bSmall)}; b now layer ${sim.bSmall.b.layer} (${decoded(sim.bSmall.b)}), longest gap ${sim.gap.toFixed(0)} ms`);
   console.log(`simulcast latency: ${latency}`);
 
+  // Adapting to slow links: the proxy's rate, limited and lifted while the page runs.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const live = (fn, arg) => page.evaluate(fn, arg);
+  /** Polls the page until `fn` (run there, on `window.live`) is true, for up to `ms`; false if it never was. */
+  const until = async (fn, arg, ms) => {
+    for (const end = Date.now() + ms; Date.now() < end; await sleep(100)) {
+      if (await live(fn, arg)) return true;
+    }
+    return false;
+  };
+  const adapt = async (slow, steps) => {
+    const done = page.evaluate((o) => window.adaptation(o), {
+      relay: `https://127.0.0.1:${port}`,
+      proxied: `https://127.0.0.1:${udpProxy.address().port}`,
+      hash,
+      slow,
+    });
+    await page.waitForFunction(() => window.live);
+    try {
+      await steps();
+    } finally {
+      udp.up = udp.down = 0;
+      await page.evaluate(() => window.finish());
+    }
+    return done;
+  };
+  const mark = (label) => live((l) => window.mark(l), label);
+  const markAt = (r, label) => r.marks.find((m) => m.label === label)?.t;
+  /** The decoded frames of `who` from `from` to `to` ms: the layers among them, and the longest gap. */
+  const frames = (r, who, from, to = Infinity) => {
+    const list = r.frames[who].filter((f) => f.t >= from && f.t < to);
+    let gap = 0;
+    for (let i = 1; i < list.length; i++) gap = Math.max(gap, list[i].t - list[i - 1].t);
+    return { count: list.length, layers: [...new Set(list.map((f) => f.layer))], gap, first: (layer) => list.find((f) => f.layer === layer)?.t };
+  };
+
+  const decodedSince = (who, layer, label) => until(([w, l, m]) => window.decodedSince(w, l, m), [who, layer, label], 30_000);
+
+  // A receiver behind a slow downlink: the relay moves it to layer 1, c keeps layer 2.
+  let downOk = {};
+  const down = await adapt("b", async () => {
+    await sleep(4000);
+    udp.down = 1_000_000;
+    await mark("limited");
+    downOk.moved = await until(() => window.live.limits.b.some((e) => e.layer === 1) && window.decodedSince("b", 1, "limited"), undefined, 15_000);
+    await mark("moved");
+    await sleep(3000);
+    udp.down = 0;
+    await mark("lifted");
+    downOk.back = await decodedSince("b", 2, "lifted");
+    await sleep(1000);
+  });
+  {
+    const [limited, lifted] = [markAt(down, "limited"), markAt(down, "lifted")];
+    const toOne = down.limits.b.find((e) => e.t > limited && e.layer === 1)?.t;
+    const firstOne = frames(down, "b", limited).first(1);
+    const backTwo = frames(down, "b", lifted).first(2);
+    const backLimit = down.limits.b.find((e) => e.t > lifted && e.layer === 2)?.t;
+    const cDuring = frames(down, "c", limited);
+    console.log(
+      `slow downlink (1 Mbit/s): b videolimit ${JSON.stringify(down.limits.b)}; ` +
+        `limit after ${toOne - limited} ms, b's first layer 1 frame after ${firstOne - limited} ms; ` +
+        `lifted: limit 2 after ${backLimit - lifted} ms, b's first layer 2 frame after ${backTwo - lifted} ms; ` +
+        `c: layers ${cDuring.layers} (${cDuring.count} frames, longest gap ${cDuring.gap} ms), videolimit ${JSON.stringify(down.limits.c)}`,
+    );
+    downOk = { ...downOk, toOne, firstOne, backTwo, cDuring, limited, lifted };
+  }
+
+  // A sender behind a slow uplink: it stops layer 2, and b, which asked for it, gets layer 1.
+  let upOk = {};
+  const capped = () => window.live.uplink.at(-1)?.cappedAt === 1;
+  const up = await adapt("a", async () => {
+    await sleep(4000);
+    udp.up = 800_000;
+    await mark("limited");
+    upOk.capped = await until(capped, undefined, 15_000);
+    upOk.moved = await decodedSince("b", 1, "limited");
+    await sleep(3000);
+    udp.up = 0;
+    await mark("lifted");
+    upOk.back = await decodedSince("b", 2, "lifted");
+    await sleep(1000);
+  });
+  {
+    const [limited, lifted] = [markAt(up, "limited"), markAt(up, "lifted")];
+    const cap = up.uplink.find((u) => u.t > limited && u.cappedAt === 1)?.t;
+    const restart = up.uplink.find((u) => u.t > lifted && u.cappedAt === null)?.t;
+    const firstOne = frames(up, "b", cap ?? limited).first(1);
+    const backTwo = frames(up, "b", lifted).first(2);
+    const bMove = frames(up, "b", (cap ?? limited) - 500, (cap ?? limited) + 4000);
+    console.log(
+      `slow uplink (800 kbit/s): a's uplink ${JSON.stringify(up.uplink)}; ` +
+        `capped after ${cap - limited} ms, b's first layer 1 frame ${firstOne - cap} ms after that, longest gap in b's frames around it ${bMove.gap} ms; ` +
+        `lifted: layer 2 again after ${restart - lifted} ms, b's first layer 2 frame after ${backTwo - lifted} ms; ` +
+        `a's videolimit ${JSON.stringify(up.limits.a)}, b's ${JSON.stringify(up.limits.b)}`,
+    );
+    upOk = { ...upOk, cap, restart, firstOne, backTwo, bMove, limited, lifted };
+  }
+
   if (!process.env.NO_ASSERT) {
     assert.deepEqual(sim.connected, [true, true, true], "simulcast over WebTransport");
     // Large for b, small for c: both layers, each to its receiver.
@@ -160,6 +278,27 @@ try {
     assert.equal(sim.bSmall.b.errors, 0, "decode errors");
     for (const q of Object.values(sim.latency)) assert.ok(q.p99 < 150, `simulcast p99 ${q.p99} ms`);
 
+    // The slow downlink: b moves to layer 1 and back to 2, c is untouched.
+    assert.deepEqual(down.connected, [true, true, true], "slow downlink: still connected");
+    assert.ok(downOk.moved, "b was limited to layer 1 and got it");
+    assert.ok(downOk.firstOne - downOk.limited < 10_000, "b on layer 1 within 10 s");
+    assert.ok(downOk.back, "b back on layer 2 after the limit was lifted");
+    assert.ok(downOk.backTwo - downOk.lifted < 15_000, `b on layer 2 again ${downOk.backTwo - downOk.lifted} ms after`);
+    assert.deepEqual(downOk.cDuring.layers, [2], "c keeps layer 2");
+    assert.ok(downOk.cDuring.gap < 1000, `c's longest gap ${downOk.cDuring.gap} ms`);
+    assert.deepEqual(down.limits.c, [], "c is never limited");
+    // The slow uplink: a stops layer 2 and starts it again; b follows.
+    assert.deepEqual(up.connected, [true, true, true], "slow uplink: still connected");
+    assert.ok(upOk.capped, "a capped its uplink at layer 1");
+    assert.ok(upOk.moved, "b got layer 1 once a stopped layer 2");
+    assert.ok(upOk.firstOne - upOk.cap < 3000, `b on layer 1 ${upOk.firstOne - upOk.cap} ms after the cap`);
+    // The relay moves b a second after layer 2's last frames reach it, late through the
+    // full buffer; those may be lost too, and b asks for a keyframe if ours came too early.
+    assert.ok(upOk.bMove.gap < 2500, `b's longest gap while it moved: ${upOk.bMove.gap} ms`);
+    assert.ok(upOk.back, "b back on layer 2 after the limit was lifted");
+    assert.ok(upOk.restart - upOk.lifted < 15_000, `a restarted layer 2 ${upOk.restart - upOk.lifted} ms after`);
+    assert.equal(up.stats.a.uplink.cappedAt, null, "a's uplink uncapped at the end");
+
     for (const r of [wt, wtLossy]) assert.deepEqual(r.connected, [true, true], "over WebTransport");
     assert.ok(wt.sent.sent > 100, `${wt.sent.sent} sent`);
     assert.ok(wt.received.decoded >= wt.sent.sent * 0.95, `${wt.received.decoded} of ${wt.sent.sent} decoded`);
@@ -176,7 +315,7 @@ try {
   await browser.close();
   server.close();
   udpProxy.close();
-  for (const up of upstreams.values()) up.close();
+  for (const up of upstreams.values()) up.socket.close();
   relayProcess.kill();
 }
 process.exit(failed ? 1 : 0);

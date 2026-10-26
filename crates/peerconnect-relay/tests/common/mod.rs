@@ -391,6 +391,9 @@ pub async fn events_for(conn: &mut GroupConnection, period: Duration) -> Vec<Eve
 pub struct Path {
     pub addr: SocketAddr,
     pub loss_per_mille: Arc<AtomicU32>,
+    /// Relay → member rate, kbit/s (0: unlimited), with a deep buffer:
+    /// packets that would wait more than half a second are dropped.
+    pub down_kbps: Arc<AtomicU32>,
     pub blocked: Arc<AtomicBool>,
     pub rebind: mpsc::UnboundedSender<()>,
     client: Arc<Mutex<Option<SocketAddr>>>,
@@ -402,6 +405,8 @@ impl Path {
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = udp.local_addr().unwrap();
         let loss_per_mille = Arc::new(AtomicU32::new(0));
+        let down_kbps = Arc::new(AtomicU32::new(0));
+        let next_free = Arc::new(Mutex::new(tokio::time::Instant::now()));
         let blocked = Arc::new(AtomicBool::new(false));
         let (rebind, mut rebinds) = mpsc::unbounded_channel::<()>();
         let downstream = Arc::new(udp);
@@ -439,15 +444,30 @@ impl Path {
         // Relay → member, from whichever upstream socket is current.
         let read_upstream = {
             let (client, to_client, drop_it) = (client.clone(), to_client.clone(), drop_it.clone());
+            let (down_kbps, next_free) = (down_kbps.clone(), next_free.clone());
             move |socket: Arc<UdpSocket>| {
                 let (client, to_client, drop_it) = (client.clone(), to_client.clone(), drop_it.clone());
+                let (down_kbps, next_free) = (down_kbps.clone(), next_free.clone());
                 tokio::spawn(async move {
                     let mut buf = vec![0; 65536];
                     while let Ok((n, _)) = socket.recv_from(&mut buf).await {
                         let Some(to) = *client.lock().unwrap() else { continue };
-                        if !drop_it() {
-                            let _ = to_client.send((tokio::time::Instant::now() + one_way, buf[..n].to_vec(), to));
+                        if drop_it() {
+                            continue;
                         }
+                        let now = tokio::time::Instant::now();
+                        let mut leaves = now;
+                        let kbps = down_kbps.load(Ordering::Relaxed);
+                        if kbps > 0 {
+                            let mut free = next_free.lock().unwrap();
+                            let start = (*free).max(now);
+                            if start - now > Duration::from_millis(500) {
+                                continue; // the buffer is full
+                            }
+                            leaves = start + Duration::from_micros(n as u64 * 8 * 1000 / kbps as u64);
+                            *free = leaves;
+                        }
+                        let _ = to_client.send((leaves + one_way, buf[..n].to_vec(), to));
                     }
                 })
             }
@@ -485,7 +505,7 @@ impl Path {
                 }
             });
         }
-        Path { addr, loss_per_mille, blocked, rebind, client, cut_off }
+        Path { addr, loss_per_mille, down_kbps, blocked, rebind, client, cut_off }
     }
 
     pub fn url(&self, scheme: &str) -> String {

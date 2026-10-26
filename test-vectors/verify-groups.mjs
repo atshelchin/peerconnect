@@ -68,6 +68,9 @@ assert.deepEqual(hex(v.welcome_r), cat([0x83, 0], u32(1 << 2)));
 assert.deepEqual(hex(v.subscribe_r), Buffer.from([0x85, 2, 2]));
 assert.deepEqual(hex(v.subscribe_r_none), Buffer.from([0x85, 2, 0xff]));
 assert.deepEqual(hex(v.demand_s), Buffer.from([0x86, 0b110]));
+// LIMIT: the largest layer the member's link takes now, 0xFF for none.
+assert.deepEqual(hex(v.limit_r), Buffer.from([0x87, 1]));
+assert.deepEqual(hex(v.limit_r_none), Buffer.from([0x87, 0xff]));
 assert.deepEqual(hex(v.member_arrived), Buffer.from([0x84, 2, 1]));
 assert.deepEqual(hex(v.member_left), Buffer.from([0x84, 2, 0]));
 

@@ -201,5 +201,74 @@
     return { connected, both, cStopped, cGone, bMoved, bSmall, gap, latency };
   };
 
+  /** Joins `group` through another relay address (a proxy in front of the same relay). */
+  const via = (group, relay) => Group.parse(group.toString().replace(group.relay, relay));
+
+  /**
+   * Three members, a sending layers 1 (640 × 360) and 2 (1280 × 720), b
+   * asking for its layer 2, and c for layer 2 too (or 1, when a is the slow
+   * one: so that a runs both). `slow` joins through `proxied`, whose rate the
+   * test limits and lifts, marking when (`mark`), watching `live`, and
+   * ending the run with `finish`. Returns, per receiver, every decoded
+   * frame's time and layer, everyone's "videolimit" events, and a's uplink
+   * and encoders as they changed; times in ms from the start.
+   */
+  window.adaptation = async ({ relay, proxied, hash, slow }) => {
+    window.live = null;
+    const group = Group.create(relay);
+    const webTransport = pinning(hash);
+    const [a, b, c] = ["a", "b", "c"].map((profile) =>
+      joinGroup(profile === slow ? via(group, proxied) : group, { profile, webTransport }),
+    );
+    await together([a, b, c]);
+    const start = performance.now();
+    const now = () => Math.round(performance.now() - start);
+    const frames = { b: [], c: [] };
+    const limits = { a: [], b: [], c: [] };
+    for (const [name, m] of Object.entries({ a, b, c }))
+      m.addEventListener("videolimit", (e) => limits[name].push({ t: now(), layer: e.detail.layer }));
+    const watch = (who) => (member, frame, track, layer) => {
+      frames[who].push({ t: now(), layer });
+      frame.close();
+    };
+    const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+    const va = await startVideo(a, {
+      stream: camera,
+      framerate: 20,
+      layers: [
+        { layer: 1, width: 640, height: 360, bitrate: 400_000, minBitrate: 150_000 },
+        { layer: 2, width: 1280, height: 720, bitrate: 1_500_000, minBitrate: 300_000 },
+      ],
+    });
+    const vb = await startVideo(b, { onFrame: watch("b"), unattached: null });
+    const vc = await startVideo(c, { onFrame: watch("c"), unattached: null });
+    vb.setLayer(a.id, 2);
+    vc.setLayer(a.id, slow === "a" ? 1 : 2);
+    // a's uplink and encoders, whenever they change.
+    const uplink = [];
+    const poll = setInterval(() => {
+      const s = va.stats();
+      const state = { cappedAt: s.uplink.cappedAt, running: s.layers.filter((l) => l.running).map((l) => l.layer).join() };
+      const last = uplink.at(-1);
+      if (!last || last.cappedAt !== state.cappedAt || last.running !== state.running) uplink.push({ t: now(), ...state, wait: s.uplink.wait });
+    }, 50);
+    window.marks = [];
+    window.mark = (label) => window.marks.push({ t: now(), label });
+    window.live = { frames, limits, uplink, now };
+    /** Whether `who` decoded a frame of `layer` since the mark `label`. */
+    window.decodedSince = (who, layer, label) => {
+      const since = window.marks.find((m) => m.label === label)?.t ?? Infinity;
+      return frames[who].some((f) => f.layer === layer && f.t > since);
+    };
+    await new Promise((r) => (window.finish = r));
+    clearInterval(poll);
+    const connected = [a.connected, b.connected, c.connected];
+    const stats = { a: va.stats(), b: vb.stats(), c: vc.stats() };
+    for (const v of [va, vb, vc]) v.stop();
+    camera.getTracks().forEach((t) => t.stop());
+    for (const m of [a, b, c]) m.leave();
+    return { connected, frames, limits, uplink, marks: window.marks, stats: { a: { uplink: stats.a.uplink, layers: stats.a.layers } } };
+  };
+
   window.ready = true;
 </script>

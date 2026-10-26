@@ -27,14 +27,17 @@
 	/** A member's video is shown while frames keep coming: at least one in this long. */
 	const VIDEO_FRESH = 2000;
 	/**
-	 * Two sizes at 30 frames a second, as meeting apps send: 720p for those
-	 * who show us large, 360p for small tiles. Each is encoded only while
-	 * someone shows it, and steps down towards `minBitrate` while its
-	 * receivers keep losing frames.
+	 * Three sizes at 30 frames a second, as meeting apps send: 720p for those
+	 * who show us large, 360p for gallery tiles, 180p for thumbnails and slow
+	 * links. Each is encoded only while someone shows it, and steps down
+	 * towards `minBitrate` while its receivers keep losing frames; the
+	 * largest stops while our uplink cannot carry them all, and the relay
+	 * gives each receiver no more than its link takes.
 	 */
 	const VIDEO = {
 		framerate: 30,
 		layers: [
+			{ layer: 0, width: 320, height: 180, bitrate: 150_000, minBitrate: 60_000 },
 			{ layer: 1, width: 640, height: 360, bitrate: 400_000, minBitrate: 150_000 },
 			{ layer: 2, width: 1280, height: 720, bitrate: 1_500_000, minBitrate: 300_000 }
 		]
@@ -43,6 +46,9 @@
 	const CAMERA = { width: 1280, height: 720, frameRate: VIDEO.framerate };
 	/** Offline this long after joining, the network is probably what stops it (UDP blocked). */
 	const UNREACHABLE = 10_000;
+	/** Round trips to the relay (ms) beyond which our network is at most fair, and poor. */
+	const SLOW_RTT = 300;
+	const BAD_RTT = 600;
 
 	type Sdk = typeof import('peerconnect');
 	type VoiceSdk = typeof import('peerconnect/voice');
@@ -76,6 +82,8 @@
 		muted: boolean;
 		deafened: boolean;
 		camera: boolean;
+		/** Their network, 0–3 bars, as they judge it (see `quality`); not said by older pages. */
+		net?: number;
 	}
 
 	const t = $derived(i18n.t.voice);
@@ -137,6 +145,10 @@
 	let facingUs = $state(true);
 	let switching = $state(false);
 	let cameraStream: MediaStream | undefined = $state.raw();
+	/** Our network, 0–3 bars (see `quality`), as we last told the others. */
+	let net = $state(3);
+	/** The relay sends us no video: our link is too slow for any. */
+	let videoPaused = $state(false);
 	/** Members whose video is coming in now. */
 	let watching: Record<string, boolean> = $state({});
 	// The meeting's layout, as in the usual video meeting apps.
@@ -315,6 +327,28 @@
 	/** An RMS level as 0–1 on a decibel scale: −60 dBFS is silence, −10 loud. */
 	function level(rms: number): number {
 		return Math.min(1, Math.max(0, (20 * Math.log10(rms + 1e-9) + 60) / 50));
+	}
+
+	/**
+	 * Our network as 0–3 bars, from what we know of it, each part capping it:
+	 * - the relay's limit on what our link takes (`videoLimit`): every layer,
+	 *   3; not the largest, 2; only the smallest, 1; no video at all, 0;
+	 * - our uplink, while we send video: a layer stopped for it, at most 2;
+	 *   only the smallest left, at most 1;
+	 * - the round trip to the relay: over `SLOW_RTT`, at most 2; over
+	 *   `BAD_RTT`, at most 1;
+	 * - offline, 0.
+	 */
+	function quality(): number {
+		if (!conn || conn.state !== 'online') return 0;
+		const limit = conn.videoLimit;
+		let bars = limit === null ? 0 : limit >= 3 ? 3 : limit >= 1 ? 2 : 1;
+		const capped = camera && video ? video.stats().uplink.cappedAt : null;
+		if (capped !== null) bars = Math.min(bars, capped <= VIDEO.layers[0].layer ? 1 : 2);
+		const rtt = conn.rtt ?? 0;
+		if (rtt > BAD_RTT) bars = Math.min(bars, 1);
+		else if (rtt > SLOW_RTT) bars = Math.min(bars, 2);
+		return bars;
 	}
 
 	function speaking(id: string): boolean {
@@ -507,7 +541,8 @@
 						presence[from] = {
 							muted: !!said.muted,
 							deafened: !!said.deafened,
-							camera: !!said.camera
+							camera: !!said.camera,
+							net: Number.isInteger(said.net) ? Math.min(3, Math.max(0, said.net)) : undefined
 						};
 					}
 				} catch {
@@ -530,6 +565,9 @@
 			clock = Date.now();
 			if (!chatOpen && from !== me) unread++;
 			void scrollDown();
+		});
+		c.addEventListener('videolimit', (e) => {
+			if (current()) videoPaused = e.detail.layer === null;
 		});
 		c.addEventListener('full', () => current() && raise('full'));
 		c.addEventListener('replaced', () => current() && raise('replaced'));
@@ -580,7 +618,15 @@
 					const shape = canvas.width && canvas.height ? canvas.width / canvas.height : 0;
 					if (shape && Math.abs(shape - (shapes[id] ?? 0)) > 0.01) shapes[id] = shape;
 				}
-				if (Date.now() - clock >= 1000) clock = Date.now();
+				if (Date.now() - clock >= 1000) {
+					clock = Date.now();
+					// Once a second at most: the others hear when our network changes.
+					const bars = quality();
+					if (bars !== net) {
+						net = bars;
+						announce();
+					}
+				}
 			}
 			if (voice && now - last >= 40) {
 				last = now;
@@ -606,7 +652,7 @@
 	/** Tells the others whether we are muted or deafened. */
 	function announce() {
 		try {
-			conn?.send('command', JSON.stringify({ type: 'presence', muted, deafened, camera }));
+			conn?.send('command', JSON.stringify({ type: 'presence', muted, deafened, camera, net }));
 		} catch {
 			// left
 		}
@@ -702,10 +748,17 @@
 	}
 
 	// Each canvas gets the layer that suits its size (the video SDK sees to
-	// it); those behind someone watched across the whole window get none.
+	// it); thumbnails in the speaker view's strip the smallest, which is
+	// plenty for them even on a dense screen; those behind someone watched
+	// across the whole window none.
 	$effect(() => {
 		if (!video) return;
-		for (const m of others) video.setLayer(m.id, maximized && maximized !== m.id ? null : 'auto');
+		const strip = view === 'speaker' && people.length > 1;
+		for (const m of others) {
+			const layer =
+				maximized && maximized !== m.id ? null : strip && m.id !== featured ? 0 : 'auto';
+			video.setLayer(m.id, layer);
+		}
 	});
 
 	/** Draws a member's video into this canvas while it is on the page. */
@@ -778,6 +831,8 @@
 		deafened = camera = false;
 		muted = true;
 		facingUs = true;
+		net = 3;
+		videoPaused = false;
 		view = 'gallery';
 		pinned = latest = maximized = null;
 		unread = 0;
@@ -1060,6 +1115,7 @@
 		{@const talking = !off && speaking(person.id)}
 		{@const shown = hasVideo(person.id) && (size === 'whole' || maximized !== person.id)}
 		{@const turn = mine ? t.room.rotateMine : t.room.rotateTheirs.replace('{name}', person.name)}
+		{@const bars = mine ? net : presence[person.id]?.net}
 		<li
 			class="person tile {size}"
 			class:mine
@@ -1154,6 +1210,28 @@
 				<span class="name"
 					>{person.name}{#if mine}<em>&nbsp;· {t.room.you}</em>{/if}</span
 				>
+				{#if bars !== undefined}
+					{@const said =
+						bars >= 3
+							? t.room.network.good
+							: bars === 2
+								? t.room.network.fair
+								: t.room.network.poor}
+					<span class="net bars-{bars}" role="img" aria-label={said} title={said}>
+						<svg viewBox="0 0 13 12" aria-hidden="true">
+							{#each [1, 2, 3] as n (n)}
+								<rect
+									x={(n - 1) * 5}
+									y={12 - n * 4}
+									width="3"
+									height={n * 4}
+									rx="1"
+									class:lit={n <= bars}
+								/>
+							{/each}
+						</svg>
+					</span>
+				{/if}
 				<svg class="wave" viewBox="0 0 {WAVE * 4} 24" preserveAspectRatio="none" aria-hidden="true">
 					{#each (waves[person.id] ?? []).slice(-WAVE) as v, i (i)}
 						{@const h = Math.max(2, v * 22)}
@@ -1267,6 +1345,9 @@
 					</ul>
 				{/if}
 				{@render overlay(comments)}
+				{#if videoPaused}
+					<p class="paused" role="status">{t.room.videoPaused}</p>
+				{/if}
 			</section>
 
 			{#if chatOpen}
@@ -1868,6 +1949,32 @@
 		opacity: 0.4;
 	}
 
+	/* Network bars, as meeting apps show them: green, amber, red. */
+	.net {
+		display: inline-grid;
+		flex: none;
+		place-items: center;
+	}
+
+	.net svg {
+		width: 13px;
+		height: 12px;
+		fill: rgb(255 255 255 / 0.3);
+	}
+
+	.net .lit {
+		fill: #4ade80;
+	}
+
+	.net.bars-2 .lit {
+		fill: #facc15;
+	}
+
+	.net.bars-1 .lit,
+	.net.bars-0 .lit {
+		fill: #f87171;
+	}
+
 	.flag,
 	.state {
 		display: inline-grid;
@@ -1948,6 +2055,25 @@
 		padding: 0;
 		list-style: none;
 		pointer-events: none;
+	}
+
+	/* Our link takes no video: said calmly, over the stage, until it does again. */
+	.paused {
+		position: absolute;
+		top: 10px;
+		left: 50%;
+		z-index: 4;
+		width: max-content;
+		max-width: calc(100% - 24px);
+		margin: 0;
+		padding: 6px 14px;
+		border-radius: 999px;
+		background: rgb(10 12 16 / 0.7);
+		backdrop-filter: blur(6px);
+		color: #fff;
+		font-size: 0.85rem;
+		text-align: center;
+		transform: translateX(-50%);
 	}
 
 	.stage:has(.strip) .comments {

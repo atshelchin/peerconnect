@@ -13,6 +13,12 @@
 // for a keyframe, which this module sends at once. Each layer's bitrate
 // steps down while receivers keep asking, and back up while they do not.
 //
+// The relay fits what each receiver gets to its link; our own uplink is
+// ours to fit. While it cannot carry every layer we run, the largest stops
+// (its receivers get the next one down), down to the smallest, which always
+// goes on; a while after it keeps up, the layer starts again, on trial. The
+// rules are the relay's for receivers (GROUP.md §3.3), see `#uplinkCheck`.
+//
 // Each video frame is `codec[1] ‖ encoded chunk` (GROUP.md §7.4): 1 VP8,
 // 2 VP9, 3 H.264 (Annex B), 4 AV1. Timestamps are milliseconds on the
 // sender's clock.
@@ -45,6 +51,21 @@ const SHOWN = [180, 360, 720];
 const SETTLE = 300;
 /** Keyframe requests this soon after a layer starts are receivers moving to it, not losses. */
 const STARTING = 1000;
+/** How soon the relay notices a layer is no longer sent, and moves its receivers to the next one down. */
+const LAYER_FRESH = 1000;
+/** Our video waiting this long (ms) beyond this many bytes means the uplink does not keep up. */
+const UPLINK_QUEUED = 32 << 10;
+const CONGESTED_FOR = 300;
+/** After a change, the uplink's signals are ignored this long (ms): the queue takes a moment to drain. */
+const UPLINK_SETTLE = 2000;
+/**
+ * An uplink that keeps up this long (ms) gets a stopped layer back to try;
+ * the wait doubles, up to `PROBE_MAX`, each time a try fails within
+ * `PROBE_TRIAL`.
+ */
+const PROBE_WAIT = 8000;
+const PROBE_MAX = 60_000;
+const PROBE_TRIAL = 5000;
 
 /**
  * Starts video in a group. With `stream`, sends its video track; without,
@@ -66,6 +87,17 @@ export class Video extends EventTarget {
   #layers;
   /** Which layers the relay says are wanted (bit n: layer n); null until it says. */
   #demand = null;
+  /** Our uplink: the largest layer it carries now (`LAYERS - 1`: all), and what it showed lately. */
+  #uplink = {
+    cap: LAYERS - 1,
+    changedAt: 0,
+    congestedAt: null,
+    congestedSince: null,
+    raisedAt: null,
+    wait: PROBE_WAIT,
+    dropped: 0,
+    queued: 0,
+  };
   /** Quarter turns, clockwise: of what we send, and of what we show of each member. */
   #rotation = 0;
   #views = new Map();
@@ -219,10 +251,18 @@ export class Video extends EventTarget {
       ...l.stats,
     }));
     const total = (key) => layers.reduce((sum, l) => sum + l[key], 0);
+    const u = this.#uplink;
     return {
       bitrate: this.bitrate,
       codec: this.codec,
       demand: this.#demand,
+      uplink: {
+        congested: u.congestedAt !== null && performance.now() - u.congestedAt < 1000,
+        cappedAt: u.cap < LAYERS - 1 ? u.cap : null,
+        queued: u.queued,
+        dropped: u.dropped,
+        wait: u.wait,
+      },
       encoded: total("encoded"),
       sent: total("sent"),
       keyframes: total("keyframes"),
@@ -279,6 +319,7 @@ export class Video extends EventTarget {
     this.#run();
     const tick = () => {
       if (this.#element !== element) return;
+      if (this.#sending) this.#uplinkCheck(performance.now());
       if (element.readyState >= 2 && element.videoWidth) this.#capture(element);
       this.#timer = setTimeout(tick, 1000 / framerate);
     };
@@ -299,9 +340,12 @@ export class Video extends EventTarget {
     }
   }
 
-  /** Our layer that serves `layer`: the nearest at or below it, else the lowest. */
+  /**
+   * Our layer that serves `layer`: the nearest at or below it, else the
+   * lowest; none above what our uplink carries now, but for the lowest.
+   */
   #layer(layer) {
-    return this.#layers.findLast((l) => l.layer <= layer) ?? this.#layers[0];
+    return this.#layers.findLast((l) => l.layer <= Math.min(layer, this.#uplink.cap)) ?? this.#layers[0];
   }
 
   #startLayer(l) {
@@ -312,7 +356,7 @@ export class Video extends EventTarget {
     });
     l.size = null; // configured for the first frame's shape
     l.keyframeDue = true; // receivers moving to it start there
-    l.startedAt = performance.now();
+    l.moversUntil = performance.now() + STARTING;
   }
 
   #stopLayer(l) {
@@ -330,7 +374,62 @@ export class Video extends EventTarget {
     const l = this.#layer(layer ?? 0);
     l.stats.requests++;
     l.keyframeDue = true;
-    if (performance.now() - l.startedAt >= STARTING) this.#strained(l);
+    if (performance.now() >= l.moversUntil) this.#strained(l);
+  }
+
+  /**
+   * Whether our uplink keeps up, from how far our video is backed up: it
+   * does not if video was dropped, or more than `UPLINK_QUEUED` has waited
+   * for `CONGESTED_FOR`. Then our largest running layer stops at once
+   * (unless it is the only one: the smallest goes on, whatever the link;
+   * the relay moves receivers that cannot take it to audio only); after
+   * `PROBE_WAIT` without a sign, it starts again from a keyframe, and a try
+   * that fails within `PROBE_TRIAL` doubles the next wait. Signals are
+   * ignored for `UPLINK_SETTLE` after each change.
+   */
+  #uplinkCheck(now) {
+    const backlog = this.#conn.videoBacklog;
+    if (!backlog) return;
+    const u = this.#uplink;
+    const dropped = backlog.dropped > u.dropped;
+    u.dropped = backlog.dropped;
+    u.queued = backlog.queued;
+    if (!dropped && backlog.queued <= UPLINK_QUEUED) {
+      u.congestedSince = null;
+      if (u.raisedAt !== null && now - u.raisedAt >= PROBE_TRIAL) {
+        u.raisedAt = null;
+        u.wait = PROBE_WAIT;
+      }
+      if (u.cap < LAYERS - 1 && now - Math.max(u.congestedAt ?? 0, u.changedAt) >= u.wait) {
+        // The layer just above the cap back, on trial.
+        const next = this.#layers.find((l) => l.layer > u.cap);
+        u.cap = next && next !== this.#layers.at(-1) ? next.layer : LAYERS - 1;
+        u.changedAt = u.raisedAt = now;
+        this.#run();
+      }
+      return;
+    }
+    u.congestedAt = now;
+    if (now - u.changedAt < UPLINK_SETTLE && u.changedAt !== 0) return;
+    u.congestedSince ??= now;
+    if (!dropped && now - u.congestedSince < CONGESTED_FOR) return;
+    u.congestedSince = null;
+    const running = this.#layers.filter((l) => l.encoder);
+    if (running.length < 2) return;
+    if (u.raisedAt !== null && now - u.raisedAt < PROBE_TRIAL) u.wait = Math.min(PROBE_MAX, u.wait * 2);
+    u.raisedAt = null;
+    u.cap = running.at(-1).layer - 1;
+    u.changedAt = now;
+    this.#run();
+    // Its receivers move to the layer serving them now once the relay sees
+    // it stopped: a keyframe of that one just then spares them asking (they
+    // do, if our backed-up uplink got its last frames there late).
+    const serving = new Set();
+    for (let layer = 0; layer < LAYERS; layer++) if (this.#demand & (1 << layer)) serving.add(this.#layer(layer));
+    for (const l of serving) {
+      l.keyframeAt = now + LAYER_FRESH + 100;
+      l.moversUntil = l.keyframeAt + STARTING;
+    }
   }
 
   /**
@@ -364,9 +463,11 @@ export class Video extends EventTarget {
       if (canvas.width !== w || canvas.height !== h) [canvas.width, canvas.height] = [w, h];
       draw(canvas.getContext("2d"), element, w, h, this.#rotation);
       const frame = new VideoFrame(canvas, { timestamp });
-      const keyFrame = l.keyframeDue || now - l.lastKeyframe >= this.#options.keyframeInterval;
+      const keyFrame =
+        l.keyframeDue || now - l.lastKeyframe >= this.#options.keyframeInterval || (l.keyframeAt !== 0 && now >= l.keyframeAt);
       if (keyFrame) {
         l.keyframeDue = false;
+        l.keyframeAt = 0;
         l.lastKeyframe = now;
       }
       encoder.encode(frame, { keyFrame });
@@ -577,7 +678,10 @@ function layerState({ layer, width, height, bitrate, minBitrate }, defaults) {
     size: null,
     keyframeDue: true,
     lastKeyframe: 0,
-    startedAt: 0,
+    /** A keyframe due at this time (0: none). */
+    keyframeAt: 0,
+    /** Keyframe requests until then are receivers moving to it. */
+    moversUntil: 0,
     requests: [],
     raisedAt: 0,
     stats: { encoded: 0, sent: 0, keyframes: 0, skipped: 0, requests: 0 },

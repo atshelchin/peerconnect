@@ -428,6 +428,10 @@ impl Member {
                     kind("videodemand");
                     set("layers", layers.into());
                 }
+                Event::VideoLimit { layer } => {
+                    kind("videolimit");
+                    set("layer", layer.map_or(JsValue::NULL, JsValue::from));
+                }
                 Event::Missed { from, channel, count } => {
                     kind("missed");
                     set("from", id(from));

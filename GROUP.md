@@ -109,6 +109,7 @@ Relay frames:
 | `0x84` | MEMBER | relay → member | `slot[1] ‖ present[1]` (`0x01`: a new connection now holds the slot, `0x00`: the slot is free) |
 | `0x85` | SUBSCRIBE | member → relay | `slot[1] ‖ layer[1]`: forward me this layer (0–3) of that member's video, `0xFF` for none (§3.3) |
 | `0x86` | DEMAND | relay → member | `layers[1]`: a bitmap (bit *n* = layer *n*) of the layers of my video that someone wants (§3.3) |
+| `0x87` | LIMIT | relay → member | `layer[1]`: the largest layer my link takes now, `0xFF` for no video at all (§3.3) |
 
 A member ignores MEMBER for a slot above 3, and bits above 3 in WELCOME; a WELCOME giving it a slot above 3 is a protocol error (§7.1: reconnect). A relay closes a connection that sends SUBSCRIBE before it is seated, for its own slot, for a slot above 3 or a layer above 3 (other than `0xFF`), with 1002. Subscriptions belong to the connection: they start at layer 0 for every slot, and a slot's subscriptions, and those of others to it, start again when MEMBER announces a new connection there.
 
@@ -141,11 +142,13 @@ Video comes after chat, although it is real-time, because it can fill a link: ah
 
 **Video layers.** A VIDEO frame's type is `0x30 | layer << 1 | keyframe`: the **layer** (0–3, from the smallest picture up) of the sender's video it belongs to, and whether it is part of a keyframe. A sender may send the same picture in several layers (simulcast); the relay forwards each member, of each sender's VIDEO frames to everyone, those of one layer only:
 
-- the layer it subscribed to with SUBSCRIBE (layer 0 until it says otherwise), if the sender sends it; else the nearest layer below it that the sender sends; else the lowest layer the sender sends. A layer counts as sent while one of its frames was seen in the last **1 s**;
-- moving a member to another layer only at a keyframe of the new layer, and forwarding the old one until then, so that the picture never stops. If the old layer is no longer sent, it moves at once;
-- none of the sender's video to a member that subscribed with `0xFF`.
+- the layer it subscribed to with SUBSCRIBE (layer 0 until it says otherwise), if the sender sends it; else the nearest layer below it that the sender sends; else the lowest layer the sender sends; in each case no larger than the member's link takes (below). A layer counts as sent while one of its frames was seen in the last **1 s**;
+- moving a member to a larger layer only at a keyframe of it, and forwarding the old one until then, so that the picture never stops. If the old layer is no longer sent, or is now too large for the member's link, it moves at once;
+- none of the sender's video to a member that subscribed with `0xFF`, or whose link takes no video.
 
-VIDEO frames sent to one member (resent fragments, §7.4) are forwarded regardless. The relay tells each seated member, with DEMAND, which of its layers someone wants: the layers members subscribed to, and those being forwarded to them until a move away from them is done; it sends DEMAND when that changes, and once on seating. The relay reads nothing of a frame but its type, so it learns which layer a member watches, and when keyframes are sent.
+VIDEO frames sent to one member (resent fragments, §7.4) are forwarded regardless. The relay tells each seated member, with DEMAND, which of its layers someone wants: the layers members subscribed to (no larger than their links take), and those being forwarded to them until a move away from them is done; it sends DEMAND when that changes, and once on seating. The relay reads nothing of a frame but its type, so it learns which layer a member watches, and when keyframes are sent.
+
+**Each member's link.** A relay SHOULD fit the video it forwards a member to that member's link, so that a slow link costs its own member smaller pictures, not everyone's. The reference relay counts a link as not keeping up when it had to drop video queued for the member (§3.3, real-time frames), or when more than 32 KiB of video stayed queued for it for **300 ms** or more. It then lowers the largest layer it forwards the member to below the largest it was getting, stopping that one at once, and from the smallest to no video at all, at most once every **2 s**; and it tells the member with LIMIT. A link that has kept up for **8 s** is given one more layer to try (LIMIT again); if that fails within 5 s, the next try waits twice as long, up to 60 s. A member that receives LIMIT asks the senders whose video it gets for a keyframe of the layer it will get now (§7.4).
 
 A relay MUST deliver the frames of one class from one connection to another in the order sent (over QUIC, voice excepted: §3.6). It SHOULD hold a queue per class for each recipient and always send from the most urgent non-empty queue, so that a less urgent class never delays a more urgent one beyond the frame being written. Relay frames go with the command class.
 
@@ -371,6 +374,8 @@ A sender keeps its frames for **500 ms** (and at most 2 MiB) to answer VIDEO_NAC
 
 **Layers.** A sender SHOULD encode only the layers DEMAND says are wanted: for each wanted layer, the one it sends that is nearest below or equal to it, else its lowest, which is what the relay forwards (§3.3). A layer that becomes wanted SHOULD start with a keyframe, so that the relay can move members to it at once. A member that subscribes to a layer of a sender whose video it already receives also sends that sender KEYFRAME_REQUEST for the new layer of each of its tracks. A member keeps its subscriptions across reconnections, sending SUBSCRIBE again whenever it admits the member concerned.
 
+A sender whose own link cannot carry all the layers it encodes (its video queue drops frames, or stays long) SHOULD stop its largest layer first, keeping the smaller ones, and try it again once it has kept up for a while, starting with a keyframe; the relay moves members watching the stopped layer to the next one sent, at once (§3.3). The reference SDK follows the relay's rules above.
+
 A receiver puts each layer back together on its own as above, and delivers one layer of each track at a time: another layer takes over with its first keyframe, and the layer left behind is forgotten; for **1 s** after a move, frames of the layer left behind are ignored (they were on their way), so that they do not start a move back.
 
 The codec is the application's. Implementations that want to interoperate with the reference SDK's video use `codec[1] ‖ chunk` as each frame, where `codec` is 1 for VP8, 2 for VP9, 3 for H.264 (Annex B) or 4 for AV1, and `chunk` one encoded picture.
@@ -384,6 +389,8 @@ The codec is the application's. Implementations that want to interoperate with t
 | Message payload | ≤ 16,352 bytes | senders |
 | Video frame | ≤ 255 fragments of ≤ 1,000 bytes | senders |
 | Video layers | 4 (0–3); a layer counts as sent for 1 s after its last frame; a layer left behind is ignored for 1 s | relays, receivers |
+| A link not keeping up | video dropped, or > 32 KiB queued for ≥ 300 ms; then one layer down, at most every 2 s | relays (reference), senders |
+| A link given more | after 8 s of keeping up, doubling up to 60 s after a try that fails within 5 s | relays (reference), senders |
 | Video queued per recipient | 64 KiB, oldest dropped (reference relay) | relays |
 | Video: ask for a fragment / give a frame up / ask for a keyframe | after 5 ms / 300 ms / at most every 500 ms | receivers |
 | Video kept for resending | 500 ms, ≤ 2 MiB; resent at ≤ 512 KiB/s | senders |
@@ -421,7 +428,7 @@ The codec is the application's. Implementations that want to interoperate with t
 
 ## 10. Conformance
 
-[`test-vectors/g1.json`](test-vectors/g1.json) gives, for fixed inputs, the group's derived keys and IDs, join tokens and JOIN frames, the KEY frames of two members, and one frame of every sealed kind: CONFIRM, stream messages, a direct message, voice, a datagram, HEADS, RESEND and the resend that answers it, RESENT, a state transfer from request to acknowledgement, plus a declined one, and video: a keyframe's fragments (layer 2), a VIDEO_NACK and the fragment resent for it, a frame of layer 1, and a KEYFRAME_REQUEST; also SUBSCRIBE and DEMAND. Each frame was produced by a member of the reference implementation, and checked to have its effect at the other.
+[`test-vectors/g1.json`](test-vectors/g1.json) gives, for fixed inputs, the group's derived keys and IDs, join tokens and JOIN frames, the KEY frames of two members, and one frame of every sealed kind: CONFIRM, stream messages, a direct message, voice, a datagram, HEADS, RESEND and the resend that answers it, RESENT, a state transfer from request to acknowledgement, plus a declined one, and video: a keyframe's fragments (layer 2), a VIDEO_NACK and the fragment resent for it, a frame of layer 1, and a KEYFRAME_REQUEST; also SUBSCRIBE, DEMAND and LIMIT. Each frame was produced by a member of the reference implementation, and checked to have its effect at the other.
 
 [`test-vectors/verify-groups.mjs`](test-vectors/verify-groups.mjs) rebuilds all of it from this document using only Node's built-in cryptography, and the weekly certificates of [`g1-certificate.json`](test-vectors/g1-certificate.json) too (checking their signatures, since Node signs with random nonces).
 

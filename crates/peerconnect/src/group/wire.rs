@@ -20,7 +20,10 @@ pub const MEMBER: u8 = 0x84;
 pub const SUBSCRIBE: u8 = 0x85;
 /// Relay → member: `layers[1]`, a bitmap of our video layers someone wants.
 pub const DEMAND: u8 = 0x86;
-/// In SUBSCRIBE: no video from that member.
+/// Relay → member: `layer[1]`, the largest video layer our link takes now
+/// ([`NO_VIDEO`]: none, audio only).
+pub const LIMIT: u8 = 0x87;
+/// In SUBSCRIBE and LIMIT: no video.
 pub const NO_VIDEO: u8 = 0xFF;
 
 /// Announces a connection's sender key (encrypted under the group secret).
@@ -163,6 +166,11 @@ pub fn subscribe(slot: u8, layer: Option<u8>) -> [u8; 3] {
 /// DEMAND: which of the member's video layers someone wants (bit n: layer n).
 pub fn demand(layers: u8) -> [u8; 2] {
     [DEMAND, layers]
+}
+
+/// LIMIT: the largest layer the member's link takes now (`None`: no video).
+pub fn limit(layer: Option<u8>) -> [u8; 2] {
+    [LIMIT, layer.unwrap_or(NO_VIDEO)]
 }
 
 /// Checks a peer frame's header against the sender's slot. Returns the

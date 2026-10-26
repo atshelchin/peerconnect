@@ -41,6 +41,9 @@ const BACKLOG: usize = 256 << 10;
 /// How long senders wait for a recipient to work off its backlog before
 /// it is disconnected.
 const BACKLOG_WAIT: Duration = Duration::from_secs(5);
+/// Video bytes queued towards a member beyond which its link is not keeping
+/// up (some 170 ms of 720p), if that lasts (GROUP.md §3.3).
+const VIDEO_CONGESTED: usize = 32 << 10;
 
 /// The slots of one group, and which layer of whose video goes to whom.
 #[derive(Default)]
@@ -56,11 +59,17 @@ fn now_ms() -> u64 {
     START.elapsed().as_millis() as u64
 }
 
-/// Sends DEMAND to every sender whose wanted layers changed.
+/// Sends DEMAND to every sender whose wanted layers changed, and LIMIT to
+/// every receiver whose link limit did.
 fn tell_demands(slots: &[Option<Seat>; gwire::MAX_SLOTS], router: &mut VideoRouter) {
     for (slot, layers) in router.demands() {
         if let Some(seat) = &slots[slot as usize] {
             seat.outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::demand(layers)));
+        }
+    }
+    for (slot, layer) in router.limits() {
+        if let Some(seat) = &slots[slot as usize] {
+            seat.outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::limit(layer)));
         }
     }
 }
@@ -90,6 +99,8 @@ pub(crate) struct Outbox {
     voice_limit: usize,
     /// Video bytes queued beyond which the oldest video is dropped.
     video_limit: usize,
+    /// Video was dropped since the video router last asked.
+    video_dropped: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -118,6 +129,7 @@ impl Outbox {
             limit,
             voice_limit,
             video_limit,
+            video_dropped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -136,6 +148,7 @@ impl Outbox {
         } else if class == Class::Video {
             let video = Class::Video.index();
             while q.bytes[video] + len > self.video_limit {
+                self.video_dropped.store(true, Ordering::Relaxed);
                 let Some(old) = q.classes[video].pop_front() else { return false };
                 q.bytes[video] -= old.len();
             }
@@ -151,6 +164,13 @@ impl Outbox {
         self.ready.notify_one();
         self.class_ready[class.index()].notify_one();
         behind
+    }
+
+    /// What the video router sees of this member's link: whether video is
+    /// waiting, and whether some was dropped since it last asked.
+    fn video_link(&self) -> (bool, bool) {
+        let queued = self.queues.lock().unwrap().bytes[Class::Video.index()];
+        (queued > VIDEO_CONGESTED, self.video_dropped.swap(false, Ordering::Relaxed))
     }
 
     /// Waits until the recipient's command and chat backlog is below
@@ -325,7 +345,11 @@ impl GroupRoom {
         for (i, seat) in slots.iter().enumerate() {
             if let Some(seat) = seat
                 && to.map_or(i != slot as usize, |to| i == to as usize)
-                && router.as_mut().is_none_or(|r| r.forward(now, slot, i as u8, msg[0]))
+                && router.as_mut().is_none_or(|r| {
+                    let (congested, dropped) = seat.outbox.video_link();
+                    r.link(now, i as u8, congested, dropped);
+                    r.forward(now, slot, i as u8, msg[0])
+                })
                 && seat.outbox.push(class, msg.clone())
             {
                 behind.push(seat.outbox.clone());

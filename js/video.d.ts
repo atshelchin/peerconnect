@@ -71,6 +71,23 @@ export interface VideoStats {
   codec: string | null;
   /** The layers the relay says are wanted of us (bit n: layer n), null until it says. */
   demand: number | null;
+  /**
+   * Our uplink. While it cannot carry every layer we run (video was dropped, or more than
+   * 32 KiB waited for 300 ms), our largest running layer stops, down to the smallest, which
+   * always goes on; its receivers get the next layer down. After 8 s without a sign it
+   * starts again, on trial: one that fails within 5 s doubles the wait, up to 60 s.
+   */
+  uplink: {
+    /** A sign of it within the last second. */
+    congested: boolean;
+    /** The largest layer we send now, while some are stopped for the uplink; null when none are. */
+    cappedAt: number | null;
+    /** Video bytes waiting to go out, and dropped since we joined (`GroupConnection.videoBacklog`). */
+    queued: number;
+    dropped: number;
+    /** Milliseconds the uplink must keep up before a stopped layer is tried again. */
+    wait: number;
+  };
   /** The layers' numbers, added up. */
   encoded: number;
   sent: number;
@@ -100,7 +117,10 @@ export interface VideoEventMap {
 
 /** Video in a group: started by `startVideo`. */
 export class Video extends EventTarget {
-  /** Bits per second our encoders run at now, all layers (each steps down while its receivers keep losing frames). */
+  /**
+   * Bits per second our encoders run at now, all layers (each steps down while its receivers
+   * keep losing frames; the largest stops while our uplink cannot carry them all, see `stats().uplink`).
+   */
   readonly bitrate: number;
   readonly codec: string | null;
   /**

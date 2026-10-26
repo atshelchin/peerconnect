@@ -122,6 +122,9 @@ impl Relay {
                     let (now, kind) = (self.now, frame[0]);
                     targets.retain(|&t| {
                         let to = self.slots.iter().position(|s| *s == Some(t)).unwrap() as u8;
+                        // As the Linux relay: video queued past 32 KiB is a link not keeping up.
+                        let queued: usize = self.conns[&t].queues[Class::Video.index()].iter().map(Vec::len).sum();
+                        self.router.link(now, to, queued > 32 << 10, false);
                         self.router.forward(now, from, to, kind)
                     });
                     self.tell_demands();
@@ -189,6 +192,11 @@ impl Relay {
         for (slot, layers) in self.router.demands() {
             if let Some(c) = self.slots[slot as usize] {
                 self.conns.get_mut(&c).unwrap().queues[0].push_back(wire::demand(layers).to_vec());
+            }
+        }
+        for (slot, layer) in self.router.limits() {
+            if let Some(c) = self.slots[slot as usize] {
+                self.conns.get_mut(&c).unwrap().queues[0].push_back(wire::limit(layer).to_vec());
             }
         }
     }

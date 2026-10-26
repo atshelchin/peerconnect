@@ -68,6 +68,7 @@ typedef enum {
   PC_VIDEO = 22,        /* a whole video frame from `member`'s `track`, of `layer`: `keyframe`, `timestamp`, `data` */
   PC_KEYFRAME_REQUEST = 23, /* members need a keyframe of `layer` of our `track`: send one soon */
   PC_VIDEO_DEMAND = 24, /* `layer` is a bitmap of our video layers someone wants: encode those (GROUP.md §7.4) */
+  PC_VIDEO_LIMIT = 25,  /* our link takes video layers up to `layer` now (0xFF: none, audio only) */
 } pc_kind;
 
 typedef struct {
@@ -87,7 +88,7 @@ typedef struct {
   uint8_t track;
   uint8_t keyframe;
   uint32_t timestamp;
-  /* PC_VIDEO and PC_KEYFRAME_REQUEST: the layer; PC_VIDEO_DEMAND: a bitmap of layers. */
+  /* PC_VIDEO, PC_KEYFRAME_REQUEST and PC_VIDEO_LIMIT: a layer; PC_VIDEO_DEMAND: a bitmap of layers. */
   uint8_t layer;
 } pc_output;
 

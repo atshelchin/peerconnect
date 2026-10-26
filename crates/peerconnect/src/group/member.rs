@@ -247,6 +247,12 @@ pub enum Event {
     VideoDemand {
         layers: u8,
     },
+    /// The relay says how much video our link takes now: layers up to
+    /// `layer` (`None`: none, audio only, the link is too slow). It lowers
+    /// this while we do not keep up and raises it again when we do.
+    VideoLimit {
+        layer: Option<u8>,
+    },
     /// `count` messages of `from`'s stream were lost: it no longer had them,
     /// or a gap did not close in time.
     Missed {
@@ -853,6 +859,11 @@ impl Member {
                         self.emit(Event::VideoDemand { layers });
                     }
                 }
+                wire::LIMIT => {
+                    if let &[_, layer, ..] = frame {
+                        self.handle_limit((layer != wire::NO_VIDEO).then_some(layer));
+                    }
+                }
                 wire::KEY => self.handle_key(frame),
                 kind if kind < 0x80 => self.handle_sealed(frame),
                 // Anything else is from a newer protocol revision: ignore.
@@ -977,6 +988,25 @@ impl Member {
             }
         }
         Ok(())
+    }
+
+    /// The relay moved what our link takes: ask each member whose video we
+    /// get for a keyframe of the layer we will get now, to move without
+    /// waiting for its next one.
+    fn handle_limit(&mut self, limit: Option<u8>) {
+        self.emit(Event::VideoLimit { layer: limit });
+        let Some(limit) = limit else { return };
+        let mut asks = Vec::new();
+        for (slot, v) in &self.video_in {
+            let Some(member) = self.admitted(*slot).map(|a| a.identity) else { continue };
+            let wanted = self.subscriptions.iter().find(|(m, _)| *m == member).map_or(Some(0), |&(_, l)| l);
+            if let Some(wanted) = wanted {
+                asks.extend(v.tracks().into_iter().map(|track| (*slot, track, wanted.min(limit))));
+            }
+        }
+        for (slot, track, layer) in asks {
+            self.seal_to(wire::CONTROL, slot, &[control::KEYFRAME_REQUEST, track, layer]);
+        }
     }
 
     fn send_subscription(&mut self, slot: u8, layer: Option<u8>) {

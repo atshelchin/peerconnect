@@ -134,6 +134,13 @@ export interface GroupEventMap {
    * wanted layer we do not send, the nearest below it, or else our lowest.
    */
   videodemand: CustomEvent<{ layers: number }>;
+  /**
+   * The relay moved what our link takes (GROUP.md §3.3): video layers up to `layer`, 3
+   * meaning all of them, or none (`null`: the link is too slow, audio only). It lowers this
+   * while video for us queues up and raises it a layer at a time while we keep up; the
+   * members whose video we get are asked for keyframes of the layer we get now.
+   */
+  videolimit: CustomEvent<{ layer: number | null }>;
   /** `count` messages of `from`'s stream were lost (it no longer had them). */
   missed: CustomEvent<{ from: string; channel: Channel; count: number }>;
   /**
@@ -163,6 +170,18 @@ export class GroupConnection extends EventTarget {
   readonly connected: boolean;
   /** The latest "videodemand" (bit n: layer n is wanted), undefined until the relay says. */
   readonly videoDemand: number | undefined;
+  /**
+   * The latest "videolimit": the largest layer our link takes, 3 (all) until the relay says
+   * otherwise and again on each new session; `null`, no video at all (audio only).
+   */
+  readonly videoLimit: number | null;
+  /**
+   * How far our own video is backed up on the way out: bytes waiting to be sent now, and
+   * bytes dropped (the oldest, past the backlog) since we joined. Cheap to read;
+   * `peerconnect/video` reads it to stop its largest layer while the uplink cannot carry
+   * them all.
+   */
+  readonly videoBacklog: { queued: number; dropped: number };
   /** Broadcasts a message (up to 16,352 bytes) and returns its id. */
   send(channel: Channel, data: Data): number;
   /** Sends to one member only; not resent if the connection drops. */

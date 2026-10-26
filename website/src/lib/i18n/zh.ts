@@ -369,7 +369,13 @@ export const zh: Dict = {
 			},
 			switchCamera: '切换前后摄像头',
 			rotateMine: '把你的画面转 90°（大家看到的都会转）',
-			rotateTheirs: '把 {name} 的画面转 90°（只对你）'
+			rotateTheirs: '把 {name} 的画面转 90°（只对你）',
+			network: {
+				good: '网络：良好',
+				fair: '网络：一般',
+				poor: '网络：较差'
+			},
+			videoPaused: '你的网络较慢：已暂停视频，语音照常。'
 		},
 		invite: {
 			title: '邀请',

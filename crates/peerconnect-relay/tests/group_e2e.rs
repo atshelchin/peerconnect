@@ -584,3 +584,78 @@ async fn each_member_gets_the_video_layer_it_subscribed_to() {
     let moved = at_b.iter().position(|&l| l == 2).expect("b gets layer 2");
     assert!(at_b.len() >= 80 && moved <= 10 && at_b[moved..].iter().all(|&l| l == 2), "b: {at_b:?}");
 }
+
+#[tokio::test]
+async fn a_slow_link_gets_smaller_video_and_more_again_once_it_keeps_up() {
+    let relay = Relay::start().await;
+    let Some(local) = &relay.local else { return }; // shapes the path
+    let slow = Path::new(local.addr, Duration::ZERO).await;
+    slow.down_kbps.store(1000, std::sync::atomic::Ordering::Relaxed);
+    let group = Group::create(&relay.url).unwrap();
+    let mut a = join(&group, "a");
+    let mut b = join(&group.with_relay(&slow.url("quic")).unwrap(), "b");
+    let mut c = join(&group, "c");
+    for conn in [&mut a, &mut b, &mut c] {
+        admitted(conn, 2).await;
+    }
+    for conn in [&b, &c] {
+        conn.subscribe(a.id(), Some(2));
+    }
+    // a sends 360p at 400 kbit/s and 720p at 1.5 Mbit/s, 30 frames a second;
+    // b's link takes 1 Mbit/s for the first 6 s, then whatever comes.
+    let sender = a.sender();
+    let start = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_millis(33));
+    let (mut keyframe_due, mut demand) = ([true; 3], 0u8);
+    let (mut at_b, mut at_c, mut limits) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..(22_000 / 33) {
+        tick.tick().await;
+        if start.elapsed() > Duration::from_secs(6) {
+            slow.down_kbps.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for (layer, size) in [(1u8, 1666), (2, 6250)] {
+            let keyframe = keyframe_due[layer as usize] || i % 60 == 0;
+            keyframe_due[layer as usize] = false;
+            sender.send_video(0, layer, keyframe, i, vec![layer; if keyframe { 4 * size } else { size }]);
+        }
+        while let Some(event) = a.try_next() {
+            match event {
+                Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
+                Event::VideoDemand { layers } => {
+                    for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
+                        *due |= layers & !demand & 1 << layer != 0;
+                    }
+                    demand = layers;
+                }
+                _ => {}
+            }
+        }
+        let t = start.elapsed().as_millis();
+        while let Some(event) = b.try_next() {
+            match event {
+                Event::Video { layer, .. } => at_b.push((t, layer)),
+                Event::VideoLimit { layer } => limits.push((t, layer)),
+                _ => {}
+            }
+        }
+        while let Some(event) = c.try_next() {
+            if let Event::Video { layer, .. } = event {
+                at_c.push((t, layer));
+            }
+        }
+    }
+    let layers_between = |got: &[(u128, u8)], from: u128, to: u128| -> Vec<u8> {
+        got.iter().filter(|(t, _)| (from..to).contains(t)).map(|&(_, l)| l).collect()
+    };
+    eprintln!("b's link limits: {limits:?}");
+    // c, on a fast link, gets 720p throughout.
+    assert!(layers_between(&at_c, 1000, 22_000).iter().all(|&l| l == 2));
+    // b is moved down within a few seconds, and gets 360p while its link is slow…
+    let (down_at, down) = limits.first().copied().expect("b's link was limited");
+    assert!(down_at < 4000 && down == Some(1), "{limits:?}");
+    let slow_part = layers_between(&at_b, down_at + 1000, 6000);
+    assert!(!slow_part.is_empty() && slow_part.iter().all(|&l| l == 1), "{slow_part:?}");
+    // …and back to 720p once it keeps up again.
+    assert!(limits.iter().any(|&(t, l)| t > 6000 && l == Some(3)), "{limits:?}");
+    assert_eq!(at_b.last().map(|&(_, l)| l), Some(2), "720p again at the end");
+}

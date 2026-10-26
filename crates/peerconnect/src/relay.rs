@@ -144,10 +144,13 @@ impl GroupConn {
 /// Which layer of each member's video a relay forwards each other member
 /// (GROUP.md §3.3): the layer it subscribed to (layer 0 until it says
 /// otherwise), or, if the sender does not send that one, the nearest below
-/// it that the sender does, or else the lowest. A change takes effect at the
-/// new layer's next keyframe, the old layer going on until then, so that the
-/// picture never stops. Each sender is told which of its layers are wanted
-/// (DEMAND), so that it encodes only those. Free of I/O, for relays to share.
+/// it that the sender does, or else the lowest; never above what the
+/// receiver's link takes now. A move up takes effect at the new layer's
+/// next keyframe, the old layer going on until then, so that the picture
+/// never stops; a move down for a link that cannot keep up stops the larger
+/// layer at once. Each sender is told which of its layers are wanted
+/// (DEMAND), each receiver how far its link limits it (LIMIT). Free of I/O,
+/// for relays to share.
 #[derive(Debug, Clone)]
 pub struct VideoRouter {
     /// By receiver, then sender: the layer subscribed to (`None`: no video).
@@ -158,12 +161,56 @@ pub struct VideoRouter {
     seen: [[Option<u64>; LAYERS]; SLOTS],
     /// By sender: the DEMAND it was last sent, if seated.
     told: [Option<Option<u8>>; SLOTS],
+    /// By receiver: what its link takes.
+    links: [Link; SLOTS],
+}
+
+/// How many layers a receiver's link takes now, and when to try one more.
+#[derive(Debug, Clone, Copy)]
+struct Link {
+    /// Layers 0 to `layers - 1` (none: audio only); [`LAYERS`] when unlimited.
+    layers: u8,
+    /// The LIMIT the receiver was last told.
+    told: u8,
+    changed_at: u64,
+    /// The last sign that it could not keep up, and since when that lasts.
+    congested_at: Option<u64>,
+    congested_since: Option<u64>,
+    /// When it was last given one more layer, while that is on trial.
+    raised_at: Option<u64>,
+    /// How long it must keep up before it is given one more.
+    wait: u64,
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Link {
+            layers: LAYERS as u8,
+            told: LAYERS as u8,
+            changed_at: 0,
+            congested_at: None,
+            congested_since: None,
+            raised_at: None,
+            wait: PROBE_WAIT,
+        }
+    }
 }
 
 const SLOTS: usize = group::wire::MAX_SLOTS;
 const LAYERS: usize = group::wire::VIDEO_LAYERS as usize;
 /// A layer not seen for this long (ms) is taken to be no longer sent.
 const LAYER_FRESH: u64 = 1000;
+/// A link whose video stays queued this long (ms) does not keep up.
+const CONGESTED_FOR: u64 = 300;
+/// After a change, a link's signals are ignored this long (ms): the move
+/// takes a keyframe, and the queue a moment to drain.
+const LINK_SETTLE: u64 = 2000;
+/// A link that keeps up this long (ms) is given one more layer to try; the
+/// wait doubles, up to [`PROBE_MAX`], each time a try fails within
+/// [`PROBE_TRIAL`].
+const PROBE_WAIT: u64 = 8000;
+const PROBE_MAX: u64 = 60_000;
+const PROBE_TRIAL: u64 = 5000;
 
 impl Default for VideoRouter {
     fn default() -> Self {
@@ -172,13 +219,14 @@ impl Default for VideoRouter {
             forwarding: [[None; SLOTS]; SLOTS],
             seen: [[None; LAYERS]; SLOTS],
             told: [None; SLOTS],
+            links: [Link::default(); SLOTS],
         }
     }
 }
 
 impl VideoRouter {
-    /// A new connection in `slot`: it wants layer 0 of everyone, and nobody
-    /// has subscribed to its video yet.
+    /// A new connection in `slot`: it wants layer 0 of everyone, nobody has
+    /// subscribed to its video yet, and its link takes everything.
     pub fn seat(&mut self, slot: u8) {
         self.reset(slot);
         self.told[slot as usize] = Some(None);
@@ -199,6 +247,7 @@ impl VideoRouter {
             self.forwarding[other][s] = None;
         }
         self.seen[s] = [None; LAYERS];
+        self.links[s] = Link::default();
     }
 
     /// `receiver` subscribed to `layer` of `sender`'s video.
@@ -211,22 +260,67 @@ impl VideoRouter {
         }
     }
 
+    /// What the relay sees of `receiver`'s link now: whether its video is
+    /// waiting longer than it should (`congested`), and whether video for it
+    /// was dropped since it last said (`dropped`). Call it before forwarding
+    /// it a video frame. A link that does not keep up is moved below the
+    /// largest layer it gets (to none of them, from the smallest); one that
+    /// keeps up long enough is given one more layer to try.
+    pub fn link(&mut self, now: u64, receiver: u8, congested: bool, dropped: bool) {
+        let r = receiver as usize;
+        let top = self.forwarding[r].iter().flatten().max().copied();
+        let l = &mut self.links[r];
+        if !congested && !dropped {
+            l.congested_since = None;
+            if l.raised_at.is_some_and(|at| now.saturating_sub(at) >= PROBE_TRIAL) {
+                l.raised_at = None;
+                l.wait = PROBE_WAIT;
+            }
+            let calm_since = l.congested_at.map_or(l.changed_at, |at| at.max(l.changed_at));
+            if (l.layers as usize) < LAYERS && now.saturating_sub(calm_since) >= l.wait {
+                l.layers += 1;
+                l.changed_at = now;
+                l.raised_at = Some(now);
+            }
+            return;
+        }
+        l.congested_at = Some(now);
+        if now.saturating_sub(l.changed_at) < LINK_SETTLE && l.changed_at != 0 {
+            return;
+        }
+        let since = *l.congested_since.get_or_insert(now);
+        if dropped || now.saturating_sub(since) >= CONGESTED_FOR {
+            l.layers = top.map_or(l.layers.saturating_sub(1), |top| top.min(l.layers.saturating_sub(1)));
+            if l.raised_at.take().is_some_and(|at| now.saturating_sub(at) < PROBE_TRIAL) {
+                l.wait = (l.wait * 2).min(PROBE_MAX);
+            }
+            l.changed_at = now;
+            l.congested_since = None;
+        }
+    }
+
     /// Whether to forward a video frame of type `kind`, sent by `sender` to
     /// everyone, to `receiver`. Call it for each receiver in turn.
     pub fn forward(&mut self, now: u64, sender: u8, receiver: u8, kind: u8) -> bool {
         let Some((layer, keyframe)) = group::wire::video_layer(kind) else { return true };
         let (s, r) = (sender as usize, receiver as usize);
         self.seen[s][layer as usize] = Some(now);
-        let Some(want) = self.wanted[r][s] else {
+        let (Some(want), Some(limit)) = (self.wanted[r][s], self.links[r].layers.checked_sub(1)) else {
             self.forwarding[r][s] = None;
             return false;
         };
         let sent = |l: u8| self.seen[s][l as usize].is_some_and(|at| now.saturating_sub(at) <= LAYER_FRESH);
-        let target = (0..=want).rev().find(|&l| sent(l)).or_else(|| (want + 1..LAYERS as u8).find(|&l| sent(l)));
+        let target = (0..=want.min(limit)).rev().find(|&l| sent(l)).or_else(|| (0..=limit).find(|&l| sent(l)));
         match self.forwarding[r][s] {
-            Some(current) if current == layer => true,
-            // The new layer from its keyframe on, or at once if the old one stopped.
-            Some(current) if target == Some(layer) && (keyframe || !sent(current)) => {
+            Some(current) if current == layer && layer <= limit => true,
+            // Too large for the link now: stopped at once.
+            Some(current) if current == layer => {
+                self.forwarding[r][s] = None;
+                false
+            }
+            // The new layer from its keyframe on, or at once if the old one
+            // stopped (or was stopped: the receiver waits for a keyframe).
+            Some(current) if target == Some(layer) && (keyframe || !sent(current) || current > limit) => {
                 self.forwarding[r][s] = Some(layer);
                 true
             }
@@ -241,20 +335,37 @@ impl VideoRouter {
 
     /// The DEMAND frames due, `(slot, layers)`: for every seated sender whose
     /// wanted layers changed since it was last told. Layers being forwarded
-    /// count as wanted until the switch away from them is done.
+    /// count as wanted until the move away from them is done; a layer above
+    /// what a receiver's link takes is not wanted by it.
     pub fn demands(&mut self) -> Vec<(u8, u8)> {
         let mut due = Vec::new();
         for s in 0..SLOTS {
             let Some(told) = self.told[s] else { continue };
             let mut layers = 0u8;
             for r in (0..SLOTS).filter(|&r| r != s && self.told[r].is_some()) {
-                for layer in [self.wanted[r][s], self.forwarding[r][s]].into_iter().flatten() {
+                let Some(limit) = self.links[r].layers.checked_sub(1) else { continue };
+                let forwarding = self.forwarding[r][s].filter(|&l| l <= limit);
+                for layer in [self.wanted[r][s].map(|l| l.min(limit)), forwarding].into_iter().flatten() {
                     layers |= 1 << layer;
                 }
             }
             if told != Some(layers) {
                 self.told[s] = Some(Some(layers));
                 due.push((s as u8, layers));
+            }
+        }
+        due
+    }
+
+    /// The LIMIT frames due, `(slot, layer)`: the largest layer each seated
+    /// receiver's link takes now (`None`: no video at all), for those whose
+    /// limit changed since they were last told.
+    pub fn limits(&mut self) -> Vec<(u8, Option<u8>)> {
+        let mut due = Vec::new();
+        for (r, link) in self.links.iter_mut().enumerate() {
+            if self.told[r].is_some() && link.told != link.layers {
+                link.told = link.layers;
+                due.push((r as u8, link.layers.checked_sub(1)));
             }
         }
         due
@@ -438,5 +549,67 @@ mod tests {
         assert_eq!(r.demands(), [(0, 0b10)]);
         r.leave(1);
         assert_eq!(r.demands(), [(0, 0)], "the subscriber left");
+    }
+
+    #[test]
+    fn a_link_that_does_not_keep_up_gets_smaller_layers_then_none() {
+        let mut r = VideoRouter::default();
+        for slot in 0..2 {
+            r.seat(slot);
+        }
+        r.subscribe(1, 0, Some(2));
+        assert!(r.forward(0, 0, 1, v(1, true)));
+        assert!(r.forward(1, 0, 1, v(2, true)));
+        assert_eq!(r.limits(), []);
+        r.demands();
+        // Video waits, but not for long enough to count.
+        r.link(100, 1, true, false);
+        r.link(300, 1, false, false);
+        r.link(500, 1, true, false);
+        assert_eq!(r.limits(), []);
+        // It goes on waiting: below layer 2, at once.
+        r.link(500 + CONGESTED_FOR, 1, true, false);
+        assert_eq!(r.limits(), [(1, Some(1))]);
+        assert!(!r.forward(900, 0, 1, v(2, false)), "the larger layer stops at once");
+        assert!(r.forward(901, 0, 1, v(1, false)), "the smaller one goes on");
+        assert_eq!(r.demands(), [(0, 0b10)], "layer 2 is no longer wanted");
+        // Signals are ignored while the move settles; then a drop moves it at once.
+        r.link(1000, 1, true, true);
+        assert_eq!(r.limits(), []);
+        r.link(900 + LINK_SETTLE, 1, true, true);
+        assert_eq!(r.limits(), [(1, Some(0))], "below layer 1");
+        assert!(!r.forward(3000, 0, 1, v(1, true)), "a sends nothing that small");
+        assert_eq!(r.demands(), [(0, 0b1)], "so a is asked for layer 0");
+        r.link(3000 + LINK_SETTLE, 1, true, true);
+        assert_eq!(r.limits(), [(1, None)], "and below that: audio only");
+        assert_eq!(r.demands(), [(0, 0)], "nothing to encode for it");
+    }
+
+    #[test]
+    fn a_link_that_keeps_up_is_given_more_and_tries_less_often_after_failing() {
+        let mut r = VideoRouter::default();
+        r.seat(0);
+        r.seat(1);
+        r.subscribe(1, 0, Some(2));
+        assert!(r.forward(0, 0, 1, v(2, true)));
+        r.link(10_000, 1, true, true);
+        assert_eq!(r.limits(), [(1, Some(1))]);
+        // Calm for PROBE_WAIT: one more layer to try.
+        r.link(10_000 + PROBE_WAIT - 1, 1, false, false);
+        assert_eq!(r.limits(), []);
+        r.link(10_000 + PROBE_WAIT, 1, false, false);
+        assert_eq!(r.limits(), [(1, Some(2))]);
+        // The try fails at once: back down, and the next try waits twice as long.
+        let failed = 10_000 + PROBE_WAIT + LINK_SETTLE;
+        assert!(r.forward(failed - 1, 0, 1, v(2, true)));
+        r.link(failed, 1, true, true);
+        assert_eq!(r.limits(), [(1, Some(1))]);
+        r.link(failed + PROBE_WAIT, 1, false, false);
+        assert_eq!(r.limits(), [], "not yet");
+        r.link(failed + 2 * PROBE_WAIT, 1, false, false);
+        assert_eq!(r.limits(), [(1, Some(2))]);
+        // A try that holds brings the wait back down.
+        r.link(failed + 2 * PROBE_WAIT + PROBE_TRIAL, 1, false, false);
+        assert_eq!(r.links[1].wait, PROBE_WAIT);
     }
 }

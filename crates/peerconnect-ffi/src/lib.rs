@@ -45,6 +45,7 @@ pub const PC_FULL: i32 = 21;
 pub const PC_VIDEO: i32 = 22;
 pub const PC_KEYFRAME_REQUEST: i32 = 23;
 pub const PC_VIDEO_DEMAND: i32 = 24;
+pub const PC_VIDEO_LIMIT: i32 = 25;
 
 #[repr(C)]
 pub struct PcOutput {
@@ -343,6 +344,10 @@ fn fill(event: Event, out: &mut PcOutput) -> (i32, Vec<u8>) {
         Event::VideoDemand { layers } => {
             out.layer = layers;
             (PC_VIDEO_DEMAND, Vec::new())
+        }
+        Event::VideoLimit { layer } => {
+            out.layer = layer.unwrap_or(0xFF);
+            (PC_VIDEO_LIMIT, Vec::new())
         }
         Event::Replaced => (PC_REPLACED, Vec::new()),
         Event::Full => (PC_FULL, Vec::new()),

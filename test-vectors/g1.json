@@ -34,6 +34,8 @@
   "subscribe_r": "850202",
   "subscribe_r_none": "8502ff",
   "demand_s": "8606",
+  "limit_r": "8701",
+  "limit_r_none": "87ff",
   "member_arrived": "840201",
   "member_left": "840200",
   "frames": [
