@@ -409,18 +409,24 @@ impl Member {
                     set("from", id(from));
                     set("data", bytes(&data));
                 }
-                Event::Video { from, track, keyframe, timestamp, data } => {
+                Event::Video { from, track, layer, keyframe, timestamp, data } => {
                     kind("video");
                     set("from", id(from));
                     set("track", track.into());
+                    set("layer", layer.into());
                     set("keyframe", keyframe.into());
                     set("timestamp", timestamp.into());
                     set("data", bytes(&data));
                 }
-                Event::KeyframeRequest { from, track } => {
+                Event::KeyframeRequest { from, track, layer } => {
                     kind("keyframerequest");
                     set("from", id(from));
                     set("track", track.into());
+                    set("layer", layer.into());
+                }
+                Event::VideoDemand { layers } => {
+                    kind("videodemand");
+                    set("layers", layers.into());
                 }
                 Event::Missed { from, channel, count } => {
                     kind("missed");
@@ -465,8 +471,13 @@ impl Member {
     }
 
     #[wasm_bindgen(js_name = sendVideo)]
-    pub fn send_video(&mut self, track: u8, keyframe: bool, timestamp: u32, data: &[u8]) -> bool {
-        self.0.send_video(track, keyframe, timestamp, data)
+    pub fn send_video(&mut self, track: u8, layer: u8, keyframe: bool, timestamp: u32, data: &[u8]) -> bool {
+        self.0.send_video(track, layer, keyframe, timestamp, data)
+    }
+
+    /// `layer` undefined: no video from `member`.
+    pub fn subscribe(&mut self, member: &str, layer: Option<u8>) -> Result<(), JsError> {
+        Ok(self.0.subscribe(member_of(member)?, layer)?)
     }
 
     #[wasm_bindgen(js_name = sendDatagram)]

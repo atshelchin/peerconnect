@@ -167,7 +167,10 @@
 	So a chat flood or a 50 MB snapshot never delays a command, voice never waits behind chat, and
 	video never starves chat. In the browser, <code>startVideo</code> from
 	<code>peerconnect/video</code> sends the camera through WebCodecs and draws each member into a canvas.
-	Each message on the command and chat streams carries up to 16,352 bytes.
+	Video goes in layers (simulcast): each member receives, of each other’s video, the layer that fits the
+	canvas it is drawn in (the large picture for a large tile, a small one for a thumbnail, nothing for
+	a hidden one), the relay switches layers at a keyframe so the picture never stops, and senders encode
+	only the layers someone wants. Each message on the command and chat streams carries up to 16,352 bytes.
 </p>
 
 <h2 id="transport">QUIC only</h2>
@@ -349,7 +352,13 @@
 	<table>
 		<thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
 		<tbody>
-			<tr><td><code>bitrate</code></td><td><code>24000</code></td><td>Opus bits per second.</td></tr
+			<tr><td><code>bitrate</code></td><td><code>32000</code></td><td>Opus bits per second.</td></tr
+			>
+			<tr
+				><td><code>redundancy</code></td><td><code>2</code></td><td
+					>Copies of the previous frames carried in each packet (0–2), so that a lost packet is
+					recovered from the next one. Receivers that do not use them play the packet as before.</td
+				></tr
 			>
 			<tr
 				><td><code>frameMs</code></td><td><code>20</code></td><td

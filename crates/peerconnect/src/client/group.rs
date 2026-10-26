@@ -132,10 +132,17 @@ impl GroupSender {
         let _ = self.command(Command::Voice(seq, data.into()));
     }
 
-    /// Sends a video frame to everyone (see [`group::Member::send_video`]);
-    /// fragments are dropped, oldest first, when the connection backs up.
-    pub fn send_video(&self, track: u8, keyframe: bool, timestamp: u32, data: impl Into<Vec<u8>>) {
-        let _ = self.command(Command::Video(track, keyframe, timestamp, data.into()));
+    /// Sends a video frame of `layer` of `track` to everyone (see
+    /// [`group::Member::send_video`]); fragments are dropped, oldest first,
+    /// when the connection backs up.
+    pub fn send_video(&self, track: u8, layer: u8, keyframe: bool, timestamp: u32, data: impl Into<Vec<u8>>) {
+        let _ = self.command(Command::Video(track, layer, keyframe, timestamp, data.into()));
+    }
+
+    /// Asks the relay for `layer` of `member`'s video, `None` for none (see
+    /// [`group::Member::subscribe`]).
+    pub fn subscribe(&self, member: MemberId, layer: Option<u8>) {
+        let _ = self.command(Command::Subscribe(member, layer));
     }
 
     /// Sends a datagram to one member or to all; dropped rather than delayed.
@@ -167,7 +174,8 @@ enum Command {
     Send(Channel, Vec<u8>, oneshot::Sender<Result<u64, SendError>>),
     SendTo(MemberId, Channel, Vec<u8>, oneshot::Sender<Result<(), SendError>>),
     Voice(u16, Vec<u8>),
-    Video(u8, bool, u32, Vec<u8>),
+    Video(u8, u8, bool, u32, Vec<u8>),
+    Subscribe(MemberId, Option<u8>),
     Datagram(Option<MemberId>, Vec<u8>),
     RequestSync(MemberId, oneshot::Sender<Result<(), SendError>>),
     ProvideSync(MemberId, u32, Vec<u8>),
@@ -229,8 +237,11 @@ async fn drive(
                 Some(Command::SendTo(to, channel, data, reply)) => {
                     let _ = reply.send(member.send_to(to, channel, &data));
                 }
-                Some(Command::Video(track, keyframe, timestamp, data)) => {
-                    member.send_video(track, keyframe, timestamp, &data);
+                Some(Command::Video(track, layer, keyframe, timestamp, data)) => {
+                    member.send_video(track, layer, keyframe, timestamp, &data);
+                }
+                Some(Command::Subscribe(of, layer)) => {
+                    let _ = member.subscribe(of, layer);
                 }
                 Some(Command::Voice(seq, data)) => {
                     member.send_voice(seq, &data);

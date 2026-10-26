@@ -27,16 +27,20 @@
 	/** A member's video is shown while frames keep coming: at least one in this long. */
 	const VIDEO_FRESH = 2000;
 	/**
-	 * 720p at 30 frames a second, as meeting apps send; the encoder steps
-	 * down towards `minBitrate` while receivers keep losing frames.
+	 * Two sizes at 30 frames a second, as meeting apps send: 720p for those
+	 * who show us large, 360p for small tiles. Each is encoded only while
+	 * someone shows it, and steps down towards `minBitrate` while its
+	 * receivers keep losing frames.
 	 */
 	const VIDEO = {
-		width: 1280,
-		height: 720,
 		framerate: 30,
-		bitrate: 1_500_000,
-		minBitrate: 200_000
+		layers: [
+			{ layer: 1, width: 640, height: 360, bitrate: 400_000, minBitrate: 150_000 },
+			{ layer: 2, width: 1280, height: 720, bitrate: 1_500_000, minBitrate: 300_000 }
+		]
 	};
+	/** The camera at the largest size we send. */
+	const CAMERA = { width: 1280, height: 720, frameRate: VIDEO.framerate };
 	/** Offline this long after joining, the network is probably what stops it (UDP blocked). */
 	const UNREACHABLE = 10_000;
 
@@ -380,8 +384,8 @@
 		try {
 			testCamera = await navigator.mediaDevices.getUserMedia({
 				video: cameraDevice
-					? { deviceId: { exact: cameraDevice }, width: VIDEO.width, height: VIDEO.height }
-					: { width: VIDEO.width, height: VIDEO.height }
+					? { deviceId: { exact: cameraDevice }, width: CAMERA.width, height: CAMERA.height }
+					: { width: CAMERA.width, height: CAMERA.height }
 			});
 		} catch {
 			raise('camera');
@@ -547,6 +551,8 @@
 			try {
 				video = await videoSdk!.startVideo(c, {
 					...VIDEO,
+					// A card shows video once frames come: until then, the smallest layer.
+					unattached: 0,
 					onFrame: (member, decoded) => {
 						frames.set(member, performance.now());
 						decoded.close();
@@ -653,7 +659,7 @@
 		// Phones cannot open a second camera while one is open.
 		cameraStream?.getTracks().forEach((t) => t.stop());
 		const stream = await navigator.mediaDevices.getUserMedia({
-			video: { width: VIDEO.width, height: VIDEO.height, frameRate: VIDEO.framerate, ...which }
+			video: { ...CAMERA, ...which }
 		});
 		cameraStream = stream;
 		const settings = stream.getVideoTracks()[0]?.getSettings() ?? {};
@@ -694,6 +700,13 @@
 			switching = false;
 		}
 	}
+
+	// Each canvas gets the layer that suits its size (the video SDK sees to
+	// it); those behind someone watched across the whole window get none.
+	$effect(() => {
+		if (!video) return;
+		for (const m of others) video.setLayer(m.id, maximized && maximized !== m.id ? null : 'auto');
+	});
 
 	/** Draws a member's video into this canvas while it is on the page. */
 	function screen(node: HTMLCanvasElement, id: string) {

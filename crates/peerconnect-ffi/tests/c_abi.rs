@@ -16,8 +16,10 @@ struct Driver {
     /// The transfer id of the latest PC_SYNC_REQUEST.
     transfer: Option<u32>,
     events: Vec<(i32, [u8; 32], Vec<u8>)>,
-    /// PC_VIDEO: track, keyframe, timestamp, data.
+    /// PC_VIDEO: track, keyframe, timestamp, data (layer 0).
     videos: Vec<(u8, u8, u32, Vec<u8>)>,
+    /// PC_VIDEO_DEMAND: the layers wanted of us.
+    demands: Vec<u8>,
 }
 
 impl Driver {
@@ -31,7 +33,7 @@ impl Driver {
         let invite = CString::new(invite).unwrap();
         let c = unsafe { pc_client_join(invite.as_ptr(), seed.as_ptr(), name.as_ptr(), name.len()) };
         assert!(!c.is_null());
-        Driver { c, seed, transfer: None, events: Vec::new(), videos: Vec::new() }
+        Driver { c, seed, transfer: None, events: Vec::new(), videos: Vec::new(), demands: Vec::new() }
     }
 
     fn id(&self) -> [u8; 32] {
@@ -55,6 +57,9 @@ impl Driver {
             }
             if kind == PC_VIDEO {
                 self.videos.push((out.track, out.keyframe, out.timestamp, data.clone()));
+            }
+            if kind == PC_VIDEO_DEMAND {
+                self.demands.push(out.layer);
             }
             self.events.push((kind, out.member, data))
         }
@@ -122,7 +127,7 @@ async fn two_members_through_the_c_abi() {
     assert_eq!(id, 0);
     unsafe { pc_client_send_voice(a.c, 3, b"opus".as_ptr(), 4) };
     let picture: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
-    unsafe { pc_client_send_video(a.c, 2, 1, 4321, picture.as_ptr(), picture.len()) };
+    unsafe { pc_client_send_video(a.c, 2, 0, 1, 4321, picture.as_ptr(), picture.len()) };
     let b_id = b.id();
     assert_eq!(unsafe { pc_client_send_to(a.c, b_id.as_ptr(), 1, b"psst".as_ptr(), 4) }, PC_OK);
     assert_eq!(unsafe { pc_client_send(a.c, 7, b"x".as_ptr(), 1, std::ptr::null_mut()) }, PC_INVALID);
@@ -141,6 +146,14 @@ async fn two_members_through_the_c_abi() {
     .await;
     assert!(a.has(PC_MESSAGE, b"place block"), "own messages are delivered too");
     assert_eq!(b.videos, [(2, 1, 4321, picture)], "a video frame, whole");
+
+    // a asks for layer 2 of b's video: the relay tells b.
+    let a_id = a.id();
+    assert_eq!(unsafe { pc_client_subscribe(a.c, b_id.as_ptr(), 2) }, PC_OK);
+    assert_eq!(unsafe { pc_client_subscribe(a.c, b_id.as_ptr(), 9) }, PC_INVALID);
+    until(&mut [&mut a, &mut b], |d| d[1].demands.last() == Some(&0b100)).await;
+    assert_eq!(unsafe { pc_client_subscribe(b.c, a_id.as_ptr(), 0xFF) }, PC_OK);
+    until(&mut [&mut a, &mut b], |d| d[0].demands.last() == Some(&0)).await;
 
     drop(b);
     until(&mut [&mut a], |d| d[0].events.iter().any(|(k, m, _)| *k == PC_LEFT && *m == b_id)).await;

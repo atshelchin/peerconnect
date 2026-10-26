@@ -243,16 +243,18 @@ fn generate() -> String {
     deliver(&mut r, &abort);
     frames.push(sealed("sync_abort", &s_fixed.key, abort, vec![("transfer", "16909061".into())]));
 
-    // Video (§7.4): a keyframe in two fragments, the second lost; R asks for
-    // it again, and S resends it to R alone. Then a frame of another track
-    // that cannot be decoded without its keyframe: R asks for one.
+    // Video (§7.4): a keyframe of layer 2 in two fragments, the second lost;
+    // R asks for it again, and S resends it to R alone. Then a frame of
+    // layer 1 of another track that cannot be decoded without its keyframe:
+    // R asks for one.
     let picture = [&[1u8][..], &(0..1499u32).map(|i| i as u8).collect::<Vec<u8>>()].concat();
-    assert!(s.send_video(1, true, 9000, &picture));
+    assert!(s.send_video(1, 2, true, 9000, &picture));
     let [video0, video1] = <[Vec<u8>; 2]>::try_from(drain(&mut s).0).unwrap();
     assert!(deliver(&mut r, &video0).is_empty());
     let video_fields = |index: usize, data: &[u8]| {
         vec![
             ("track", "1".into()),
+            ("layer", "2".into()),
             ("frame", "0".into()),
             ("index", index.to_string()),
             ("count", "2".into()),
@@ -271,12 +273,12 @@ fn generate() -> String {
         "video_nack",
         &r_fixed.key,
         nack,
-        vec![("track", "1".into()), ("frame", "0".into()), ("indices", "[1]".into())],
+        vec![("track", "1".into()), ("layer", "2".into()), ("frame", "0".into()), ("indices", "[1]".into())],
     ));
     let again = only(drain(&mut s).0);
     deliver(&mut r, &again);
     frames.push(sealed("video_resent", &s_fixed.key, again, video_fields(1, part1)));
-    assert!(s.send_video(2, false, 9033, b"\x01delta"));
+    assert!(s.send_video(2, 1, false, 9033, b"\x01delta"));
     let delta = only(drain(&mut s).0);
     let request = only(deliver(&mut r, &delta));
     frames.push(sealed(
@@ -285,6 +287,7 @@ fn generate() -> String {
         delta,
         vec![
             ("track", "2".into()),
+            ("layer", "1".into()),
             ("frame", "0".into()),
             ("index", "0".into()),
             ("count", "1".into()),
@@ -294,8 +297,8 @@ fn generate() -> String {
         ],
     ));
     s.handle_binary(0, &request);
-    assert_eq!(drain(&mut s).1, [Event::KeyframeRequest { from: r_id, track: 2 }]);
-    frames.push(sealed("keyframe_request", &r_fixed.key, request, vec![("track", "2".into())]));
+    assert_eq!(drain(&mut s).1, [Event::KeyframeRequest { from: r_id, track: 2, layer: 1 }]);
+    frames.push(sealed("keyframe_request", &r_fixed.key, request, vec![("track", "2".into()), ("layer", "1".into())]));
 
     // What R's application saw, in order: everything, exactly once.
     let message = |from, channel, data: &[u8], direct| Event::Message { from, channel, data: data.to_vec(), direct };
@@ -310,7 +313,7 @@ fn generate() -> String {
             message(s_id, Channel::Command, b"place block 8", false),
             Event::Snapshot { from: s_id, data: b"world".to_vec() },
             Event::SyncFailed { from: s_id },
-            Event::Video { from: s_id, track: 1, keyframe: true, timestamp: 9000, data: picture },
+            Event::Video { from: s_id, track: 1, layer: 2, keyframe: true, timestamp: 9000, data: picture },
         ]
     );
 
@@ -350,6 +353,10 @@ fn generate() -> String {
     }
     field("welcome_s", text(&hex(&wire::welcome(2, 1))));
     field("welcome_r", text(&hex(&wire::welcome(0, 1 << 2))));
+    // R asks for layer 2 of S's video; the relay tells S that layers 1 and 2 are wanted.
+    field("subscribe_r", text(&hex(&wire::subscribe(2, Some(2)))));
+    field("subscribe_r_none", text(&hex(&wire::subscribe(2, None))));
+    field("demand_s", text(&hex(&wire::demand(0b110))));
     field("member_arrived", text(&hex(&wire::member(2, true))));
     field("member_left", text(&hex(&wire::member(2, false))));
     out.push_str("  \"frames\": [\n");

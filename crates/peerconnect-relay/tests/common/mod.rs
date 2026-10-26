@@ -156,6 +156,8 @@ pub struct Wire {
     /// Whether to read what arrives; while not, QUIC flow control holds the
     /// relay back, as it would for a member that stopped reading.
     reading: watch::Sender<bool>,
+    /// The DEMANDs the relay sent (GROUP.md §3.3), kept apart from the rest.
+    pub demands: Vec<u8>,
     _endpoint: quinn::Endpoint,
 }
 
@@ -227,7 +229,7 @@ impl Wire {
         tokio::spawn(async move {
             let _ = tx.send(Got::Closed(close_code(&s.closed().await)));
         });
-        Wire { session, streams: Default::default(), got, reading, _endpoint: endpoint }
+        Wire { session, streams: Default::default(), got, reading, demands: Vec::new(), _endpoint: endpoint }
     }
 
     /// Stops reading, or reads again.
@@ -262,8 +264,14 @@ impl Wire {
     }
 
     pub async fn next(&mut self) -> Got {
-        // Longer than the join timeout, for tests that wait it out.
-        timeout(Duration::from_secs(20), self.got.recv()).await.expect("nothing arrived").unwrap_or(Got::Closed(None))
+        loop {
+            // Longer than the join timeout, for tests that wait it out.
+            let got = timeout(Duration::from_secs(20), self.got.recv()).await.expect("nothing arrived");
+            match got.unwrap_or(Got::Closed(None)) {
+                Got::Frame(Class::Command, f) if f.len() == 2 && f[0] == wire::DEMAND => self.demands.push(f[1]),
+                got => return got,
+            }
+        }
     }
 
     /// The next frame, from a stream or a datagram.

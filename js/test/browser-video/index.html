@@ -80,9 +80,9 @@
     });
     const sentAt = new Map();
     const send = a.sendVideo.bind(a);
-    a.sendVideo = (track, keyframe, timestamp, data) => {
+    a.sendVideo = (track, layer, keyframe, timestamp, data) => {
       sentAt.set(timestamp, performance.now());
-      return send(track, keyframe, timestamp, data);
+      return send(track, layer, keyframe, timestamp, data);
     };
     const latencies = [];
     const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 } });
@@ -107,5 +107,99 @@
     const at = (q) => latencies[Math.floor((latencies.length - 1) * q)];
     return { connected, sent, received, p50: at(0.5), p99: at(0.99), max: at(1) };
   };
+  /** Resolves once `members` all see each other. */
+  function together(members) {
+    return new Promise((resolve) => {
+      const check = () => members.every((m) => m.members.size === members.length - 1) && resolve();
+      for (const m of members) m.addEventListener("joined", check);
+    });
+  }
+
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Simulcast: a sends layers 1 (640 × 360) and 2 (1280 × 720); b shows it
+  // large, c small. Then c stops showing it, and b shows it small.
+  window.simulcast = async ({ relay, hash, seconds }) => {
+    const group = Group.create(relay);
+    const webTransport = pinning(hash);
+    const [a, b, c] = ["a", "b", "c"].map((profile) => joinGroup(group, { profile, webTransport }));
+    await together([a, b, c]);
+    const sentAt = new Map();
+    const send = a.sendVideo.bind(a);
+    a.sendVideo = (track, layer, keyframe, timestamp, data) => {
+      sentAt.set(`${layer} ${timestamp}`, performance.now());
+      return send(track, layer, keyframe, timestamp, data);
+    };
+    // Per receiver: latencies by layer, and when each frame was decoded.
+    const seen = { b: { latencies: {}, at: [] }, c: { latencies: {}, at: [] } };
+    const watch = (who) => (member, frame, track, layer) => {
+      const now = performance.now();
+      const at = sentAt.get(`${layer} ${Math.round(frame.timestamp / 1000) >>> 0}`);
+      if (at !== undefined) (seen[who].latencies[layer] ??= []).push(now - at);
+      seen[who].at.push(now);
+      frame.close();
+    };
+    const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+    const va = await startVideo(a, {
+      stream: camera,
+      framerate: 20,
+      layers: [
+        { layer: 1, width: 640, height: 360, bitrate: 400_000, minBitrate: 150_000 },
+        { layer: 2, width: 1280, height: 720, bitrate: 1_500_000, minBitrate: 300_000 },
+      ],
+    });
+    const vb = await startVideo(b, { onFrame: watch("b"), unattached: null });
+    const vc = await startVideo(c, { onFrame: watch("c"), unattached: null });
+    const screen = (width, height) => {
+      const canvas = document.createElement("canvas");
+      canvas.style.cssText = `display: block; width: ${width}px; height: ${height}px`;
+      document.body.append(canvas);
+      return canvas;
+    };
+    const big = screen(960, 540); // 540 px high: layer 2
+    const small = screen(400, 225); // 225 px: layer 1
+    vb.attach(a.id, big);
+    vc.attach(a.id, small);
+    const of = (v) => v.stats().members.find((m) => m.member === a.id) ?? { received: 0, decoded: 0, layers: [] };
+    const snapshot = () => ({ a: va.stats(), b: of(vb), c: of(vc) });
+
+    await wait(seconds * 1000);
+    const both = snapshot();
+
+    // c no longer shows it: nothing more for c, and layer 1 is no longer wanted.
+    vc.attach(a.id, null);
+    small.remove();
+    await wait(1500);
+    const cStopped = snapshot();
+    await wait(2500);
+    const cGone = snapshot();
+
+    // b shows it small: layer 1 again, from its keyframe, with no gap; layer 2 stops.
+    const shrunkAt = performance.now();
+    big.style.width = "400px";
+    big.style.height = "225px";
+    await wait(2000);
+    const bMoved = snapshot();
+    await wait(2500);
+    const bSmall = snapshot();
+    const around = seen.b.at.filter((t) => t > shrunkAt - 1000 && t < shrunkAt + 3000);
+    let gap = 0;
+    for (let i = 1; i < around.length; i++) gap = Math.max(gap, around[i] - around[i - 1]);
+
+    const connected = [a.connected, b.connected, c.connected];
+    for (const v of [va, vb, vc]) v.stop();
+    camera.getTracks().forEach((t) => t.stop());
+    for (const m of [a, b, c]) m.leave();
+    big.remove();
+    const quantiles = (list = []) => {
+      list.sort((x, y) => x - y);
+      const at = (q) => list[Math.floor((list.length - 1) * q)];
+      return { count: list.length, p50: at(0.5), p99: at(0.99) };
+    };
+    const latency = {};
+    for (const who of ["b", "c"]) for (const [layer, list] of Object.entries(seen[who].latencies)) latency[`${who}${layer}`] = quantiles(list);
+    return { connected, both, cStopped, cGone, bMoved, bSmall, gap, latency };
+  };
+
   window.ready = true;
 </script>

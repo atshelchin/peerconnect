@@ -219,6 +219,8 @@ export class GroupConnection extends EventTarget {
   members = new Map();
   /** Our member ID. */
   id;
+  /** Which of our video layers the relay last said are wanted (bit n: layer n), if it has. */
+  videoDemand = undefined;
 
   #member;
   /** The open session to the relay. */
@@ -267,14 +269,27 @@ export class GroupConnection extends EventTarget {
   }
 
   /**
-   * Sends a video frame of `track` (up to 255,000 bytes) to everyone, cut
-   * into fragments that each fit a datagram; receivers get it whole, in
-   * order, as a "video" event, and ask for a keyframe ("keyframerequest")
-   * when they lose one for good. Dropped, oldest first, when the connection
-   * backs up. See `startVideo` in `peerconnect/video` for camera video.
+   * Sends a video frame of `layer` (0–3, from the smallest picture up) of
+   * `track` (up to 255,000 bytes), cut into fragments that each fit a
+   * datagram; the relay forwards each member the layer it subscribed to,
+   * and receivers get it whole, in order, as a "video" event, and ask for a
+   * keyframe ("keyframerequest") when they lose one for good. Dropped,
+   * oldest first, when the connection backs up. Send only the layers that
+   * "videodemand" says are wanted. See `startVideo` in `peerconnect/video`
+   * for camera video.
    */
-  sendVideo(track, keyframe, timestamp, data) {
-    return this.#do(() => this.#member.sendVideo(track, keyframe, timestamp >>> 0, bytes(data)));
+  sendVideo(track, layer, keyframe, timestamp, data) {
+    return this.#do(() => this.#member.sendVideo(track, layer, keyframe, timestamp >>> 0, bytes(data)));
+  }
+
+  /**
+   * Asks the relay for `layer` of `member`'s video from now on (`null`: none
+   * of it), also after either of us reconnects. It forwards the nearest layer
+   * `member` sends, switching at a keyframe; until asked, layer 0 or the
+   * nearest.
+   */
+  subscribe(member, layer) {
+    this.#do(() => this.#member.subscribe(member, layer ?? undefined));
   }
 
   /** Sends data that is dropped rather than delayed, to one member or (no `to`) everyone. */
@@ -336,6 +351,10 @@ export class GroupConnection extends EventTarget {
           break;
         case "left":
           this.members.delete(out.member);
+          this.#emit(out);
+          break;
+        case "videodemand":
+          this.videoDemand = out.layers;
           this.#emit(out);
           break;
         default:

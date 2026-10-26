@@ -151,7 +151,7 @@
 	的快照都不会耽误任何一条指令，语音也不会排在聊天后面，视频也不会挤掉聊天。浏览器里，<code
 		>peerconnect/video</code
 	>
-	的 <code>startVideo</code> 通过 WebCodecs 发送摄像头画面，并把每位成员画进一个 canvas。指令流和聊天流中的每条消息最多
+	的 <code>startVideo</code> 通过 WebCodecs 发送摄像头画面，并把每位成员画进一个 canvas。视频分档发送（同播）：每位成员按自己画面的大小，只收别人视频里合适的那一档（大画面收大图，缩略图收小图，看不见的不收），中继在关键帧处换档，画面不会中断；发送方只编码有人要的档位。指令流和聊天流中的每条消息最多
 	16,352 字节。
 </p>
 
@@ -304,7 +304,13 @@
 		<thead><tr><th>选项</th><th>默认值</th><th>含义</th></tr></thead>
 		<tbody>
 			<tr
-				><td><code>bitrate</code></td><td><code>24000</code></td><td>Opus 码率（比特每秒）。</td
+				><td><code>bitrate</code></td><td><code>32000</code></td><td>Opus 码率（比特每秒）。</td
+				></tr
+			>
+			<tr
+				><td><code>redundancy</code></td><td><code>2</code></td><td
+					>每个包里附带前几帧的副本（0–2
+					份），丢一个包可以从下一个包里补回来。不认识副本的接收方照常播放。</td
 				></tr
 			>
 			<tr

@@ -64,6 +64,10 @@ assert.equal(v.endpoint, `${v.relay_url}/g1/${v.group_id_text}`);
 // §3.2 Relay frames.
 assert.deepEqual(hex(v.welcome_s), cat([0x83, 2], u32(1 << 0)));
 assert.deepEqual(hex(v.welcome_r), cat([0x83, 0], u32(1 << 2)));
+// SUBSCRIBE (slot, layer; 0xFF for none) and DEMAND (a bitmap of layers), §3.2.
+assert.deepEqual(hex(v.subscribe_r), Buffer.from([0x85, 2, 2]));
+assert.deepEqual(hex(v.subscribe_r_none), Buffer.from([0x85, 2, 0xff]));
+assert.deepEqual(hex(v.demand_s), Buffer.from([0x86, 0b110]));
 assert.deepEqual(hex(v.member_arrived), Buffer.from([0x84, 2, 1]));
 assert.deepEqual(hex(v.member_left), Buffer.from([0x84, 2, 0]));
 
@@ -105,7 +109,9 @@ for (const [who, slot, to, echo] of [
 }
 
 // §4.3, §5, §6: every sealed frame, rebuilt from its fields.
-const CONTROL = 0x02, COMMAND = 0x03, VOICE = 0x21, DATAGRAM = 0x22, VIDEO = 0x31, CHAT = 0x41, BULK = 0x61;
+const CONTROL = 0x02, COMMAND = 0x03, VOICE = 0x21, DATAGRAM = 0x22, CHAT = 0x41, BULK = 0x61;
+// Video fragments carry their layer and whether they are part of a keyframe in the type (§7.4).
+const video = (f) => 0x30 | (Number(f.layer) << 1) | (f.keyframe ? 1 : 0);
 // §7.4: track[1] frame[4] index[1] count[1] flags[1] timestamp[4] ‖ data.
 const fragment = (f) => cat([f.track], u32(f.frame), [f.index, f.count, f.keyframe ? 1 : 0], u32(f.timestamp), hex(f.data));
 const message = (f) => cat([0x00], u64(f.id), ascii(f.payload));
@@ -133,12 +139,12 @@ const builders = {
   bulk: (f) => [BULK, 2, 0, cat(u32(f.transfer), ascii(f.data))],
   sync_ack: (f) => [CONTROL, 0, 2, cat([0x12], u32(f.transfer), u64(f.received))],
   sync_abort: (f) => [CONTROL, 2, 0, cat([0x13], u32(f.transfer))],
-  video_fragment: (f) => [VIDEO, 2, BROADCAST, fragment(f)],
-  video_fragment_lost: (f) => [VIDEO, 2, BROADCAST, fragment(f)],
-  video_nack: (f) => [CONTROL, 0, 2, cat([0x20, f.track], u32(f.frame), f.indices)],
-  video_resent: (f) => [VIDEO, 2, 0, fragment(f)],
-  video_delta: (f) => [VIDEO, 2, BROADCAST, fragment(f)],
-  keyframe_request: (f) => [CONTROL, 0, 2, cat([0x21, f.track])],
+  video_fragment: (f) => [video(f), 2, BROADCAST, fragment(f)],
+  video_fragment_lost: (f) => [video(f), 2, BROADCAST, fragment(f)],
+  video_nack: (f) => [CONTROL, 0, 2, cat([0x20, f.track, f.layer], u32(f.frame), f.indices)],
+  video_resent: (f) => [video(f), 2, 0, fragment(f)],
+  video_delta: (f) => [video(f), 2, BROADCAST, fragment(f)],
+  keyframe_request: (f) => [CONTROL, 0, 2, cat([0x21, f.track, f.layer])],
 };
 
 for (const frame of v.frames) {

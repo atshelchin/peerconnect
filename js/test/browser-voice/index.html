@@ -3,14 +3,14 @@
 <title>Voice latency</title>
 <script type="module">
   import { Group, joinGroup } from "../../index.js";
-  import { startVoice } from "../../voice.js";
+  import { copiesIn, startVoice, withCopies } from "../../voice.js";
 
   /** WebTransport options pinning the relay's certificate by `hash` (bytes), if given. */
   const pinning = (hash) => hash && { serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(hash) }] };
 
   // Two members in one page; measures, per frame of a's voice, the time from
   // the end of its capture to the start of its playout at b.
-  window.run = async ({ relay, hash, seconds, vad, minDelay, maxDelay }) => {
+  window.run = async ({ relay, hash, seconds, vad, minDelay, maxDelay, redundancy }) => {
     // Frames with sound in them (over -55 dBFS), and how many of those went out.
     const sender = { sound: 0, soundSent: 0, sent: 0 };
     const group = Group.create(relay);
@@ -23,6 +23,7 @@
       b.addEventListener("joined", check);
     });
     let sent = 0;
+    let bytes = 0; // voice payloads, to see what redundancy costs
     let received = 0;
     // Which frames went out with sound in them, and which of those played.
     const soundSeqs = new Set();
@@ -30,6 +31,7 @@
     const send = a.sendVoice.bind(a);
     a.sendVoice = (seq, data) => {
       sent++;
+      bytes += data.length;
       return send(seq, data);
     };
     b.addEventListener("voice", () => received++);
@@ -39,6 +41,7 @@
     let end = 0;
     const va = await startVoice(a, {
       vad,
+      redundancy,
       onCapture: (seq, now) => captured.set(seq, now),
       onFrame: ({ seq, rms, sending }) => {
         if (end && sending && rms > 10 ** (-55 / 20) && performance.now() < end - 1000) soundSeqs.add(seq);
@@ -85,6 +88,7 @@
       stats: stats[a.id],
       output,
       sent,
+      bytes,
       received,
       sender,
       lostSound: [...soundSeqs].filter((s) => !playedSeqs.has(s)).length,
@@ -121,6 +125,56 @@
     a.leave();
     navigator.mediaDevices.getUserMedia = real;
     return { before, during, after };
+  };
+  // Copies in the padding change nothing for a decoder that knows nothing
+  // of them (as older receivers do not): it plays exactly the same samples.
+  window.padding = async () => {
+    const encoded = [];
+    const encoder = new AudioEncoder({ output: (chunk) => encoded.push(chunk), error: (e) => console.log(e) });
+    encoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000, opus: { frameDuration: 20000, complexity: 10 } });
+    for (let f = 0; f < 50; f++) {
+      const pcm = new Float32Array(960).map((_, i) => 0.3 * Math.sin((2 * Math.PI * 180 * (f * 960 + i)) / 48000) + 0.05 * (Math.random() - 0.5));
+      encoder.encode(new AudioData({ format: "f32-planar", sampleRate: 48000, numberOfFrames: 960, numberOfChannels: 1, timestamp: f * 20000, data: pcm }));
+    }
+    await encoder.flush();
+    encoder.close();
+    const packets = encoded.map((chunk) => {
+      const p = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(p);
+      return p;
+    });
+    const padded = packets.map((p, i) => withCopies(p, [[1, packets[i - 1]], [2, packets[i - 2]]].filter(([, c]) => c)));
+    const decode = async (list) => {
+      const out = [];
+      const decoder = new AudioDecoder({
+        output: (audio) => {
+          const pcm = new Float32Array(audio.numberOfFrames);
+          audio.copyTo(pcm, { planeIndex: 0, format: "f32-planar" });
+          audio.close();
+          out.push(...pcm);
+        },
+        error: (e) => console.log(e),
+      });
+      decoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+      list.forEach((data, i) => decoder.decode(new EncodedAudioChunk({ type: "key", timestamp: i * 20000, data })));
+      await decoder.flush();
+      decoder.close();
+      return out;
+    };
+    const [plain, withPadding] = [await decode(packets), await decode(padded)];
+    const copies = padded.slice(2).every((p, i) => {
+      const [[b1, c1], [b2, c2]] = copiesIn(p);
+      const same = (x, y) => x.length === y.length && x.every((v, k) => v === y[k]);
+      return b1 === 1 && b2 === 2 && same(c1, packets[i + 1]) && same(c2, packets[i]);
+    });
+    return {
+      packets: packets.length,
+      bytes: packets.reduce((n, p) => n + p.length, 0) / packets.length,
+      paddedBytes: padded.reduce((n, p) => n + p.length, 0) / padded.length,
+      samples: plain.length,
+      identical: plain.length > 0 && plain.length === withPadding.length && plain.every((v, i) => v === withPadding[i]),
+      copies,
+    };
   };
   window.ready = true;
 </script>

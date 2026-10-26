@@ -107,8 +107,10 @@ Relay frames:
 | `0x81` | JOIN | member → relay | `token[16] ‖ signature[64]` |
 | `0x83` | WELCOME | relay → member | `slot[1] ‖ present[4]`: own slot, and a u32 bitmap (bit *n* = slot *n*) of the other occupied slots; bits 4–31 are zero |
 | `0x84` | MEMBER | relay → member | `slot[1] ‖ present[1]` (`0x01`: a new connection now holds the slot, `0x00`: the slot is free) |
+| `0x85` | SUBSCRIBE | member → relay | `slot[1] ‖ layer[1]`: forward me this layer (0–3) of that member's video, `0xFF` for none (§3.3) |
+| `0x86` | DEMAND | relay → member | `layers[1]`: a bitmap (bit *n* = layer *n*) of the layers of my video that someone wants (§3.3) |
 
-A member ignores MEMBER for a slot above 3, and bits above 3 in WELCOME; a WELCOME giving it a slot above 3 is a protocol error (§7.1: reconnect).
+A member ignores MEMBER for a slot above 3, and bits above 3 in WELCOME; a WELCOME giving it a slot above 3 is a protocol error (§7.1: reconnect). A relay closes a connection that sends SUBSCRIBE before it is seated, for its own slot, for a slot above 3 or a layer above 3 (other than `0xFF`), with 1002. Subscriptions belong to the connection: they start at layer 0 for every slot, and a slot's subscriptions, and those of others to it, start again when MEMBER announces a new connection there.
 
 On seating a connection, the relay sends it WELCOME, then sends every other connection MEMBER (`slot`, `0x01`), including when the new connection replaced an older one in that slot. When a seated connection ends for any reason other than replacement, the relay sends every other connection MEMBER (`slot`, `0x00`).
 
@@ -132,10 +134,18 @@ The type determines the frame's **class**. The relay knows nothing else about it
 | `0x00`–`0x1F` | command | 0 (most urgent) | reliable |
 | `0x20`–`0x2F` | voice | 1 | real-time: dropped rather than delayed |
 | `0x40`–`0x5F` | chat | 2 | reliable |
-| `0x30`–`0x3F` | video | 3 | real-time: dropped rather than delayed |
+| `0x30`–`0x3F` | video | 3 | real-time: dropped rather than delayed; `0x30`–`0x37` are VIDEO (§7.4), the rest reserved |
 | `0x60`–`0x7F` | bulk | 4 | reliable, flow-controlled end to end |
 
 Video comes after chat, although it is real-time, because it can fill a link: ahead of chat, it could starve it.
+
+**Video layers.** A VIDEO frame's type is `0x30 | layer << 1 | keyframe`: the **layer** (0–3, from the smallest picture up) of the sender's video it belongs to, and whether it is part of a keyframe. A sender may send the same picture in several layers (simulcast); the relay forwards each member, of each sender's VIDEO frames to everyone, those of one layer only:
+
+- the layer it subscribed to with SUBSCRIBE (layer 0 until it says otherwise), if the sender sends it; else the nearest layer below it that the sender sends; else the lowest layer the sender sends. A layer counts as sent while one of its frames was seen in the last **1 s**;
+- moving a member to another layer only at a keyframe of the new layer, and forwarding the old one until then, so that the picture never stops. If the old layer is no longer sent, it moves at once;
+- none of the sender's video to a member that subscribed with `0xFF`.
+
+VIDEO frames sent to one member (resent fragments, §7.4) are forwarded regardless. The relay tells each seated member, with DEMAND, which of its layers someone wants: the layers members subscribed to, and those being forwarded to them until a move away from them is done; it sends DEMAND when that changes, and once on seating. The relay reads nothing of a frame but its type, so it learns which layer a member watches, and when keyframes are sent.
 
 A relay MUST deliver the frames of one class from one connection to another in the order sent (over QUIC, voice excepted: §3.6). It SHOULD hold a queue per class for each recipient and always send from the most urgent non-empty queue, so that a less urgent class never delays a more urgent one beyond the frame being written. Relay frames go with the command class.
 
@@ -255,7 +265,7 @@ Each type has its own counter on each connection, starting at 0 and increasing b
 | `0x03` | COMMAND | command | a message (§5) |
 | `0x21` | VOICE | voice | `seq[2] ‖ audio` |
 | `0x22` | DATAGRAM | voice | application data that is dropped rather than delayed (positions, poses) |
-| `0x31` | VIDEO | video | a fragment of a video frame (§7.4) |
+| `0x30`–`0x37` | VIDEO | video | a fragment of a video frame of layer `(type >> 1) & 3`, part of a keyframe if `type & 1` (§7.4) |
 | `0x41` | CHAT | chat | a message (§5) |
 | `0x61` | BULK | bulk | `transfer[4] ‖ data` (§6) |
 
@@ -270,8 +280,8 @@ CONTROL kinds:
 | `0x11` | SYNC_BEGIN | `transfer[4] ‖ length[8] ‖ count[1] ‖ (incarnation[8] ‖ next[8]) × count` |
 | `0x12` | SYNC_ACK | `transfer[4] ‖ received[8]` |
 | `0x13` | SYNC_ABORT | `transfer[4]` |
-| `0x20` | VIDEO_NACK | `track[1] ‖ frame[4] ‖ index[1] × n`: fragments of our frame to send again, `0xFF` for all of them (§7.4) |
-| `0x21` | KEYFRAME_REQUEST | `track[1]`: a keyframe of this track, please (§7.4) |
+| `0x20` | VIDEO_NACK | `track[1] ‖ layer[1] ‖ frame[4] ‖ index[1] × n`: fragments of our frame to send again, `0xFF` for all of them (§7.4) |
+| `0x21` | KEYFRAME_REQUEST | `track[1] ‖ layer[1]`: a keyframe of this layer of this track, please (§7.4) |
 
 Channel `0x00` is commands, `0x01` is chat. Receivers MUST ignore unknown types, kinds and channels, so that later revisions can add them.
 
@@ -331,6 +341,8 @@ Voice frames carry `seq`, the sender's count of audio frames of fixed duration (
 
 The audio format is the application's. Implementations that want to interoperate with the reference SDK's voice use `hold[1] ‖ packet`, where `packet` is one Opus packet (48 kHz, mono, 20 ms frames by default; receivers take the duration from the packet) and `hold` is how many milliseconds (0–255) the sender kept the frame between capturing and sending it. A sender that skips silence keeps the last frames or two and sends them when speech starts, so that the start of a word is not clipped; `hold` lets receivers tell that delay from network jitter.
 
+So that a lost datagram costs nothing, `packet` MAY also carry copies of the packets the sender sent for the one or two frames before it (the reference SDK sends both), and a receiver missing a frame recovers it from a later packet. The copies travel in the Opus packet's padding (RFC 6716 §3.2.5; a packet of code 0, 1 or 2 is rewritten as code 3 with the same frames) as one Opus extension (draft-ietf-mlcodec-opus-extension) for the first frame, with the experimental ID 122 and L = 0, whose data is `0x50 ‖ 0x01 ‖ copies`, each copy being `back[1] ‖ length[2] ‖ copy`: the Opus packet of frame `seq − back` (`back` ≥ 1), `length` bytes long (big-endian). Opus decoders ignore padding, so receivers that know nothing of copies play `packet` as before. A receiver that uses them takes, of a frame and its copies, whichever comes first and is still in time to play, and never plays a frame twice. Senders keep the whole payload within 1,000 bytes, leaving out copies that do not fit.
+
 ### 7.3 Consistency
 
 Every member sees each stream in the same order, but streams from different members interleave differently at different receivers. Applications whose commands do not commute need a rule on top, such as:
@@ -348,14 +360,18 @@ A video frame (an encoded picture) is cut into **fragments** of at most **1,000 
 track[1] ‖ frame[4] ‖ index[1] ‖ count[1] ‖ flags[1] ‖ timestamp[4] ‖ data
 ```
 
-`track` lets one member send several videos (a camera and a screen, say). `frame` numbers the track's frames, from 0, wrapping at 2³². Fragment `index` of `count` holds bytes `index × 1000` onwards of the frame. `flags` bit 0 marks a **keyframe**, which decodes on its own; other frames need every frame since the last keyframe. `timestamp` is the sender's, in its own units.
+`track` lets one member send several videos (a camera and a screen, say). The layer is in the frame's type (§3.3): each layer of a track is a video of its own, numbered on its own. `frame` numbers the layer's frames, from 0, wrapping at 2³². Fragment `index` of `count` holds bytes `index × 1000` onwards of the frame. `flags` bit 0 marks a **keyframe**, which decodes on its own; other frames need every frame since the last keyframe; it MUST agree with the type's keyframe bit. `timestamp` is the sender's, in its own units.
 
 A receiver delivers whole frames, in order, and only decodable ones:
 
 - A frame waits for its missing fragments. After **5 ms** without them (fragments travel together; this covers mild reordering) the receiver sends the sender VIDEO_NACK for them, or for the whole frame if none of it came, and asks once more a round trip later. Frames behind it wait.
 - A frame not whole **300 ms** after it started holding up others is given up. Since what follows cannot be decoded, the receiver drops frames until the next keyframe, and sends KEYFRAME_REQUEST, at most every **500 ms** per sender and track. So does a receiver whose first frame of a track is not a keyframe (one that joined mid-stream).
 
-A sender keeps its frames for **500 ms** (and at most 2 MiB) to answer VIDEO_NACK, resending the fragments asked for to that member alone, as VIDEO frames with the same plaintext, at most **512 KiB/s** in all. It tells its application of keyframe requests at most every 500 ms per track, however many members ask, and the application sends a keyframe soon after.
+A sender keeps its frames for **500 ms** (and at most 2 MiB) to answer VIDEO_NACK, resending the fragments asked for to that member alone, as VIDEO frames of the same type with the same plaintext, at most **512 KiB/s** in all. It tells its application of keyframe requests at most every 500 ms per track and layer, however many members ask, and the application sends a keyframe of that layer soon after.
+
+**Layers.** A sender SHOULD encode only the layers DEMAND says are wanted: for each wanted layer, the one it sends that is nearest below or equal to it, else its lowest, which is what the relay forwards (§3.3). A layer that becomes wanted SHOULD start with a keyframe, so that the relay can move members to it at once. A member that subscribes to a layer of a sender whose video it already receives also sends that sender KEYFRAME_REQUEST for the new layer of each of its tracks. A member keeps its subscriptions across reconnections, sending SUBSCRIBE again whenever it admits the member concerned.
+
+A receiver puts each layer back together on its own as above, and delivers one layer of each track at a time: another layer takes over with its first keyframe, and the layer left behind is forgotten; for **1 s** after a move, frames of the layer left behind are ignored (they were on their way), so that they do not start a move back.
 
 The codec is the application's. Implementations that want to interoperate with the reference SDK's video use `codec[1] ‖ chunk` as each frame, where `codec` is 1 for VP8, 2 for VP9, 3 for H.264 (Annex B) or 4 for AV1, and `chunk` one encoded picture.
 
@@ -367,6 +383,7 @@ The codec is the application's. Implementations that want to interoperate with t
 | Frame size | ≤ 16,384 bytes | relay (1009) |
 | Message payload | ≤ 16,352 bytes | senders |
 | Video frame | ≤ 255 fragments of ≤ 1,000 bytes | senders |
+| Video layers | 4 (0–3); a layer counts as sent for 1 s after its last frame; a layer left behind is ignored for 1 s | relays, receivers |
 | Video queued per recipient | 64 KiB, oldest dropped (reference relay) | relays |
 | Video: ask for a fragment / give a frame up / ask for a keyframe | after 5 ms / 300 ms / at most every 500 ms | receivers |
 | Video kept for resending | 500 ms, ≤ 2 MiB; resent at ≤ 512 KiB/s | senders |
@@ -404,7 +421,7 @@ The codec is the application's. Implementations that want to interoperate with t
 
 ## 10. Conformance
 
-[`test-vectors/g1.json`](test-vectors/g1.json) gives, for fixed inputs, the group's derived keys and IDs, join tokens and JOIN frames, the KEY frames of two members, and one frame of every sealed kind: CONFIRM, stream messages, a direct message, voice, a datagram, HEADS, RESEND and the resend that answers it, RESENT, a state transfer from request to acknowledgement, plus a declined one, and video: a keyframe's fragments, a VIDEO_NACK and the fragment resent for it, and a KEYFRAME_REQUEST. Each frame was produced by a member of the reference implementation, and checked to have its effect at the other.
+[`test-vectors/g1.json`](test-vectors/g1.json) gives, for fixed inputs, the group's derived keys and IDs, join tokens and JOIN frames, the KEY frames of two members, and one frame of every sealed kind: CONFIRM, stream messages, a direct message, voice, a datagram, HEADS, RESEND and the resend that answers it, RESENT, a state transfer from request to acknowledgement, plus a declined one, and video: a keyframe's fragments (layer 2), a VIDEO_NACK and the fragment resent for it, a frame of layer 1, and a KEYFRAME_REQUEST; also SUBSCRIBE and DEMAND. Each frame was produced by a member of the reference implementation, and checked to have its effect at the other.
 
 [`test-vectors/verify-groups.mjs`](test-vectors/verify-groups.mjs) rebuilds all of it from this document using only Node's built-in cryptography, and the weekly certificates of [`g1-certificate.json`](test-vectors/g1-certificate.json) too (checking their signatures, since Node signs with random nonces).
 

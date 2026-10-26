@@ -24,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use peerconnect::RoomId;
 use peerconnect::group::{Class, wire as gwire};
-use peerconnect::relay::{GroupAction, GroupConn, Incoming};
+use peerconnect::relay::{GroupAction, GroupConn, Incoming, VideoRouter};
 use peerconnect::wire::close;
 use tokio::sync::{Notify, OwnedSemaphorePermit, watch};
 use tokio::task::JoinHandle;
@@ -42,10 +42,27 @@ const BACKLOG: usize = 256 << 10;
 /// it is disconnected.
 const BACKLOG_WAIT: Duration = Duration::from_secs(5);
 
-/// The slots of one group.
+/// The slots of one group, and which layer of whose video goes to whom.
 #[derive(Default)]
 pub(crate) struct GroupRoom {
     slots: Mutex<[Option<Seat>; gwire::MAX_SLOTS]>,
+    /// Locked after `slots`, when both are.
+    router: Mutex<VideoRouter>,
+}
+
+/// Milliseconds on the relay's clock, for the video router.
+fn now_ms() -> u64 {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
+/// Sends DEMAND to every sender whose wanted layers changed.
+fn tell_demands(slots: &[Option<Seat>; gwire::MAX_SLOTS], router: &mut VideoRouter) {
+    for (slot, layers) in router.demands() {
+        if let Some(seat) = &slots[slot as usize] {
+            seat.outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::demand(layers)));
+        }
+    }
 }
 
 struct Seat {
@@ -278,7 +295,20 @@ impl GroupRoom {
             seat.outbox.push(Class::Command, member(slot as u8, true));
         }
         slots[slot] = Some(Seat { id, token, outbox });
+        let mut router = self.router.lock().unwrap();
+        router.seat(slot as u8);
+        tell_demands(&slots, &mut router);
         Some(slot as u8)
+    }
+
+    /// The connection in `slot` wants `layer` of `other`'s video.
+    fn subscribe(&self, id: u64, slot: u8, other: u8, layer: Option<u8>) {
+        let slots = self.slots.lock().unwrap();
+        if holds(&slots, slot, id) {
+            let mut router = self.router.lock().unwrap();
+            router.subscribe(slot, other, layer);
+            tell_demands(&slots, &mut router);
+        }
     }
 
     /// Fans a frame out. Returns the recipients that are behind (to wait
@@ -288,14 +318,21 @@ impl GroupRoom {
         if !holds(&slots, slot, id) {
             return None;
         }
+        // Video to everyone goes to each in the layer it wants (GROUP.md §3.3).
+        let mut router = (class == Class::Video && to.is_none()).then(|| self.router.lock().unwrap());
+        let now = now_ms();
         let mut behind = Vec::new();
         for (i, seat) in slots.iter().enumerate() {
             if let Some(seat) = seat
                 && to.map_or(i != slot as usize, |to| i == to as usize)
+                && router.as_mut().is_none_or(|r| r.forward(now, slot, i as u8, msg[0]))
                 && seat.outbox.push(class, msg.clone())
             {
                 behind.push(seat.outbox.clone());
             }
+        }
+        if let Some(router) = &mut router {
+            tell_demands(&slots, router);
         }
         Some(behind)
     }
@@ -310,6 +347,9 @@ impl GroupRoom {
             seat.outbox.purge(slot);
             seat.outbox.push(Class::Command, member(slot, false));
         }
+        let mut router = self.router.lock().unwrap();
+        router.leave(slot);
+        tell_demands(&slots, &mut router);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -428,6 +468,11 @@ impl Relay {
                             _ = closing.changed() => break,
                             () = outbox.catch_up() => {}
                         }
+                    }
+                }
+                GroupAction::Subscribe { slot: other, layer } => {
+                    if let Some((room, id, slot)) = &seated {
+                        room.subscribe(*id, *slot, other, layer);
                     }
                 }
                 GroupAction::Close(code) => break outbox.close(code),

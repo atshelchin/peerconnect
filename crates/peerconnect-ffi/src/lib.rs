@@ -44,6 +44,7 @@ pub const PC_REPLACED: i32 = 20;
 pub const PC_FULL: i32 = 21;
 pub const PC_VIDEO: i32 = 22;
 pub const PC_KEYFRAME_REQUEST: i32 = 23;
+pub const PC_VIDEO_DEMAND: i32 = 24;
 
 #[repr(C)]
 pub struct PcOutput {
@@ -61,6 +62,7 @@ pub struct PcOutput {
     pub track: u8,
     pub keyframe: u8,
     pub timestamp: u32,
+    pub layer: u8,
 }
 
 impl PcOutput {
@@ -79,6 +81,7 @@ impl PcOutput {
         track: 0,
         keyframe: 0,
         timestamp: 0,
+        layer: 0,
     };
 }
 
@@ -323,17 +326,23 @@ fn fill(event: Event, out: &mut PcOutput) -> (i32, Vec<u8>) {
             out.member = from.0;
             (PC_SYNC_FAILED, Vec::new())
         }
-        Event::Video { from, track, keyframe, timestamp, data } => {
+        Event::Video { from, track, layer, keyframe, timestamp, data } => {
             out.member = from.0;
             out.track = track;
+            out.layer = layer;
             out.keyframe = keyframe as u8;
             out.timestamp = timestamp;
             (PC_VIDEO, data)
         }
-        Event::KeyframeRequest { from, track } => {
+        Event::KeyframeRequest { from, track, layer } => {
             out.member = from.0;
             out.track = track;
+            out.layer = layer;
             (PC_KEYFRAME_REQUEST, Vec::new())
+        }
+        Event::VideoDemand { layers } => {
+            out.layer = layers;
+            (PC_VIDEO_DEMAND, Vec::new())
         }
         Event::Replaced => (PC_REPLACED, Vec::new()),
         Event::Full => (PC_FULL, Vec::new()),
@@ -387,13 +396,22 @@ pub unsafe extern "C" fn pc_member_send_datagram(m: *mut PcMember, to: *const u8
 pub unsafe extern "C" fn pc_member_send_video(
     m: *mut PcMember,
     track: u8,
+    layer: u8,
     keyframe: u8,
     timestamp: u32,
     data: *const u8,
     len: usize,
 ) -> i32 {
     let data = unsafe { bytes(data, len) };
-    unsafe { with(m, 0, |m| m.member.send_video(track, keyframe != 0, timestamp, data) as i32) }
+    unsafe { with(m, 0, |m| m.member.send_video(track, layer, keyframe != 0, timestamp, data) as i32) }
+}
+
+/// `layer` 0xFF: no video from `member`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_member_subscribe(m: *mut PcMember, member: *const u8, layer: u8) -> i32 {
+    let Some(member) = (unsafe { id(member) }) else { return PC_INVALID };
+    let layer = (layer != 0xFF).then_some(layer);
+    unsafe { with(m, PC_INVALID, |m| code(m.member.subscribe(member, layer))) }
 }
 
 #[unsafe(no_mangle)]
@@ -595,13 +613,30 @@ pub unsafe extern "C" fn pc_client_send_datagram(c: *mut PcClient, to: *const u8
 pub unsafe extern "C" fn pc_client_send_video(
     c: *mut PcClient,
     track: u8,
+    layer: u8,
     keyframe: u8,
     timestamp: u32,
     data: *const u8,
     len: usize,
 ) {
     let data = unsafe { bytes(data, len) }.to_vec();
-    unsafe { with_client(c, (), |c| c.conn.send_video(track, keyframe != 0, timestamp, data)) }
+    unsafe { with_client(c, (), |c| c.conn.send_video(track, layer, keyframe != 0, timestamp, data)) }
+}
+
+/// `layer` 0xFF: no video from `member`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_subscribe(c: *mut PcClient, member: *const u8, layer: u8) -> i32 {
+    let Some(member) = (unsafe { id(member) }) else { return PC_INVALID };
+    if layer != 0xFF && layer >= peerconnect::group::wire::VIDEO_LAYERS {
+        return PC_INVALID;
+    }
+    let layer = (layer != 0xFF).then_some(layer);
+    unsafe {
+        with_client(c, PC_INVALID, |c| {
+            c.conn.subscribe(member, layer);
+            PC_OK
+        })
+    }
 }
 
 #[unsafe(no_mangle)]

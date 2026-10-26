@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use peerconnect::RoomId;
 use peerconnect::group::{Channel, Class, Config, Event, Group, Identity, Member, MemberId, Output, State, wire};
-use peerconnect::relay::{GroupAction, GroupConn, Incoming};
+use peerconnect::relay::{GroupAction, GroupConn, Incoming, VideoRouter};
 use peerconnect::wire::close;
 
 struct Conn {
@@ -47,6 +47,10 @@ struct Relay {
     /// Deliver as QUIC would: a random class each time, voice in any order,
     /// and only commands purged (the rest is already on its way).
     quic: Option<u64>,
+    /// Which layer of whose video goes to whom.
+    router: VideoRouter,
+    /// The simulation's clock, for the router.
+    now: u64,
 }
 
 impl Relay {
@@ -101,15 +105,27 @@ impl Relay {
         match conn.state.receive(&self.group, message) {
             GroupAction::Pong => self.conns.get_mut(&id).unwrap().pongs += 1,
             GroupAction::Join(token) => self.join(id, token),
+            GroupAction::Subscribe { slot, layer } => {
+                let from = self.slot_of(id).unwrap();
+                self.router.subscribe(from, slot, layer);
+                self.tell_demands();
+            }
             GroupAction::Forward { to, class } => {
                 let Incoming::Binary(frame) = message else { unreachable!() };
                 self.log.push(frame.to_vec());
                 let from = self.slot_of(id).unwrap();
-                let targets: Vec<usize> = match to {
+                let mut targets: Vec<usize> = match to {
                     Some(to) => self.slots[to as usize].into_iter().collect(),
                     None => self.slots.iter().flatten().copied().filter(|&c| c != id).collect(),
                 };
-                let _ = from;
+                if class == Class::Video && to.is_none() {
+                    let (now, kind) = (self.now, frame[0]);
+                    targets.retain(|&t| {
+                        let to = self.slots.iter().position(|s| *s == Some(t)).unwrap() as u8;
+                        self.router.forward(now, from, to, kind)
+                    });
+                    self.tell_demands();
+                }
                 for target in targets {
                     let conn = self.conns.get_mut(&target).unwrap();
                     if frame[0] == wire::COMMAND
@@ -165,6 +181,16 @@ impl Relay {
         conn.state = GroupConn::Seated(slot as u8);
         conn.queues[0].push_back(wire::welcome(slot as u8, present).to_vec());
         self.announce(slot as u8, true);
+        self.router.seat(slot as u8);
+        self.tell_demands();
+    }
+
+    fn tell_demands(&mut self) {
+        for (slot, layers) in self.router.demands() {
+            if let Some(c) = self.slots[slot as usize] {
+                self.conns.get_mut(&c).unwrap().queues[0].push_back(wire::demand(layers).to_vec());
+            }
+        }
     }
 
     fn announce(&mut self, slot: u8, present: bool) {
@@ -194,6 +220,8 @@ impl Relay {
             self.slots[slot as usize] = None;
             self.purge(slot);
             self.announce(slot, false);
+            self.router.leave(slot);
+            self.tell_demands();
         }
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.closing = Some(code.unwrap_or(1006));
@@ -236,6 +264,8 @@ impl Sim {
             lose: HashMap::new(),
             tamper: None,
             no_replacement: false,
+            router: VideoRouter::default(),
+            now: 0,
             // The value seeds the order: `PEERCONNECT_SIM_QUIC=7`, say.
             quic: std::env::var("PEERCONNECT_SIM_QUIC")
                 .ok()
@@ -292,6 +322,7 @@ impl Sim {
                             continue;
                         }
                         if let Some(id) = self.nodes[n].conn {
+                            self.relay.now = self.now;
                             self.relay.receive(id, Incoming::Binary(&frame));
                         }
                     }
@@ -1283,7 +1314,7 @@ fn video_through_a_lossy_relay_arrives_whole_in_order_and_recovers_with_keyframe
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        if to == b && frame[0] == wire::VIDEO && x % 100 < 8 { vec![] } else { vec![frame.to_vec()] }
+        if to == b && wire::video_layer(frame[0]).is_some() && x % 100 < 8 { vec![] } else { vec![frame.to_vec()] }
     }));
     let ia = sim.id(a);
     let mut keyframe_due = true;
@@ -1293,7 +1324,7 @@ fn video_through_a_lossy_relay_arrives_whole_in_order_and_recovers_with_keyframe
         let keyframe = keyframe_due || i % 60 == 0;
         keyframe_due = false;
         let data: Vec<u8> = (0..if keyframe { 12_000 } else { 3_000 }).map(|j| (i as usize ^ j) as u8).collect();
-        assert!(sim.nodes[a].member.send_video(0, keyframe, i, &data));
+        assert!(sim.nodes[a].member.send_video(0, 0, keyframe, i, &data));
         sent += 1;
         sim.run(33);
         if sim.take(a).iter().any(|e| matches!(e, Event::KeyframeRequest { .. })) {
@@ -1322,4 +1353,88 @@ fn video_through_a_lossy_relay_arrives_whole_in_order_and_recovers_with_keyframe
     // Resends fill most holes; what is lost for good costs frames until the next keyframe.
     assert!(at_b.len() as u32 >= sent * 8 / 10, "{} of {sent}", at_b.len());
     assert!((at_b.len() as u32) < sent, "with 8% of fragments vanishing, something was lost");
+}
+
+#[test]
+fn each_member_gets_the_video_layer_it_subscribed_to() {
+    let mut sim = Sim::new();
+    let a = sim.add(Identity::generate(), "a");
+    let b = sim.add(Identity::generate(), "b");
+    let c = sim.add(Identity::generate(), "c");
+    sim.run(100);
+    let ia = sim.id(a);
+    // a sends two layers of one track; b wants the larger, c says nothing (the smallest sent).
+    sim.nodes[b].member.subscribe(ia, Some(2)).unwrap();
+    let mut keyframe_due = [true; 3];
+    let mut demand = 0u8;
+    for i in 0..90u32 {
+        for layer in [1, 2] {
+            let keyframe = keyframe_due[layer as usize] || i % 60 == 0;
+            keyframe_due[layer as usize] = false;
+            let data = vec![layer; if keyframe { 3000 } else { 500 }];
+            assert!(sim.nodes[a].member.send_video(0, layer, keyframe, i, &data));
+        }
+        sim.run(33);
+        for e in sim.take(a) {
+            match e {
+                Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
+                // A layer newly wanted starts with a keyframe, so that the relay can move to it.
+                Event::VideoDemand { layers } => {
+                    for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
+                        *due |= layers & !demand & 1 << layer != 0;
+                    }
+                    demand = layers;
+                }
+                _ => {}
+            }
+        }
+    }
+    sim.run(500);
+    let layers = |events: Vec<Event>| -> Vec<u8> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Video { from, layer, data, .. } if from == ia => {
+                    assert!(data.iter().all(|&v| v == layer), "a frame of the layer it says");
+                    Some(layer)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let (at_b, at_c) = (layers(sim.take(b)), layers(sim.take(c)));
+    assert!(at_c.len() >= 85 && at_c.iter().all(|&l| l == 1), "c: layer 1 only, {at_c:?}");
+    // b gets what is sent until the relay has its SUBSCRIBE and layer 2 a keyframe: a round trip.
+    let moved = at_b.iter().position(|&l| l == 2).expect("b gets layer 2");
+    assert!(at_b.len() >= 85 && moved <= 3 && at_b[moved..].iter().all(|&l| l == 2), "b: {at_b:?}");
+
+    // b moves to the smaller layer: it keeps getting pictures, and then only layer 1.
+    sim.nodes[b].member.subscribe(ia, Some(1)).unwrap();
+    for i in 90..150u32 {
+        for layer in [1, 2] {
+            let keyframe = keyframe_due[layer as usize];
+            keyframe_due[layer as usize] = false;
+            let data = vec![layer; if keyframe { 3000 } else { 500 }];
+            assert!(sim.nodes[a].member.send_video(0, layer, keyframe, i, &data));
+        }
+        sim.run(33);
+        for e in sim.take(a) {
+            match e {
+                Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
+                // A layer newly wanted starts with a keyframe, so that the relay can move to it.
+                Event::VideoDemand { layers } => {
+                    for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
+                        *due |= layers & !demand & 1 << layer != 0;
+                    }
+                    demand = layers;
+                }
+                _ => {}
+            }
+        }
+    }
+    sim.run(500);
+    let at_b = layers(sim.take(b));
+    assert!(at_b.len() >= 55, "no gap while moving: {} frames", at_b.len());
+    let first_small = at_b.iter().position(|&l| l == 1).expect("moved to layer 1");
+    assert!(at_b[first_small..].iter().all(|&l| l == 1), "and stayed: {at_b:?}");
 }

@@ -528,3 +528,59 @@ async fn a_declined_sync_fails_cleanly() {
     a.decline_sync(from, transfer);
     assert_eq!(wait(&mut b, |e| matches!(e, Event::SyncFailed { .. })).await, Event::SyncFailed { from: a.id() });
 }
+
+#[tokio::test]
+async fn each_member_gets_the_video_layer_it_subscribed_to() {
+    let relay = Relay::start().await;
+    let group = Group::create(&relay.url).unwrap();
+    let mut a = join(&group, "a");
+    let mut b = join(&group, "b");
+    let mut c = join(&group, "c");
+    for conn in [&mut a, &mut b, &mut c] {
+        admitted(conn, 2).await;
+    }
+    // a sends layers 1 and 2; b wants 2, c says nothing and gets the smallest sent.
+    b.subscribe(a.id(), Some(2));
+    let sender = a.sender();
+    let mut tick = tokio::time::interval(Duration::from_millis(33));
+    let mut keyframe_due = [true; 3];
+    let mut demand = 0u8;
+    for i in 0..90u32 {
+        tick.tick().await;
+        for layer in [1u8, 2] {
+            let keyframe = keyframe_due[layer as usize] || i % 60 == 0;
+            keyframe_due[layer as usize] = false;
+            sender.send_video(0, layer, keyframe, i, vec![layer; if keyframe { 6000 } else { 1500 }]);
+        }
+        while let Some(event) = a.try_next() {
+            match event {
+                Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
+                Event::VideoDemand { layers } => {
+                    for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
+                        *due |= layers & !demand & 1 << layer != 0;
+                    }
+                    demand = layers;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(demand, 0b111, "layer 2 for b; for c, layer 0, and layer 1, which it gets");
+    let layers = |conn: &mut GroupConnection, from: MemberId| {
+        let mut got = Vec::new();
+        while let Some(event) = conn.try_next() {
+            if let Event::Video { from: f, layer, data, .. } = event
+                && f == from
+            {
+                assert!(data.iter().all(|&v| v == layer));
+                got.push(layer);
+            }
+        }
+        got
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (at_b, at_c) = (layers(&mut b, a.id()), layers(&mut c, a.id()));
+    assert!(at_c.len() >= 80 && at_c.iter().all(|&l| l == 1), "c: {at_c:?}");
+    let moved = at_b.iter().position(|&l| l == 2).expect("b gets layer 2");
+    assert!(at_b.len() >= 80 && moved <= 10 && at_b[moved..].iter().all(|&l| l == 2), "b: {at_b:?}");
+}

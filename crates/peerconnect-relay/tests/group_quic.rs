@@ -576,7 +576,7 @@ async fn stream_video(a: &mut GroupConnection, b: &mut GroupConnection) -> (Vec<
             let at = start.elapsed().as_millis() as u32;
             let size = if keyframe { 20_000 } else { 7_000 };
             let data: Vec<u8> = (0..size).map(|j| (i as usize + j) as u8).collect();
-            sender.send_video(0, keyframe, at, data);
+            sender.send_video(0, 0, keyframe, at, data);
         }
     });
     let mut frames = Vec::new();

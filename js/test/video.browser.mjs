@@ -1,6 +1,7 @@
 // Video in a real browser (headless Chromium, its fake camera, WebCodecs):
 // two members in one page through the Rust relay over WebTransport, then
-// through a path that loses UDP datagrams.
+// through a path that loses UDP datagrams; then simulcast, three members,
+// each receiver getting the layer that suits the size it shows the video at.
 //
 //   cargo build -p peerconnect-relay && node test/video.browser.mjs
 //
@@ -113,7 +114,52 @@ try {
   const wtLossy = await run("video, WebTransport, 2% UDP loss each way", { relay: `https://127.0.0.1:${udpProxy.address().port}` });
   udp.loss = 0;
 
+  // Simulcast: what each receiver shows decides what it gets, and what the sender encodes.
+  const sim = await page.evaluate((o) => window.simulcast(o), { relay: `https://127.0.0.1:${port}`, hash, seconds: 6 });
+  const layer = (s, n) => s.layers.find((l) => l.layer === n) ?? { encoded: 0, decoded: 0, received: 0, running: false };
+  const decoded = (m) => m.layers.map((l) => `layer ${l.layer} ${l.decoded}`).join(", ");
+  const latency = Object.entries(sim.latency)
+    .map(([k, q]) => `${k[0]} layer ${k.slice(1)} p50 ${q.p50?.toFixed(0)} ms p99 ${q.p99?.toFixed(0)} ms (${q.count})`)
+    .join("; ");
+  const encoders = (s) => s.a.layers.map((l) => `${l.layer}: ${l.running ? "on" : "off"} ${l.encoded} (${l.width}×${l.height})`).join(", ");
+  const demand = (s) => `0b${(s.a.demand ?? 0).toString(2)}`;
+  console.log(`simulcast, both shown: demand ${demand(sim.both)}, encoders ${encoders(sim.both)}; b got layer ${sim.both.b.layer} (${decoded(sim.both.b)}), c got layer ${sim.both.c.layer} (${decoded(sim.both.c)})`);
+  console.log(`simulcast, c detached: demand ${demand(sim.cGone)}, encoders ${encoders(sim.cGone)}; c received ${sim.cStopped.c.received} then ${sim.cGone.c.received}`);
+  console.log(`simulcast, b small: demand ${demand(sim.bSmall)}, encoders ${encoders(sim.bSmall)}; b now layer ${sim.bSmall.b.layer} (${decoded(sim.bSmall.b)}), longest gap ${sim.gap.toFixed(0)} ms`);
+  console.log(`simulcast latency: ${latency}`);
+
   if (!process.env.NO_ASSERT) {
+    assert.deepEqual(sim.connected, [true, true, true], "simulcast over WebTransport");
+    // Large for b, small for c: both layers, each to its receiver.
+    assert.equal(sim.both.a.demand, 0b110, "layers 1 and 2 wanted");
+    assert.ok(layer(sim.both.a, 1).running && layer(sim.both.a, 2).running, "both encoders run");
+    assert.equal(layer(sim.both.a, 2).width, 1280, "layer 2 at 1280 × 720");
+    assert.equal(layer(sim.both.a, 1).width, 640, "layer 1 at 640 × 360");
+    assert.equal(sim.both.b.subscribed, 2);
+    assert.equal(sim.both.c.subscribed, 1);
+    assert.equal(sim.both.b.layer, 2, "b gets layer 2");
+    assert.equal(sim.both.c.layer, 1, "c gets layer 1");
+    assert.equal(sim.both.b.width, 1280, "b decodes 1280 wide");
+    assert.equal(sim.both.c.width, 640, "c decodes 640 wide");
+    assert.ok(layer(sim.both.b, 2).decoded > 60, `b decoded ${layer(sim.both.b, 2).decoded} of layer 2`);
+    assert.ok(layer(sim.both.c, 1).decoded > 60, `c decoded ${layer(sim.both.c, 1).decoded} of layer 1`);
+    assert.equal(layer(sim.both.c, 2).received, 0, "c never gets layer 2");
+    // c detached: nothing more reaches it, and only b's layer 2 is encoded.
+    assert.equal(sim.cGone.c.received, sim.cStopped.c.received, "nothing forwarded to c");
+    assert.equal(sim.cGone.c.subscribed, null);
+    assert.equal(sim.cGone.a.demand, 0b100, "only layer 2 wanted");
+    assert.ok(!layer(sim.cGone.a, 1).running, "layer 1 encoder stopped");
+    assert.equal(layer(sim.cGone.a, 1).encoded, layer(sim.cStopped.a, 1).encoded, "layer 1 encoder idle");
+    // b small: on layer 1 without a gap, and layer 2 idle.
+    assert.equal(sim.bSmall.b.layer, 1, "b moved to layer 1");
+    assert.equal(sim.bSmall.b.width, 640, "b decodes 640 wide");
+    assert.ok(layer(sim.bSmall.b, 1).decoded > layer(sim.bMoved.b, 1).decoded + 30, "b keeps decoding layer 1");
+    assert.ok(sim.gap < 400, `longest gap while b moved: ${sim.gap} ms`);
+    assert.equal(sim.bSmall.a.demand, 0b010, "only layer 1 wanted");
+    assert.equal(layer(sim.bSmall.a, 2).encoded, layer(sim.bMoved.a, 2).encoded, "layer 2 encoder idle");
+    assert.equal(sim.bSmall.b.errors, 0, "decode errors");
+    for (const q of Object.values(sim.latency)) assert.ok(q.p99 < 150, `simulcast p99 ${q.p99} ms`);
+
     for (const r of [wt, wtLossy]) assert.deepEqual(r.connected, [true, true], "over WebTransport");
     assert.ok(wt.sent.sent > 100, `${wt.sent.sent} sent`);
     assert.ok(wt.received.decoded >= wt.sent.sent * 0.95, `${wt.received.decoded} of ${wt.sent.sent} decoded`);

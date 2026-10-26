@@ -162,14 +162,21 @@ const voice = await startVoice(conn);
 voice.addEventListener("speaking", (e) => highlight(e.detail.member, e.detail.speaking));
 voice.setMuted(true);
 
-// Video: the camera through WebCodecs (VP8 by default), each member drawn into a canvas.
+// Video: the camera through WebCodecs (VP8 by default), in two sizes, each member drawn into a canvas.
 import { startVideo } from "peerconnect/video";
-const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 } });
-const video = await startVideo(conn, { stream: camera, bitrate: 500_000, framerate: 15 });
+const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+const video = await startVideo(conn, {
+  stream: camera,
+  framerate: 30,
+  layers: [
+    { layer: 1, width: 640, height: 360, bitrate: 400_000 },
+    { layer: 2, width: 1280, height: 720, bitrate: 1_500_000 },
+  ],
+});
 conn.addEventListener("joined", (e) => video.attach(e.detail.member, canvasFor(e.detail.member)));
 ```
 
-The bitrate steps down while receivers keep losing frames and back up while they do not. Other codecs and engines send any encoded frames with `conn.sendVideo(track, keyframe, timestamp, data)` (in Rust, `send_video`; in C, `pc_client_send_video`), get them back as `video` events, and send a keyframe on `keyframerequest`.
+Video is sent in **layers** (simulcast): each member gets, of each other member's video, the layer that fits the canvas it is drawn in, as the meeting apps do: a large tile the large picture, a thumbnail the small one, a hidden one nothing. `attach` subscribes by the canvas's size, and moves when it changes; the relay forwards each member its layer and switches at a keyframe, so the picture never stops; and senders encode only the layers someone wants. So in a call of four, each member receives one large picture and small ones, and the relay forwards half what it would otherwise. The bitrate of each layer steps down while receivers keep losing frames and back up while they do not. Other codecs and engines send any encoded frames with `conn.sendVideo(track, layer, keyframe, timestamp, data)` (in Rust, `send_video`; in C, `pc_client_send_video`), choose what to receive with `conn.subscribe(member, layer)`, get frames back as `video` events, send a keyframe on `keyframerequest`, and encode the layers `videodemand` says are wanted ([GROUP.md §7.4](GROUP.md)).
 
 ### Rust and game engines
 
@@ -220,6 +227,7 @@ Browser voice (headless Chromium, 20 ms Opus frames, through the relay):
 | End of capture to start of playout | p50 18–29 ms |
 | Through a link adding 0–60 ms of jitter each way | p50 110–140 ms; the jitter buffer adapts to about 120 ms; nothing lost |
 | After a 1 s stall | back to p50 50–70 ms within 2 s (frames dropped to catch up, not played late) |
+| Speech lost, 2% / 5% of packets lost each way (copies of the two previous frames in each packet) | 0–0.2% / 0–0.5%, against 4–6% / 10–11% without; bursty 5%: 1–3%, against 14–15% |
 
 Lossy networks, with the Linux kernel dropping packets (`tc netem` on loopback in a 2-core arm64 VM: 20 ms and the given loss on each hop, so 40 ms from player to player; two groups of ten with the game load above, measured before groups were limited to four, so more traffic per player than a group now carries; WebSocket against QUIC through the same relay; this comparison is why groups now use QUIC only):
 

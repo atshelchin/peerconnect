@@ -122,10 +122,18 @@ export interface GroupEventMap {
   message: CustomEvent<{ from: string; channel: Channel; data: Uint8Array; direct: boolean }>;
   voice: CustomEvent<{ from: string; seq: number; data: Uint8Array }>;
   datagram: CustomEvent<{ from: string; data: Uint8Array }>;
-  /** A whole video frame, in order and decodable (it follows a keyframe without loss). */
-  video: CustomEvent<{ from: string; track: number; keyframe: boolean; timestamp: number; data: Uint8Array }>;
-  /** Members lost some of our `track` and need a keyframe: send one soon. */
-  keyframerequest: CustomEvent<{ from: string; track: number }>;
+  /**
+   * A whole video frame, in order and decodable (it follows a keyframe without loss). A
+   * track's frames come from one `layer` at a time; another starts with a keyframe.
+   */
+  video: CustomEvent<{ from: string; track: number; layer: number; keyframe: boolean; timestamp: number; data: Uint8Array }>;
+  /** Members need a keyframe of `layer` of our `track` (they lost some, or are moving to it): send one soon. */
+  keyframerequest: CustomEvent<{ from: string; track: number; layer: number }>;
+  /**
+   * Which of our video layers someone wants (bit n: layer n). Encode only those; for a
+   * wanted layer we do not send, the nearest below it, or else our lowest.
+   */
+  videodemand: CustomEvent<{ layers: number }>;
   /** `count` messages of `from`'s stream were lost (it no longer had them). */
   missed: CustomEvent<{ from: string; channel: Channel; count: number }>;
   /**
@@ -153,6 +161,8 @@ export class GroupConnection extends EventTarget {
   readonly rtt: number | undefined;
   /** Whether a WebTransport session to the relay is open now. */
   readonly connected: boolean;
+  /** The latest "videodemand" (bit n: layer n is wanted), undefined until the relay says. */
+  readonly videoDemand: number | undefined;
   /** Broadcasts a message (up to 16,352 bytes) and returns its id. */
   send(channel: Channel, data: Data): number;
   /** Sends to one member only; not resent if the connection drops. */
@@ -162,11 +172,18 @@ export class GroupConnection extends EventTarget {
   /** Sends data that is dropped rather than delayed; false if not sent. */
   sendDatagram(data: Data, to?: string): boolean;
   /**
-   * Sends a video frame of `track` (up to 255,000 bytes); receivers get it
-   * whole and in order ("video"), or ask for a keyframe ("keyframerequest").
+   * Sends a video frame of `layer` (0–3, smallest picture first) of `track` (up to
+   * 255,000 bytes); the relay forwards each member the layer it subscribed to, which
+   * gets it whole and in order ("video"), or asks for a keyframe ("keyframerequest").
    * False if not sent.
    */
-  sendVideo(track: number, keyframe: boolean, timestamp: number, data: Data): boolean;
+  sendVideo(track: number, layer: number, keyframe: boolean, timestamp: number, data: Data): boolean;
+  /**
+   * Asks the relay for `layer` (0–3) of `member`'s video from now on, `null` for none.
+   * It forwards the nearest layer `member` sends, switching at a keyframe; layer 0 (or
+   * the nearest) until asked.
+   */
+  subscribe(member: string, layer: number | null | undefined): void;
   requestSync(from: string): void;
   provideSync(to: string, transfer: number, snapshot: Data): void;
   declineSync(to: string, transfer: number): void;

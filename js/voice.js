@@ -12,8 +12,135 @@
 // kept to avoid clipping the start of a word, say), so that receivers can
 // tell that delay from the network's jitter. Other implementations that
 // want to talk to this one use the same format.
+//
+// A lost datagram costs nothing audible most of the time: each packet also
+// carries copies of the two before it, so one of the next two that arrive
+// brings it back. The copies travel in the Opus packet's padding (RFC 6716
+// §3.2.5), as an Opus extension (draft-ietf-mlcodec-opus-extension) with
+// an experimental ID, which every Opus decoder ignores: receivers that know
+// nothing of them, older versions of this one included, play the packet as
+// before. What is lost for good is bridged by repeating the last pitch
+// period heard, fading out over two frames, then silence.
 
 const RATE = 48_000;
+
+// The extension: ID 122 of those reserved for experiments, running to the
+// end of the padding (L = 0), whose data starts with the experiment's
+// number and version, as the draft recommends ("P", 1), and goes on with
+// `back[1] ‖ length[2] ‖ packet` for each copy, of the packet `back` frames
+// before this one.
+const EXTENSION = (122 << 1) | 0;
+const EXPERIMENT = [0x50, 1];
+// Payloads stay within what any path carries as one datagram.
+const MAX_PAYLOAD = 1000;
+
+/**
+ * `packet` with copies of earlier packets (`[back, packet]`, nearest
+ * first) in its padding, as many as fit. A packet of any code becomes one
+ * of code 3 with the same frames, which adds two bytes or so.
+ */
+export function withCopies(packet, copies) {
+  const room = MAX_PAYLOAD - 1 - packet.length - 10; // hold, header, padding length, extension's ID and prefix
+  const kept = [];
+  let size = 0;
+  for (const [back, copy] of copies) {
+    if (size + 3 + copy.length > room) break;
+    kept.push([back, copy]);
+    size += 3 + copy.length;
+  }
+  if (!kept.length || packet.length < 1) return packet;
+  const toc = packet[0];
+  let head;
+  let body = packet.subarray(1);
+  // The frame count byte: VBR (0x80), padded (0x40), and the number of frames.
+  if ((toc & 3) === 0) head = [toc | 3, 0x41];
+  else if ((toc & 3) === 1) head = [toc | 3, 0x42]; // two frames of one size: CBR
+  else if ((toc & 3) === 2) head = [toc | 3, 0xc2]; // the first frame's length stays where VBR expects it
+  else if (packet.length < 2 || packet[1] & 0x40) return packet; // padded already: leave it be
+  else (head = [toc, packet[1] | 0x40]), (body = packet.subarray(2));
+  const padding = 1 + EXPERIMENT.length + size;
+  // Its length: 255 for each 254 bytes, then the rest.
+  const length = [];
+  let n = padding;
+  for (; n >= 255; n -= 254) length.push(255);
+  length.push(n);
+  const out = new Uint8Array(head.length + length.length + body.length + padding);
+  out.set(head);
+  out.set(length, head.length);
+  let at = head.length + length.length;
+  out.set(body, at);
+  at += body.length;
+  out[at++] = EXTENSION;
+  out.set(EXPERIMENT, at);
+  at += EXPERIMENT.length;
+  for (const [back, copy] of kept) {
+    out[at] = back;
+    out[at + 1] = copy.length >> 8;
+    out[at + 2] = copy.length & 0xff;
+    out.set(copy, at + 3);
+    at += 3 + copy.length;
+  }
+  return out;
+}
+
+/** The copies of earlier packets that `packet` carries, as `[back, packet]`. */
+export function copiesIn(packet) {
+  if (packet.length < 3 || (packet[0] & 3) !== 3 || !(packet[1] & 0x40)) return [];
+  let at = 2;
+  let padding = 0;
+  for (;;) {
+    if (at >= packet.length) return [];
+    const b = packet[at++];
+    padding += b === 255 ? 254 : b;
+    if (b !== 255) break;
+  }
+  if (padding > packet.length - at) return [];
+  // Walk the extensions, skipping those of others, for ours on the first frame.
+  const end = packet.length;
+  let frame = 0;
+  for (at = end - padding; at < end; ) {
+    const id = packet[at] >> 1;
+    const long = packet[at++] & 1;
+    if (id === 0) {
+      if (long) continue;
+      break; // the rest is padding
+    }
+    if (id === 1) {
+      frame += long ? (packet[at++] ?? 0) : 1;
+      continue;
+    }
+    if (id === 2) break; // "repeat these extensions": not for us
+    if (id < 32) {
+      at += long;
+      continue;
+    }
+    let size = end - at;
+    if (long) {
+      size = 0;
+      for (;;) {
+        if (at >= end) return [];
+        const b = packet[at++];
+        size += b;
+        if (b !== 255) break;
+      }
+    }
+    if (size > end - at) break;
+    if (id === EXTENSION >> 1 && frame === 0 && size >= 2 && packet[at] === EXPERIMENT[0] && packet[at + 1] === EXPERIMENT[1]) {
+      const copies = [];
+      for (let i = at + 2; i + 3 <= at + size; ) {
+        const back = packet[i];
+        const length = (packet[i + 1] << 8) | packet[i + 2];
+        i += 3;
+        if (i + length > at + size) break;
+        if (back > 0 && length > 0) copies.push([back, packet.subarray(i, i + length)]);
+        i += length;
+      }
+      return copies;
+    }
+    at += size;
+  }
+  return [];
+}
 
 // Runs in the audio thread: cuts the microphone into frames, and mixes the
 // speakers through per-speaker jitter buffers.
@@ -48,6 +175,26 @@ class Capture extends AudioWorkletProcessor {
   }
 }
 
+// The pitch period of a frame, in samples (2.5 to 15 ms): the lag at which
+// its last 5 ms best match what came before. Every other sample will do.
+function period(pcm) {
+  const n = pcm.length;
+  const w = Math.min(240, n >> 2);
+  let best = 0;
+  let lag = Math.min(720, n - w);
+  for (let l = 120; l <= Math.min(720, n - w); l += 2) {
+    let xy = 0;
+    let yy = 0;
+    for (let i = n - w; i < n; i += 2) {
+      xy += pcm[i] * pcm[i - l];
+      yy += pcm[i - l] * pcm[i - l];
+    }
+    const score = yy > 0 ? xy / Math.sqrt(yy) : 0;
+    if (score > best) (best = score), (lag = l);
+  }
+  return lag;
+}
+
 // One speaker: frames by sequence number, played out after an adaptive delay.
 class Speaker {
   constructor(frame, config) {
@@ -56,26 +203,36 @@ class Speaker {
     this.config = config;
     this.frames = new Map();
     this.quiet = new Set(); // buffered frames with little sound in them
+    this.copies = new Set(); // buffered frames that came as copies in a later packet
     this.skip = new Set(); // frames dropped to catch up: pass over them without a gap
     this.next = null; // the frame to play next, while playing
     this.current = null;
     this.position = 0;
+    this.last = null; // the last frame played that was not made up
+    this.lost = 0; // frames made up since
     this.offsets = []; // arrival time minus send time, recent frames
     this.target = config.min;
     this.gain = 1;
     this.energy = 0;
     this.samples = 0;
-    this.stats = { late: 0, concealed: 0, dropped: 0, played: 0, underruns: 0 };
+    this.stats = { late: 0, concealed: 0, dropped: 0, played: 0, recovered: 0, underruns: 0 };
   }
+  // A frame, or with hold null a copy of one that came in a later packet.
+  // Each comes once: the main thread passes on only the first copy.
   push(seq, pcm, hold) {
-    if (this.next !== null && seq < this.next) {
-      this.stats.late++;
+    if (this.next !== null && (seq < this.next || (seq === this.next && this.current))) {
+      // Its time has passed (or it is being made up right now). A copy too
+      // late to help is no news: the frame was concealed, and counted so.
+      if (hold !== null) this.stats.late++;
       return;
     }
     this.frames.set(seq, pcm);
+    if (hold === null) this.copies.add(seq);
     let energy = 0;
     for (const v of pcm) energy += v * v;
     if (Math.sqrt(energy / pcm.length) < QUIET) this.quiet.add(seq);
+    // A copy came when the packet after it did: that says nothing of jitter.
+    if (hold === null) return;
     // Jitter: the spread of (arrival - seq × frame - time the sender held
     // it) over the last 2 s.
     this.offsets.push(currentTime - seq * this.seconds - hold);
@@ -85,6 +242,22 @@ class Speaker {
   }
   buffered() {
     return this.frames.size * this.seconds;
+  }
+  // The made-up continuation of what was last heard, sample by sample: its
+  // last pitch period over and over, fading out over two frames, as in
+  // G.711 Appendix I. Speech is close to periodic over that time, so this
+  // bridges a lost frame where silence would be heard as a break.
+  synth() {
+    const t = this.t++;
+    const g = 1 - t / (2 * this.frame);
+    return g > 0 ? g * this.last[this.last.length - this.period + (t % this.period)] : 0;
+  }
+  conceal() {
+    const pcm = new Float32Array(this.frame);
+    if (this.lost === 0) (this.period = period(this.last)), (this.t = 0);
+    if (this.lost < 2) for (let i = 0; i < pcm.length; i++) pcm[i] = this.synth();
+    this.lost++;
+    return pcm;
   }
   mix(out, played) {
     if (this.next === null) {
@@ -110,6 +283,15 @@ class Speaker {
         if (pcm) {
           this.frames.delete(this.next);
           this.quiet.delete(this.next);
+          if (this.copies.delete(this.next)) this.stats.recovered++;
+          if (this.lost && this.last) {
+            // Back from a made-up stretch: cross-fade into the real thing
+            // over 5 ms rather than jump.
+            const n = Math.min(240, pcm.length);
+            for (let k = 0; k < n; k++) pcm[k] = (pcm[k] * k + this.synth() * (n - k)) / n;
+          }
+          this.lost = 0;
+          this.last = pcm;
           this.current = pcm;
           this.position = 0;
           this.stats.played++;
@@ -118,11 +300,12 @@ class Speaker {
           // Underrun: the talk spurt is over, or the network stalled.
           // Wait to rebuffer.
           this.next = null;
+          this.lost = 0;
           this.stats.underruns++;
           return;
         } else {
-          // A frame lost on the way: play silence in its place.
-          this.current = new Float32Array(this.frame);
+          // A frame lost on the way, copies and all: make it up.
+          this.current = this.conceal();
           this.position = 0;
           this.stats.concealed++;
         }
@@ -153,6 +336,7 @@ class Speaker {
       }
       this.frames.delete(victim);
       this.quiet.delete(victim);
+      this.copies.delete(victim);
       this.skip.add(victim);
       this.stats.dropped++;
     }
@@ -218,7 +402,11 @@ registerProcessor("peerconnect-playback", Playback);
  * that the browser lets audio start.
  *
  * Options:
- * - `bitrate`: Opus bits per second (default 24000).
+ * - `bitrate`: Opus bits per second (default 32000).
+ * - `redundancy`: how many earlier packets each one carries a copy of, so
+ *   that the next packets bring back those lost (0, 1 or 2; default 2). One
+ *   covers lone losses; two, bursts as well (on Wi-Fi, say), for about a
+ *   fifth more bandwidth than one.
  * - `frameMs`: 10, 20 (default), 40 or 60. Longer frames send fewer packets
  *   and add latency.
  * - `threshold`: the level, in dBFS, above which the microphone counts as
@@ -243,8 +431,12 @@ export async function startVoice(conn, options = {}) {
     codec: "opus",
     sampleRate: RATE,
     numberOfChannels: 1,
-    bitrate: options.bitrate ?? 24_000,
-    opus: { frameDuration: frameMs * 1000, complexity: 5 },
+    bitrate: options.bitrate ?? 32_000,
+    // Complexity 10, the best Opus does, costs next to nothing more (0.19
+    // ms to encode a frame against 0.16 at 5, on a laptop). "voip" favours
+    // intelligibility, as WebRTC does for speech. Variable bitrate, the
+    // default, spends bits where the sound needs them.
+    opus: { frameDuration: frameMs * 1000, complexity: 10, application: "voip" },
   };
   const { supported } = await AudioEncoder.isConfigSupported(config);
   if (!supported) throw new Error("this browser cannot encode Opus");
@@ -291,6 +483,7 @@ export class Voice extends EventTarget {
   #micLevel = 0;
   #transmitting = false;
   #preroll = [];
+  #sent = []; // the latest packets sent, [seq, packet], for copies in the next
   #speaking = new Set();
   #levels = new Map();
   #listeners = [];
@@ -420,7 +613,8 @@ export class Voice extends EventTarget {
 
   /**
    * Per member: `rms` level, current `delay` and jitter buffer `target` (s),
-   * frames `played`, `late`, `concealed` (lost) and `dropped` (to catch up).
+   * frames `played` (`recovered` of them from a copy in a later packet),
+   * `late`, `concealed` (lost) and `dropped` (to catch up).
    */
   stats() {
     return new Map(this.#levels);
@@ -480,19 +674,31 @@ export class Voice extends EventTarget {
     const seq = Math.round(chunk.timestamp / this.#frameUs);
     const { what, at } = this.#pending.get(seq) ?? { what: "hold", at: performance.now() };
     this.#pending.delete(seq);
-    const data = new Uint8Array(1 + chunk.byteLength);
-    chunk.copyTo(data.subarray(1));
+    const packet = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(packet);
     if (what === "hold") {
       // Kept briefly, so that the start of the next word is not clipped.
-      this.#preroll.push([seq, data, at]);
+      this.#preroll.push([seq, packet, at]);
       if (this.#preroll.length > 2) this.#preroll.shift();
       return;
     }
-    const frames = what === "onset" ? [...this.#preroll.splice(0), [seq, data, at]] : [[seq, data, at]];
+    const frames = what === "onset" ? [...this.#preroll.splice(0), [seq, packet, at]] : [[seq, packet, at]];
     const now = performance.now();
-    for (const [s, d, captured] of frames) {
-      d[0] = Math.min(255, Math.max(0, Math.round(now - captured)));
-      this.#conn.sendVoice(s & 0xffff, d);
+    const redundancy = Math.min(2, this.#options.redundancy ?? 2);
+    for (const [s, p, captured] of frames) {
+      // Copies of the packets just before, if they went out.
+      const copies = [];
+      for (const [earlier, copy] of this.#sent) {
+        if (s - earlier >= 1 && s - earlier <= redundancy) copies.push([s - earlier, copy]);
+      }
+      copies.sort((x, y) => x[0] - y[0]);
+      const packed = withCopies(p, copies);
+      const data = new Uint8Array(1 + packed.length);
+      data[0] = Math.min(255, Math.max(0, Math.round(now - captured)));
+      data.set(packed, 1);
+      this.#conn.sendVoice(s & 0xffff, data);
+      this.#sent.push([s, p]);
+      if (this.#sent.length > 2) this.#sent.shift();
     }
   }
 
@@ -507,17 +713,31 @@ export class Voice extends EventTarget {
         error: () => this.#decoders.delete(from),
       });
       decoder.configure({ codec: "opus", sampleRate: RATE, numberOfChannels: 1 });
-      entry = { decoder, last: null, queue: [] };
+      entry = { decoder, last: null, queue: [], seen: new Set() };
       this.#decoders.set(from, entry);
     }
     // Unwrap the 16-bit sequence number around the last one seen.
     const last = entry.last ?? seq;
     const unwrapped = last + ((((seq - (last & 0xffff)) & 0xffff) ^ 0x8000) - 0x8000);
     entry.last = Math.max(entry.last ?? unwrapped, unwrapped);
+    for (const s of entry.seen) if (s < entry.last - 64) entry.seen.delete(s);
+    // The copies first, oldest first, so that the decoder goes in order.
+    // Whichever of a frame and its copies comes first is played; the
+    // others are not even decoded.
+    const packet = data.subarray(1);
+    const copies = copiesIn(packet).sort((x, y) => y[0] - x[0]);
+    for (const [back, copy] of copies) this.#decode(entry, unwrapped - back, copy, null);
+    this.#decode(entry, unwrapped, packet, data[0] / 1000);
+  }
+
+  // `hold` is null for a copy.
+  #decode(entry, seq, packet, hold) {
+    if (entry.seen.has(seq)) return;
+    entry.seen.add(seq);
     // Decoders may rewrite timestamps, but they output one frame per packet,
     // in order: match outputs to inputs by that.
-    entry.queue.push([unwrapped, data[0] / 1000]);
-    entry.decoder.decode(new EncodedAudioChunk({ type: "key", timestamp: unwrapped * 20_000, data: data.subarray(1) }));
+    entry.queue.push([seq, hold]);
+    entry.decoder.decode(new EncodedAudioChunk({ type: "key", timestamp: seq * 20_000, data: packet }));
   }
 
   #decoded(member, audio) {

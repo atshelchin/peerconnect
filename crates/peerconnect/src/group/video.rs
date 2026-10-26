@@ -1,7 +1,10 @@
 //! Video (GROUP.md §7.4): frames cut into fragments that each fit a QUIC
 //! datagram, put back together by receivers, a fragment resent once when a
 //! receiver says it is missing, and a keyframe asked for when a frame is
-//! lost for good. Free of I/O and crypto: the member seals what this says.
+//! lost for good. A track may be sent in several layers (sizes), each
+//! numbered and put back together on its own; a receiver plays one layer
+//! of each track at a time, and moves to another at one of its keyframes.
+//! Free of I/O and crypto: the member seals what this says.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -26,8 +29,11 @@ const KEEP_BYTES: usize = 2 << 20;
 /// quarter of that.
 const RESEND_RATE: f64 = 512.0 * 1024.0;
 const RESEND_BURST: f64 = RESEND_RATE / 4.0;
-/// Frames a receiver holds per sender and track, waiting for missing parts.
+/// Frames a receiver holds per sender, track and layer, waiting for missing parts.
 const HOLD_FRAMES: usize = 64;
+/// Frames of a layer a receiver just moved away from are ignored this long:
+/// they were already on their way, and are not the start of a move back.
+const LEFT_GRACE: u64 = 1000;
 
 /// A fragment's plaintext: `track frame[4] index count flags timestamp[4] ‖ data`.
 pub(crate) fn fragments(track: u8, frame: u32, keyframe: bool, timestamp: u32, data: &[u8]) -> Option<Vec<Vec<u8>>> {
@@ -90,13 +96,13 @@ fn before(a: u32, b: u32) -> bool {
 
 // The sending side.
 
-/// Our recent frames, per track, for resending.
+/// Our recent frames, per track and layer, for resending.
 pub(crate) struct Outgoing {
     tracks: Vec<TrackOut>,
     tokens: f64,
     tokens_at: u64,
-    /// When we last told the application a track's keyframe is wanted.
-    keyframe_told: Vec<(u8, u64)>,
+    /// When we last told the application a layer's keyframe is wanted, by track and layer.
+    keyframe_told: Vec<((u8, u8), u64)>,
 }
 
 impl Default for Outgoing {
@@ -108,6 +114,7 @@ impl Default for Outgoing {
 
 struct TrackOut {
     track: u8,
+    layer: u8,
     next: u32,
     recent: VecDeque<Sent>,
     bytes: usize,
@@ -125,14 +132,15 @@ impl Outgoing {
         &mut self,
         now: u64,
         track: u8,
+        layer: u8,
         keyframe: bool,
         timestamp: u32,
         data: &[u8],
     ) -> Option<Vec<Vec<u8>>> {
-        let t = match self.tracks.iter().position(|t| t.track == track) {
+        let t = match self.tracks.iter().position(|t| (t.track, t.layer) == (track, layer)) {
             Some(i) => &mut self.tracks[i],
             None => {
-                self.tracks.push(TrackOut { track, next: 0, recent: VecDeque::new(), bytes: 0 });
+                self.tracks.push(TrackOut { track, layer, next: 0, recent: VecDeque::new(), bytes: 0 });
                 self.tracks.last_mut().unwrap()
             }
         };
@@ -150,11 +158,11 @@ impl Outgoing {
 
     /// The fragments a receiver asked for again (`NACK`), those still kept
     /// and within the resend rate.
-    pub(crate) fn resend(&mut self, now: u64, track: u8, frame: u32, indices: &[u8]) -> Vec<Vec<u8>> {
+    pub(crate) fn resend(&mut self, now: u64, track: u8, layer: u8, frame: u32, indices: &[u8]) -> Vec<Vec<u8>> {
         let elapsed = now.saturating_sub(self.tokens_at) as f64 / 1000.0;
         self.tokens = (self.tokens + elapsed * RESEND_RATE).min(RESEND_BURST);
         self.tokens_at = now;
-        let Some(t) = self.tracks.iter().find(|t| t.track == track) else { return Vec::new() };
+        let Some(t) = self.tracks.iter().find(|t| (t.track, t.layer) == (track, layer)) else { return Vec::new() };
         let Some(sent) = t.recent.iter().find(|s| s.frame == frame && now.saturating_sub(s.at) <= KEEP_FOR) else {
             return Vec::new();
         };
@@ -175,9 +183,10 @@ impl Outgoing {
         out
     }
 
-    /// Whether to tell the application that `track` needs a keyframe:
-    /// once per [`KEYFRAME_RETRY`], however many receivers ask.
-    pub(crate) fn keyframe_wanted(&mut self, now: u64, track: u8) -> bool {
+    /// Whether to tell the application that `layer` of `track` needs a
+    /// keyframe: once per [`KEYFRAME_RETRY`], however many receivers ask.
+    pub(crate) fn keyframe_wanted(&mut self, now: u64, track: u8, layer: u8) -> bool {
+        let track = (track, layer);
         match self.keyframe_told.iter_mut().find(|(t, _)| *t == track) {
             Some((_, at)) if now.saturating_sub(*at) < KEYFRAME_RETRY => false,
             Some((_, at)) => {
@@ -198,22 +207,31 @@ impl Outgoing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     /// A whole frame, in order, decodable (it follows a keyframe without loss).
-    Deliver { track: u8, keyframe: bool, timestamp: u32, data: Vec<u8> },
+    Deliver { track: u8, layer: u8, keyframe: bool, timestamp: u32, data: Vec<u8> },
     /// Ask the sender for these fragments of `frame` again.
-    Nack { track: u8, frame: u32, indices: Vec<u8> },
+    Nack { track: u8, layer: u8, frame: u32, indices: Vec<u8> },
     /// Ask the sender for a keyframe.
-    RequestKeyframe { track: u8 },
+    RequestKeyframe { track: u8, layer: u8 },
 }
 
-/// One sender's video, per track.
+/// One sender's video, per track and layer.
 #[derive(Default)]
 pub(crate) struct Incoming {
     tracks: Vec<TrackIn>,
+    /// Per track: the layer delivered, and the layers moved away from, when.
+    playing: Vec<Playing>,
+}
+
+struct Playing {
+    track: u8,
+    layer: u8,
+    left: Vec<(u8, u64)>,
 }
 
 #[derive(Default)]
 struct TrackIn {
     track: u8,
+    layer: u8,
     /// The next frame to deliver, once one has arrived.
     next: Option<u32>,
     /// Frames from `next` on, as far as they have arrived.
@@ -243,16 +261,50 @@ impl TrackIn {
 }
 
 impl Incoming {
-    pub(crate) fn push(&mut self, now: u64, plaintext: &[u8], out: &mut Vec<Action>) {
+    /// A fragment of `layer`, the layer its type said.
+    pub(crate) fn push(&mut self, now: u64, layer: u8, plaintext: &[u8], out: &mut Vec<Action>) {
         let Some(f) = parse(plaintext) else { return };
-        let i = match self.tracks.iter().position(|t| t.track == f.track) {
+        if let Some(p) = self.playing.iter_mut().find(|p| p.track == f.track) {
+            p.left.retain(|&(_, at)| now.saturating_sub(at) < LEFT_GRACE);
+            if p.layer != layer && p.left.iter().any(|&(l, _)| l == layer) {
+                return; // still arriving from before the move
+            }
+        }
+        let i = match self.tracks.iter().position(|t| (t.track, t.layer) == (f.track, layer)) {
             Some(i) => i,
             None => {
-                self.tracks.push(TrackIn { track: f.track, broken: true, ..TrackIn::default() });
+                self.tracks.push(TrackIn { track: f.track, layer, broken: true, ..TrackIn::default() });
                 self.tracks.len() - 1
             }
         };
-        let t = &mut self.tracks[i];
+        let mut actions = Vec::new();
+        Self::assemble(&mut self.tracks[i], now, f, &mut actions);
+        self.play(now, actions, out);
+    }
+
+    /// Passes on what the layers' assemblers decided, delivering one layer
+    /// per track: another layer takes over with its first keyframe.
+    fn play(&mut self, now: u64, actions: Vec<Action>, out: &mut Vec<Action>) {
+        for action in actions {
+            let Action::Deliver { track, layer, keyframe, .. } = action else {
+                out.push(action);
+                continue;
+            };
+            match self.playing.iter_mut().find(|p| p.track == track) {
+                Some(p) if p.layer == layer => {}
+                Some(p) if keyframe => {
+                    let old = std::mem::replace(&mut p.layer, layer);
+                    p.left.push((old, now));
+                    self.tracks.retain(|t| !(t.track == track && t.layer == old));
+                }
+                Some(_) => continue,
+                None => self.playing.push(Playing { track, layer, left: Vec::new() }),
+            }
+            out.push(action);
+        }
+    }
+
+    fn assemble(t: &mut TrackIn, now: u64, f: Fragment<'_>, out: &mut Vec<Action>) {
         let next = *t.next.get_or_insert(f.frame);
         if before(f.frame, next) {
             return; // delivered or given up already
@@ -303,7 +355,13 @@ impl Incoming {
                 continue;
             }
             let data = p.parts.into_iter().flatten().flatten().collect();
-            out.push(Action::Deliver { track: t.track, keyframe: p.keyframe, timestamp: p.timestamp, data });
+            out.push(Action::Deliver {
+                track: t.track,
+                layer: t.layer,
+                keyframe: p.keyframe,
+                timestamp: p.timestamp,
+                data,
+            });
         }
         if !t.frames.is_empty() {
             t.blocked_since.get_or_insert(now);
@@ -313,12 +371,18 @@ impl Incoming {
     fn want_keyframe(t: &mut TrackIn, now: u64, out: &mut Vec<Action>) {
         if t.keyframe_asked.is_none_or(|at| now.saturating_sub(at) >= KEYFRAME_RETRY) {
             t.keyframe_asked = Some(now);
-            out.push(Action::RequestKeyframe { track: t.track });
+            out.push(Action::RequestKeyframe { track: t.track, layer: t.layer });
         }
     }
 
     /// Asks for what is missing, and gives up on what is too late.
     pub(crate) fn tick(&mut self, now: u64, rtt: u64, out: &mut Vec<Action>) {
+        let mut actions = Vec::new();
+        self.tick_layers(now, rtt, &mut actions);
+        self.play(now, actions, out);
+    }
+
+    fn tick_layers(&mut self, now: u64, rtt: u64, out: &mut Vec<Action>) {
         for t in &mut self.tracks {
             let Some(since) = t.blocked_since else { continue };
             let waited = now.saturating_sub(since);
@@ -347,11 +411,19 @@ impl Incoming {
                         None => vec![WHOLE_FRAME],
                     };
                     if !indices.is_empty() {
-                        out.push(Action::Nack { track: t.track, frame, indices });
+                        out.push(Action::Nack { track: t.track, layer: t.layer, frame, indices });
                     }
                 }
             }
         }
+    }
+
+    /// The tracks seen from this sender.
+    pub(crate) fn tracks(&self) -> Vec<u8> {
+        let mut tracks: Vec<u8> = self.tracks.iter().map(|t| t.track).collect();
+        tracks.sort_unstable();
+        tracks.dedup();
+        tracks
     }
 
     /// When [`Incoming::tick`] has something to do.
@@ -406,13 +478,13 @@ mod tests {
         let mut out = Vec::new();
         let mut all = Vec::new();
         for i in 0..5u32 {
-            all.extend(tx.send(0, 0, i == 0, i * 33, &frame(1500 + i as usize, i as u8)).unwrap());
+            all.extend(tx.send(0, 0, 0, i == 0, i * 33, &frame(1500 + i as usize, i as u8)).unwrap());
         }
         // Out of order, but the first to arrive is the first frame's.
         all.swap(1, 4);
         all.swap(2, 7);
         for p in &all {
-            rx.push(1, p, &mut out);
+            rx.push(1, 0, p, &mut out);
         }
         assert_eq!(
             delivered(&out),
@@ -426,11 +498,11 @@ mod tests {
         let mut tx = Outgoing::default();
         let mut rx = Incoming::default();
         let mut out = Vec::new();
-        let key = tx.send(0, 0, true, 0, &frame(3000, 0)).unwrap();
-        let next = tx.send(0, 0, false, 33, &frame(800, 1)).unwrap();
-        rx.push(1, &key[0], &mut out);
-        rx.push(1, &key[2], &mut out); // key[1] is lost
-        rx.push(2, &next[0], &mut out);
+        let key = tx.send(0, 0, 0, true, 0, &frame(3000, 0)).unwrap();
+        let next = tx.send(0, 0, 0, false, 33, &frame(800, 1)).unwrap();
+        rx.push(1, 0, &key[0], &mut out);
+        rx.push(1, 0, &key[2], &mut out); // key[1] is lost
+        rx.push(2, 0, &next[0], &mut out);
         assert!(delivered(&out).is_empty(), "held until the keyframe is whole");
         assert_eq!(rx.deadline(50), Some(1 + NACK_DELAY));
         rx.tick(1 + NACK_DELAY, 50, &mut out);
@@ -438,9 +510,9 @@ mod tests {
             if let Action::Nack { frame, indices, .. } = a { Some((*frame, indices.clone())) } else { None }
         });
         assert_eq!(nack, Some((0, vec![1])));
-        let again = tx.resend(30, 0, 0, &[1]);
+        let again = tx.resend(30, 0, 0, 0, &[1]);
         assert_eq!(again, vec![key[1].clone()]);
-        rx.push(40, &again[0], &mut out);
+        rx.push(40, 0, &again[0], &mut out);
         assert_eq!(delivered(&out), [(true, 0, 3000), (false, 33, 800)]);
     }
 
@@ -449,10 +521,10 @@ mod tests {
         let mut rx = Incoming::default();
         let mut out = Vec::new();
         let parts = fragments(0, 0, true, 0, &frame(2500, 0)).unwrap();
-        rx.push(0, &parts[0], &mut out);
-        rx.push(0, &parts[1], &mut out);
+        rx.push(0, 0, &parts[0], &mut out);
+        rx.push(0, 0, &parts[1], &mut out);
         rx.tick(NACK_DELAY, 20, &mut out);
-        assert_eq!(out, [Action::Nack { track: 0, frame: 0, indices: vec![2] }]);
+        assert_eq!(out, [Action::Nack { track: 0, layer: 0, frame: 0, indices: vec![2] }]);
     }
 
     #[test]
@@ -460,21 +532,21 @@ mod tests {
         let mut tx = Outgoing::default();
         let mut rx = Incoming::default();
         let mut out = Vec::new();
-        let f0 = tx.send(0, 0, true, 0, &frame(100, 0)).unwrap();
-        let _f1 = tx.send(0, 0, false, 1, &frame(100, 1)).unwrap(); // never arrives
-        let f2 = tx.send(0, 0, false, 2, &frame(100, 2)).unwrap();
-        rx.push(0, &f0[0], &mut out);
-        rx.push(5, &f2[0], &mut out);
+        let f0 = tx.send(0, 0, 0, true, 0, &frame(100, 0)).unwrap();
+        let _f1 = tx.send(0, 0, 0, false, 1, &frame(100, 1)).unwrap(); // never arrives
+        let f2 = tx.send(0, 0, 0, false, 2, &frame(100, 2)).unwrap();
+        rx.push(0, 0, &f0[0], &mut out);
+        rx.push(5, 0, &f2[0], &mut out);
         rx.tick(5 + NACK_DELAY, 20, &mut out);
         assert!(out.iter().any(|a| matches!(a, Action::Nack { frame: 1, indices, .. } if indices == &[WHOLE_FRAME])));
         rx.tick(5 + HOLD, 20, &mut out);
-        assert!(out.iter().any(|a| matches!(a, Action::RequestKeyframe { track: 0 })));
+        assert!(out.iter().any(|a| matches!(a, Action::RequestKeyframe { track: 0, layer: 0 })));
         // Frame 2 depended on frame 1: not delivered.
         assert_eq!(delivered(&out), [(true, 0, 100)]);
-        let f3 = tx.send(400, 0, false, 3, &frame(100, 3)).unwrap();
-        let f4 = tx.send(400, 0, true, 4, &frame(100, 4)).unwrap();
-        rx.push(400, &f3[0], &mut out);
-        rx.push(401, &f4[0], &mut out);
+        let f3 = tx.send(400, 0, 0, false, 3, &frame(100, 3)).unwrap();
+        let f4 = tx.send(400, 0, 0, true, 4, &frame(100, 4)).unwrap();
+        rx.push(400, 0, &f3[0], &mut out);
+        rx.push(401, 0, &f4[0], &mut out);
         assert_eq!(delivered(&out), [(true, 0, 100), (true, 4, 100)], "back with the keyframe");
     }
 
@@ -484,44 +556,44 @@ mod tests {
         let mut rx = Incoming::default();
         let mut out = Vec::new();
         for i in 0..3 {
-            let _ = tx.send(0, 0, i == 0, i, &frame(10, 0));
+            let _ = tx.send(0, 0, 0, i == 0, i, &frame(10, 0));
         }
-        let delta = tx.send(0, 0, false, 3, &frame(10, 0)).unwrap();
-        rx.push(0, &delta[0], &mut out);
-        assert_eq!(out, [Action::RequestKeyframe { track: 0 }]);
-        let key = tx.send(10, 0, true, 4, &frame(10, 0)).unwrap();
-        rx.push(10, &key[0], &mut out);
+        let delta = tx.send(0, 0, 0, false, 3, &frame(10, 0)).unwrap();
+        rx.push(0, 0, &delta[0], &mut out);
+        assert_eq!(out, [Action::RequestKeyframe { track: 0, layer: 0 }]);
+        let key = tx.send(10, 0, 0, true, 4, &frame(10, 0)).unwrap();
+        rx.push(10, 0, &key[0], &mut out);
         assert_eq!(delivered(&out), [(true, 4, 10)]);
     }
 
     #[test]
     fn the_first_loss_is_answered_at_once() {
         let mut tx = Outgoing::default();
-        let f = tx.send(0, 0, true, 0, &frame(1500, 0)).unwrap();
-        assert_eq!(tx.resend(0, 0, 0, &[1]), vec![f[1].clone()]);
+        let f = tx.send(0, 0, 0, true, 0, &frame(1500, 0)).unwrap();
+        assert_eq!(tx.resend(0, 0, 0, 0, &[1]), vec![f[1].clone()]);
     }
 
     #[test]
     fn resends_are_bounded_by_age_and_rate() {
         let mut tx = Outgoing::default();
-        let f = tx.send(0, 0, true, 0, &frame(MAX_VIDEO_FRAME, 0)).unwrap();
-        assert!(tx.resend(KEEP_FOR + 1, 0, 0, &[0]).is_empty(), "too old");
+        let f = tx.send(0, 0, 0, true, 0, &frame(MAX_VIDEO_FRAME, 0)).unwrap();
+        assert!(tx.resend(KEEP_FOR + 1, 0, 0, 0, &[0]).is_empty(), "too old");
         let mut tx = Outgoing::default();
-        let _ = tx.send(0, 0, true, 0, &frame(MAX_VIDEO_FRAME, 0));
-        let burst = tx.resend(400, 0, 0, &[WHOLE_FRAME]);
+        let _ = tx.send(0, 0, 0, true, 0, &frame(MAX_VIDEO_FRAME, 0));
+        let burst = tx.resend(400, 0, 0, 0, &[WHOLE_FRAME]);
         assert!(burst.len() < f.len() && !burst.is_empty(), "{} of {}", burst.len(), f.len());
-        assert!(tx.resend(400, 0, 0, &[200]).is_empty(), "the rate is spent");
-        assert!(tx.resend(450, 0, 9, &[0]).is_empty(), "unknown frame");
-        assert!(tx.resend(450, 5, 0, &[0]).is_empty(), "unknown track");
+        assert!(tx.resend(400, 0, 0, 0, &[200]).is_empty(), "the rate is spent");
+        assert!(tx.resend(450, 0, 0, 9, &[0]).is_empty(), "unknown frame");
+        assert!(tx.resend(450, 5, 0, 0, &[0]).is_empty(), "unknown track");
     }
 
     #[test]
     fn keyframe_requests_are_coalesced() {
         let mut tx = Outgoing::default();
-        assert!(tx.keyframe_wanted(0, 0));
-        assert!(!tx.keyframe_wanted(100, 0));
-        assert!(tx.keyframe_wanted(100, 1), "per track");
-        assert!(tx.keyframe_wanted(KEYFRAME_RETRY, 0));
+        assert!(tx.keyframe_wanted(0, 0, 0));
+        assert!(!tx.keyframe_wanted(100, 0, 0));
+        assert!(tx.keyframe_wanted(100, 1, 0), "per track");
+        assert!(tx.keyframe_wanted(KEYFRAME_RETRY, 0, 0));
     }
 
     #[test]
@@ -529,13 +601,61 @@ mod tests {
         let mut rx = Incoming::default();
         let mut out = Vec::new();
         for (i, id) in [u32::MAX - 1, u32::MAX, 0, 1].into_iter().enumerate() {
-            rx.push(i as u64, &fragments(0, id, i == 0, id, &[1]).unwrap()[0], &mut out);
+            rx.push(i as u64, 0, &fragments(0, id, i == 0, id, &[1]).unwrap()[0], &mut out);
         }
         assert_eq!(delivered(&out).len(), 4);
         out.clear();
-        rx.push(10, &fragments(0, 1000, true, 1000, &[1]).unwrap()[0], &mut out);
+        rx.push(10, 0, &fragments(0, 1000, true, 1000, &[1]).unwrap()[0], &mut out);
         assert_eq!(delivered(&out), [(true, 1000, 1)]);
-        rx.push(11, &fragments(0, 999, false, 999, &[1]).unwrap()[0], &mut out);
+        rx.push(11, 0, &fragments(0, 999, false, 999, &[1]).unwrap()[0], &mut out);
         assert_eq!(delivered(&out).len(), 1, "older than what was delivered: ignored");
+    }
+
+    #[test]
+    fn layers_are_numbered_and_resent_apart() {
+        let mut tx = Outgoing::default();
+        let low = tx.send(0, 0, 1, true, 0, &frame(1500, 1)).unwrap();
+        let high = tx.send(0, 0, 2, true, 0, &frame(1500, 2)).unwrap();
+        assert_eq!(parse(&low[0]).unwrap().frame, 0);
+        assert_eq!(parse(&high[0]).unwrap().frame, 0, "each layer counts its own frames");
+        assert_eq!(tx.resend(1, 0, 2, 0, &[1]), vec![high[1].clone()]);
+        assert!(tx.keyframe_wanted(1, 0, 1));
+        assert!(tx.keyframe_wanted(1, 0, 2), "per layer");
+    }
+
+    #[test]
+    fn one_layer_plays_and_another_takes_over_at_its_keyframe() {
+        let mut tx = Outgoing::default();
+        let mut rx = Incoming::default();
+        let mut out = Vec::new();
+        let layers = |out: &[Action]| -> Vec<(u8, bool)> {
+            out.iter()
+                .filter_map(|a| match a {
+                    Action::Deliver { layer, keyframe, .. } => Some((*layer, *keyframe)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Layer 1 plays.
+        for i in 0..3u32 {
+            rx.push(i as u64, 1, &tx.send(0, 0, 1, i == 0, i, &frame(10, 0)).unwrap()[0], &mut out);
+        }
+        // Layer 2 starts mid-stream: its deltas are not played, and its keyframe is asked for.
+        let _ = tx.send(0, 0, 2, true, 0, &frame(10, 0));
+        rx.push(5, 2, &tx.send(5, 0, 2, false, 1, &frame(10, 0)).unwrap()[0], &mut out);
+        assert!(out.contains(&Action::RequestKeyframe { track: 0, layer: 2 }));
+        rx.push(6, 1, &tx.send(6, 0, 1, false, 3, &frame(10, 0)).unwrap()[0], &mut out);
+        // Its keyframe: layer 2 plays from then on, and layer 1's frames still on their way are ignored.
+        rx.push(7, 2, &tx.send(7, 0, 2, true, 2, &frame(10, 0)).unwrap()[0], &mut out);
+        rx.push(8, 1, &tx.send(8, 0, 1, false, 4, &frame(10, 0)).unwrap()[0], &mut out);
+        rx.push(9, 2, &tx.send(9, 0, 2, false, 3, &frame(10, 0)).unwrap()[0], &mut out);
+        assert_eq!(layers(&out), [(1, true), (1, false), (1, false), (1, false), (2, true), (2, false)]);
+        assert!(!out.contains(&Action::RequestKeyframe { track: 0, layer: 1 }), "the old layer is not asked for");
+        // Back to layer 1, later: from its keyframe.
+        out.clear();
+        rx.push(2000, 1, &tx.send(2000, 0, 1, false, 9, &frame(10, 0)).unwrap()[0], &mut out);
+        assert!(layers(&out).is_empty());
+        rx.push(2001, 1, &tx.send(2001, 0, 1, true, 10, &frame(10, 0)).unwrap()[0], &mut out);
+        assert_eq!(layers(&out), [(1, true)]);
     }
 }

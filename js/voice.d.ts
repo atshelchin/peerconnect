@@ -1,8 +1,15 @@
 import type { GroupConnection } from "./index.js";
 
 export interface VoiceOptions {
-  /** Opus bits per second (default 24000). */
+  /** Opus bits per second (default 32000). */
   bitrate?: number;
+  /**
+   * How many earlier packets each one carries a copy of, so that the packets after bring back
+   * those lost (default 2). 1 covers lone losses; 2, bursts as well, for about a fifth more
+   * bandwidth; 0 sends none. Receivers that know nothing of the copies play the packets as
+   * before.
+   */
+  redundancy?: 0 | 1 | 2;
   /** Frame duration: 10, 20 (default), 40 or 60 ms. Longer frames send fewer packets and add latency. */
   frameMs?: 10 | 20 | 40 | 60;
   /** Send only while speaking (default true). */
@@ -36,12 +43,16 @@ export interface SpeakerStats {
   delay: number;
   target: number;
   played: number;
-  /** Frames that arrived after their time. */
+  /** Frames played from a copy in a later packet, the frame itself having been lost (or not yet come). */
+  recovered: number;
+  /** Frames that arrived after their time (copies too late to help are not counted). */
   late: number;
-  /** Frames missing at their time, replaced by silence. */
+  /** Frames missing at their time, copies and all: made up from the last pitch period heard, fading out. */
   concealed: number;
   /** Frames dropped to catch up after a stall. */
   dropped: number;
+  /** Times the buffer ran dry (at the end of each talk spurt, as a rule) and waited to fill again. */
+  underruns: number;
 }
 
 export interface VoiceEventMap {
@@ -87,3 +98,12 @@ export class Voice extends EventTarget {
  * gesture. Needs WebCodecs audio with Opus; rejects where it is missing.
  */
 export function startVoice(conn: GroupConnection, options?: VoiceOptions): Promise<Voice>;
+
+/**
+ * The voice payload's packet (GROUP.md §7.2) with copies of earlier packets, `[back, packet]`
+ * (the packet `back` frames before), in its Opus padding: for implementations that want to
+ * send them too. Copies that would take the payload past 1,000 bytes are left out.
+ */
+export function withCopies(packet: Uint8Array, copies: [number, Uint8Array][]): Uint8Array;
+/** The copies of earlier packets that an Opus packet carries in its padding, as `[back, packet]`. */
+export function copiesIn(packet: Uint8Array): [number, Uint8Array][];
