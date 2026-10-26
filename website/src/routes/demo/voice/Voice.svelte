@@ -97,6 +97,9 @@
 		typeof AudioContext === 'function' && 'setSinkId' in AudioContext.prototype;
 	let deafened = $state(false);
 	let camera = $state(false);
+	/** Our camera faces us (shown mirrored), or away (the rear camera, shown as it is). */
+	let facingUs = $state(true);
+	let switching = $state(false);
 	let cameraStream: MediaStream | undefined = $state.raw();
 	/** Members whose video is coming in now. */
 	let watching: Record<string, boolean> = $state({});
@@ -467,23 +470,62 @@
 			return;
 		}
 		try {
-			const stream = await navigator.mediaDevices.getUserMedia({
-				video: {
-					width: VIDEO.width,
-					height: VIDEO.height,
-					frameRate: VIDEO.framerate,
-					...(cameraDevice ? { deviceId: { exact: cameraDevice } } : {})
-				}
-			});
-			cameraStream = stream;
-			await video.setStream(stream);
+			await useCamera(cameraDevice ? { deviceId: { exact: cameraDevice } } : {});
 			camera = true;
 			problems = problems.filter((p) => p !== 'camera');
 			announce();
+			void listDevices(); // now with names, and how many there are to switch between
 		} catch {
 			cameraStream?.getTracks().forEach((t) => t.stop());
 			cameraStream = undefined;
 			raise('camera');
+		}
+	}
+
+	/** Opens a camera (letting go of the one before) and sends it. */
+	async function useCamera(which: MediaTrackConstraints) {
+		// Phones cannot open a second camera while one is open.
+		cameraStream?.getTracks().forEach((t) => t.stop());
+		const stream = await navigator.mediaDevices.getUserMedia({
+			video: { width: VIDEO.width, height: VIDEO.height, frameRate: VIDEO.framerate, ...which }
+		});
+		cameraStream = stream;
+		const settings = stream.getVideoTracks()[0]?.getSettings() ?? {};
+		facingUs = settings.facingMode !== 'environment';
+		if (settings.deviceId) cameraDevice = settings.deviceId;
+		await video!.setStream(stream);
+	}
+
+	/**
+	 * The other camera: front to back and back again where the browser
+	 * knows which way cameras face (phones), else the next one in the list.
+	 */
+	async function switchCamera() {
+		if (!video || !camera || switching) return;
+		switching = true;
+		const before = cameraDevice;
+		const facing = cameraStream?.getVideoTracks()[0]?.getSettings().facingMode;
+		try {
+			if (facing === 'user' || facing === 'environment') {
+				try {
+					await useCamera({ facingMode: { exact: facing === 'user' ? 'environment' : 'user' } });
+					return;
+				} catch {
+					// no camera facing the other way: try the list
+				}
+			}
+			const cameras = devices.camera.filter((d) => d.deviceId);
+			const next = cameras[(cameras.findIndex((d) => d.deviceId === before) + 1) % cameras.length];
+			await useCamera(next ? { deviceId: { exact: next.deviceId } } : {});
+		} catch {
+			// The other camera would not open: back to the one we had.
+			try {
+				await useCamera(before ? { deviceId: { exact: before } } : {});
+			} catch {
+				raise('camera');
+			}
+		} finally {
+			switching = false;
 		}
 	}
 
@@ -552,6 +594,7 @@
 		frames.clear();
 		deafened = camera = false;
 		muted = true;
+		facingUs = true;
 		status = 'offline';
 		problems = [];
 		invite = '';
@@ -621,9 +664,14 @@
 		| 'camera'
 		| 'camera-off'
 		| 'rotate'
+		| 'switch-camera'
 )}
 	<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-		{#if name === 'rotate'}
+		{#if name === 'switch-camera'}
+			<path d="M4 8h3l1.5-2h7L17 8h3v11H4z" />
+			<path d="M9.5 12.5a2.8 2.8 0 0 1 5-1.2M14.5 14.5a2.8 2.8 0 0 1-5 1.2" />
+			<path d="M14.8 9.6v1.9h-1.9M9.2 17.4v-1.9h1.9" />
+		{:else if name === 'rotate'}
 			<path d="M20 12a8 8 0 1 1-2.34-5.66" />
 			<path d="M20 4v4.5h-4.5" />
 		{:else if name === 'camera' || name === 'camera-off'}
@@ -785,15 +833,22 @@
 								: t.room.rotateTheirs.replace('{name}', person.name)}
 							<div class="frame">
 								<!-- Ours as we send it (mirrored, as a mirror would be); theirs as they arrive. -->
-								<canvas class="screen" class:mirror={mine} use:screen={person.id}
+								<canvas class="screen" class:mirror={mine && facingUs} use:screen={person.id}
 									>{t.room.video.replace('{name}', person.name)}</canvas
 								>
-								<button
-									class="rotate"
-									aria-label={turn}
-									title={turn}
-									onclick={() => rotate(person.id)}>{@render icon('rotate')}</button
-								>
+								<span class="overlay">
+									{#if mine && devices.camera.length > 1}
+										<button
+											aria-label={t.room.switchCamera}
+											title={t.room.switchCamera}
+											disabled={switching}
+											onclick={switchCamera}>{@render icon('switch-camera')}</button
+										>
+									{/if}
+									<button aria-label={turn} title={turn} onclick={() => rotate(person.id)}
+										>{@render icon('rotate')}</button
+									>
+								</span>
 							</div>
 						{/if}
 						<span class="avatar" aria-hidden="true">{person.name.slice(0, 1).toUpperCase()}</span>
@@ -1205,10 +1260,15 @@
 		object-fit: contain;
 	}
 
-	.rotate {
+	.overlay {
 		position: absolute;
 		top: 8px;
 		right: 8px;
+		display: flex;
+		gap: 8px;
+	}
+
+	.overlay button {
 		display: grid;
 		place-items: center;
 		width: 36px;
@@ -1220,8 +1280,13 @@
 		cursor: pointer;
 	}
 
-	.rotate:hover {
+	.overlay button:hover {
 		background: rgb(0 0 0 / 0.65);
+	}
+
+	.overlay button:disabled {
+		opacity: 0.5;
+		cursor: wait;
 	}
 
 	.screen.mirror {

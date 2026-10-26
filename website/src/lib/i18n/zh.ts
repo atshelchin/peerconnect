@@ -344,6 +344,7 @@ export const zh: Dict = {
 			cameraOn: '关闭摄像头',
 			cameraOff: '打开摄像头：大家都能看见你',
 			video: '{name} 的视频',
+			switchCamera: '切换前后摄像头',
 			rotateMine: '把你的画面转 90°（大家看到的都会转）',
 			rotateTheirs: '把 {name} 的画面转 90°（只对你）'
 		},

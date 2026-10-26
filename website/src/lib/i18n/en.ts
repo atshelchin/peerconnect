@@ -357,6 +357,7 @@ export const en = {
 			cameraOn: 'Turn your camera off',
 			cameraOff: 'Turn your camera on: everyone sees you',
 			video: 'Video from {name}',
+			switchCamera: 'Switch camera (front and back)',
 			rotateMine: 'Turn your picture a quarter turn, for everyone',
 			rotateTheirs: 'Turn {name}’s picture a quarter turn (only for you)'
 		},
