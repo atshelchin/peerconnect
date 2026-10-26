@@ -231,7 +231,10 @@
       frames[who].push({ t: now(), layer });
       frame.close();
     };
-    const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+    // A busy picture, so that 720p needs its bitrate (the fake camera's plain
+    // picture encodes far below it, and would fit any slow link).
+    const picture = busy({ width: 1280, height: 720, fps: 20, noise: 0.1 });
+    const camera = picture.stream;
     const va = await startVideo(a, {
       stream: camera,
       framerate: 20,
@@ -268,6 +271,220 @@
     camera.getTracks().forEach((t) => t.stop());
     for (const m of [a, b, c]) m.leave();
     return { connected, frames, limits, uplink, marks: window.marks, stats: { a: { uplink: stats.a.uplink, layers: stats.a.layers } } };
+  };
+
+  /**
+   * A busy picture of `width` × `height` at `fps`, as a screen with text
+   * looks: rows of text, a counter and a moving bar, under a band of
+   * `noise` (0–1 of the height) of fixed random pixels, which make
+   * keyframes large (the encoder must draw every one) and deltas small.
+   */
+  function busy({ width, height, fps, noise = 0 }) {
+    const canvas = document.createElement("canvas");
+    [canvas.width, canvas.height] = [width, height];
+    const ctx = canvas.getContext("2d");
+    const band = Math.round(height * noise);
+    const grain = band ? ctx.createImageData(width, band) : null;
+    if (grain) {
+      let seed = 7;
+      for (let i = 0; i < grain.data.length; i += 4) {
+        seed = (seed * 48271) % 2147483647;
+        const v = seed & 0xff;
+        [grain.data[i], grain.data[i + 1], grain.data[i + 2], grain.data[i + 3]] = [v, (v * 7) & 0xff, 255 - v, 255];
+      }
+    }
+    let n = 0;
+    const paint = () => {
+      n++;
+      ctx.fillStyle = "#f4f4f4";
+      ctx.fillRect(0, 0, width, height);
+      if (grain) ctx.putImageData(grain, 0, 0);
+      ctx.fillStyle = "#222";
+      ctx.font = "15px monospace";
+      for (let y = band + 38; y < height - 70; y += 20) ctx.fillText(`${y} the quick brown fox jumps over the lazy dog, 0123456789 `.repeat(4), 6, y);
+      ctx.font = "bold 18px monospace";
+      ctx.fillText(`frame ${n}`, 6, band + 18);
+      ctx.fillStyle = "#e00000";
+      ctx.fillRect((n * 23) % width, height - 60, 120, 40);
+    };
+    paint();
+    const timer = setInterval(paint, 1000 / fps);
+    const stream = canvas.captureStream(fps);
+    return { stream, stop: () => (clearInterval(timer), stream.getTracks().forEach((t) => t.stop())) };
+  }
+
+  /** Records what `m` sends: per track and layer, each frame's size, and whether it was a keyframe. */
+  function recordSends(m) {
+    const sent = [];
+    const send = m.sendVideo.bind(m);
+    m.sendVideo = (track, layer, keyframe, timestamp, data) => {
+      const ok = send(track, layer, keyframe, timestamp, data);
+      sent.push({ t: performance.now(), track, layer, keyframe, timestamp, size: data.length, codec: data[0], ok });
+      return ok;
+    };
+    return sent;
+  }
+
+  /**
+   * Two tracks from one member: a sends its camera as track 0 (layers 0
+   * and 1) and a screen as track 1 (layers 1, 2 and 3; 1 in `screenCodec`
+   * if given), from a second Video that only sends. b shows the screen
+   * large and the camera small, c both at gallery size; then b shows the
+   * screen small too.
+   */
+  window.tracks = async ({ relay, hash, seconds, screenCodec }) => {
+    const group = Group.create(relay);
+    const webTransport = pinning(hash);
+    const [a, b, c] = ["a", "b", "c"].map((profile) => joinGroup(group, { profile, webTransport }));
+    await together([a, b, c]);
+    const sent = recordSends(a);
+    const camera = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+    const screen = busy({ width: 1920, height: 1080, fps: 15 });
+    const limits = { a: [], b: [], c: [] };
+    for (const [name, m] of Object.entries({ a, b, c })) m.addEventListener("videolimit", (e) => limits[name].push(e.detail.layer));
+    const vaCamera = await startVideo(a, {
+      stream: camera,
+      framerate: 20,
+      layers: [
+        { layer: 0, width: 320, height: 180, bitrate: 150_000, minBitrate: 60_000 },
+        { layer: 1, width: 640, height: 360, bitrate: 400_000, minBitrate: 150_000 },
+      ],
+    });
+    const vaScreen = await startVideo(a, {
+      track: 1,
+      receive: false,
+      stream: screen.stream,
+      framerate: 15,
+      contentHint: "detail",
+      layers: [
+        { layer: 1, width: 640, height: 360, bitrate: 300_000, codec: screenCodec },
+        { layer: 2, width: 1280, height: 720, bitrate: 1_000_000 },
+        { layer: 3, width: 1920, height: 1080, bitrate: 2_500_000, minBitrate: 800_000 },
+      ],
+    });
+    const decodedAt = { b: [], c: [] };
+    const watch = (who) => (member, frame, track, layer) => {
+      decodedAt[who].push({ t: performance.now(), track, layer, width: frame.displayWidth, timestamp: Math.round(frame.timestamp / 1000) >>> 0 });
+      frame.close();
+    };
+    const vb = await startVideo(b, { onFrame: watch("b"), unattached: null });
+    const vc = await startVideo(c, { onFrame: watch("c"), unattached: null });
+    const shown = (width, height) => {
+      const canvas = document.createElement("canvas");
+      canvas.style.cssText = `display: block; width: ${width}px; height: ${height}px`;
+      document.body.append(canvas);
+      return canvas;
+    };
+    const canvases = {
+      bScreen: shown(1440, 810), // 810 rows: layer 3
+      bCamera: shown(160, 90), // 90: layer 0
+      cScreen: shown(400, 225), // 225: layer 1
+      cCamera: shown(400, 225),
+    };
+    vb.attach(a.id, canvases.bScreen, { track: 1 });
+    vb.attach(a.id, canvases.bCamera);
+    vc.attach(a.id, canvases.cScreen, { track: 1 });
+    vc.attach(a.id, canvases.cCamera, { track: 0 });
+    const of = (v, track) => v.stats().members.find((m) => m.member === a.id && m.track === track) ?? { received: 0, decoded: 0, errors: 0, layers: [] };
+    const snapshot = () => ({
+      camera: vaCamera.stats(),
+      screen: vaScreen.stats(),
+      demand: [...a.videoDemand],
+      b: { camera: of(vb, 0), screen: of(vb, 1) },
+      c: { camera: of(vc, 0), screen: of(vc, 1) },
+      pixels: Object.fromEntries(Object.entries(canvases).map(([k, cv]) => [k, [cv.width, cv.height]])),
+    });
+    await wait(seconds * 1000);
+    const both = snapshot();
+    // b shows the screen small: layer 1 of it, from its keyframe (another codec, if layer 3 had one).
+    const shrunkAt = performance.now();
+    canvases.bScreen.style.cssText = "display: block; width: 400px; height: 225px";
+    await wait(3000);
+    const bSmall = snapshot();
+    const around = decodedAt.b.filter((f) => f.track === 1 && f.t > shrunkAt - 1000 && f.t < shrunkAt + 3000);
+    let gap = 0;
+    for (let i = 1; i < around.length; i++) gap = Math.max(gap, around[i].t - around[i - 1].t);
+    const connected = [a.connected, b.connected, c.connected];
+    for (const v of [vaCamera, vaScreen, vb, vc]) v.stop();
+    camera.getTracks().forEach((t) => t.stop());
+    screen.stop();
+    for (const m of [a, b, c]) m.leave();
+    for (const canvas of Object.values(canvases)) canvas.remove();
+    const keyframes = {};
+    for (const s of sent) if (s.keyframe) (keyframes[`${s.track} ${s.layer}`] ??= []).push(s.size);
+    return { connected, both, bSmall, gap, keyframes, limits };
+  };
+
+  /**
+   * 1080p from a busy picture (`noise` of it random, for large keyframes):
+   * a sends layer 3 only, in `codec` if given, b receives it. Returns the
+   * size of every keyframe sent, which of them b decoded, and b's numbers.
+   */
+  window.fullHd = async ({ relay, hash, seconds, codec, noise, bitrate = 3_500_000 }) => {
+    const group = Group.create(relay);
+    const webTransport = pinning(hash);
+    const [a, b] = ["a", "b"].map((profile) => joinGroup(group, { profile, webTransport }));
+    await together([a, b]);
+    const sent = recordSends(a);
+    const picture = busy({ width: 1920, height: 1080, fps: 15, noise });
+    const va = await startVideo(a, {
+      stream: picture.stream,
+      framerate: 15,
+      layers: [{ layer: 3, width: 1920, height: 1080, bitrate, minBitrate: 1_000_000, codec }],
+    });
+    const decoded = new Map();
+    const vb = await startVideo(b, {
+      onFrame: (member, frame, track, layer) => {
+        decoded.set(Math.round(frame.timestamp / 1000) >>> 0, { width: frame.displayWidth, height: frame.displayHeight, layer });
+        frame.close();
+      },
+    });
+    vb.setLayer(a.id, 3);
+    // What b missed before it listened is not counted.
+    const from = performance.now() + 500;
+    // How long a's backlog takes to empty from each peak over 100 KB (a keyframe).
+    const drains = [];
+    let peak = null;
+    const sampler = setInterval(() => {
+      const { queued } = a.videoBacklog;
+      if (queued > 100_000 && (!peak || queued > peak.queued)) peak = { queued, t: peak?.t ?? performance.now() };
+      if (peak && queued === 0) drains.push({ bytes: peak.queued, ms: Math.round(performance.now() - peak.t) }), (peak = null);
+    }, 2);
+    await wait(seconds * 1000);
+    clearInterval(sampler);
+    const connected = [a.connected, b.connected];
+    const stats = { a: va.stats(), b: vb.stats().members.find((m) => m.member === a.id && m.track === 0) };
+    va.stop();
+    vb.stop();
+    picture.stop();
+    a.leave();
+    b.leave();
+    // Frames sent after the last second may still be on their way.
+    const settled = sent.filter((s) => s.t > from && s.t < sent.at(-1).t - 1000);
+    const keyframes = settled.filter((s) => s.keyframe).map((s) => ({ size: s.size, ok: s.ok, decoded: decoded.get(s.timestamp) ?? null }));
+    const deltas = settled.filter((s) => !s.keyframe).map((s) => s.size);
+    return { drains, dropped: a.videoBacklog.dropped, connected, stats, keyframes, sent: settled.length, decodedSent: settled.filter((s) => decoded.has(s.timestamp)).length, deltaMax: Math.max(0, ...deltas) };
+  };
+
+  /** The codec each layer picks by default, at the sizes the demo sends. */
+  window.codecs = async ({ relay, hash }) => {
+    const group = Group.create(relay);
+    const a = joinGroup(group, { profile: "a", webTransport: pinning(hash) });
+    const picture = busy({ width: 1920, height: 1080, fps: 15 });
+    const v = await startVideo(a, {
+      stream: picture.stream,
+      layers: [
+        { layer: 0, width: 320, height: 180, bitrate: 150_000 },
+        { layer: 1, width: 640, height: 360, bitrate: 400_000 },
+        { layer: 2, width: 1280, height: 720, bitrate: 1_500_000 },
+        { layer: 3, width: 1920, height: 1080, bitrate: 3_500_000 },
+      ],
+    });
+    const layers = v.stats().layers.map((l) => ({ layer: l.layer, codec: l.codec, hardware: l.hardware }));
+    v.stop();
+    picture.stop();
+    a.leave();
+    return layers;
   };
 
   window.ready = true;

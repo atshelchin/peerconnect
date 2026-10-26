@@ -88,9 +88,9 @@ pub enum GroupAction {
     /// other connection when `None`, queued by class. Video sent to everyone
     /// goes to each connection as its [`VideoRouter`] says.
     Forward { to: Option<u8>, class: group::Class },
-    /// The connection wants `layer` of `slot`'s video (`None`: none); tell
-    /// the [`VideoRouter`].
-    Subscribe { slot: u8, layer: Option<u8> },
+    /// The connection wants `layer` of `slot`'s video `track` (`None`:
+    /// none); tell the [`VideoRouter`].
+    Subscribe { slot: u8, track: u8, layer: Option<u8> },
     /// Close the connection with this code.
     Close(u16),
 }
@@ -121,13 +121,14 @@ impl GroupConn {
                 Ok(token) => GroupAction::Join(token),
                 Err(code) => GroupAction::Close(code),
             },
-            (GroupConn::Seated(slot), Incoming::Binary(&[group::wire::SUBSCRIBE, other, layer])) => {
+            (GroupConn::Seated(slot), Incoming::Binary(&[group::wire::SUBSCRIBE, other, track, layer])) => {
                 let layer = (layer != group::wire::NO_VIDEO).then_some(layer);
                 let valid = (other as usize) < group::wire::MAX_SLOTS
                     && other != *slot
+                    && track < group::wire::VIDEO_TRACKS
                     && layer.is_none_or(|l| l < group::wire::VIDEO_LAYERS);
                 if valid {
-                    GroupAction::Subscribe { slot: other, layer }
+                    GroupAction::Subscribe { slot: other, track, layer }
                 } else {
                     GroupAction::Close(close::PROTOCOL_ERROR)
                 }
@@ -153,16 +154,19 @@ impl GroupConn {
 /// for relays to share.
 #[derive(Debug, Clone)]
 pub struct VideoRouter {
-    /// By receiver, then sender: the layer subscribed to (`None`: no video).
-    wanted: [[Option<u8>; SLOTS]; SLOTS],
-    /// By receiver, then sender: the layer being forwarded.
-    forwarding: [[Option<u8>; SLOTS]; SLOTS],
-    /// By sender, then layer: when it was last seen.
-    seen: [[Option<u64>; LAYERS]; SLOTS],
-    /// By sender: the DEMAND it was last sent, if seated.
-    told: [Option<Option<u8>>; SLOTS],
+    /// By receiver, sender and track: the layer subscribed to (`None`: none).
+    wanted: [[[Option<u8>; TRACKS]; SLOTS]; SLOTS],
+    /// By receiver, sender and track: the layer being forwarded.
+    forwarding: [[[Option<u8>; TRACKS]; SLOTS]; SLOTS],
+    /// By sender, track and layer: when it was last seen.
+    seen: [[[Option<u64>; LAYERS]; TRACKS]; SLOTS],
+    /// By sender, if seated: the DEMAND of each track it was last sent.
+    told: [Option<[Option<u8>; TRACKS]>; SLOTS],
     /// By receiver: what its link takes.
     links: [Link; SLOTS],
+    /// What every link takes at most: the relay's own limit (its traffic
+    /// budget, say), in layers as [`Link::layers`].
+    ceiling: u8,
 }
 
 /// How many layers a receiver's link takes now, and when to try one more.
@@ -197,6 +201,7 @@ impl Default for Link {
 }
 
 const SLOTS: usize = group::wire::MAX_SLOTS;
+const TRACKS: usize = group::wire::VIDEO_TRACKS as usize;
 const LAYERS: usize = group::wire::VIDEO_LAYERS as usize;
 /// A layer not seen for this long (ms) is taken to be no longer sent.
 const LAYER_FRESH: u64 = 1000;
@@ -215,11 +220,12 @@ const PROBE_TRIAL: u64 = 5000;
 impl Default for VideoRouter {
     fn default() -> Self {
         VideoRouter {
-            wanted: [[Some(0); SLOTS]; SLOTS],
-            forwarding: [[None; SLOTS]; SLOTS],
-            seen: [[None; LAYERS]; SLOTS],
+            wanted: [[[Some(0); TRACKS]; SLOTS]; SLOTS],
+            forwarding: [[[None; TRACKS]; SLOTS]; SLOTS],
+            seen: [[[None; LAYERS]; TRACKS]; SLOTS],
             told: [None; SLOTS],
             links: [Link::default(); SLOTS],
+            ceiling: LAYERS as u8,
         }
     }
 }
@@ -229,7 +235,7 @@ impl VideoRouter {
     /// subscribed to its video yet, and its link takes everything.
     pub fn seat(&mut self, slot: u8) {
         self.reset(slot);
-        self.told[slot as usize] = Some(None);
+        self.told[slot as usize] = Some([None; TRACKS]);
     }
 
     /// The connection in `slot` ended.
@@ -241,21 +247,38 @@ impl VideoRouter {
     fn reset(&mut self, slot: u8) {
         let s = slot as usize;
         for other in 0..SLOTS {
-            self.wanted[s][other] = Some(0);
-            self.wanted[other][s] = Some(0);
-            self.forwarding[s][other] = None;
-            self.forwarding[other][s] = None;
+            self.wanted[s][other] = [Some(0); TRACKS];
+            self.wanted[other][s] = [Some(0); TRACKS];
+            self.forwarding[s][other] = [None; TRACKS];
+            self.forwarding[other][s] = [None; TRACKS];
         }
-        self.seen[s] = [None; LAYERS];
+        self.seen[s] = [[None; LAYERS]; TRACKS];
         self.links[s] = Link::default();
     }
 
-    /// `receiver` subscribed to `layer` of `sender`'s video.
-    pub fn subscribe(&mut self, receiver: u8, sender: u8, layer: Option<u8>) {
-        if receiver != sender && (sender as usize) < SLOTS && layer.is_none_or(|l| (l as usize) < LAYERS) {
-            self.wanted[receiver as usize][sender as usize] = layer;
+    /// Sets what every member's link takes at most, whatever it could:
+    /// layers 0 to `layers - 1`, none for 0 (the relay's own traffic budget,
+    /// say). Members are told with LIMIT, as for their links.
+    pub fn set_ceiling(&mut self, layers: u8) {
+        self.ceiling = layers.min(LAYERS as u8);
+    }
+
+    /// Layers 0 to the result − 1 go to `receiver` now.
+    fn allowed(&self, receiver: usize) -> u8 {
+        self.links[receiver].layers.min(self.ceiling)
+    }
+
+    /// `receiver` subscribed to `layer` of `sender`'s video `track`.
+    pub fn subscribe(&mut self, receiver: u8, sender: u8, track: u8, layer: Option<u8>) {
+        let valid = receiver != sender
+            && (sender as usize) < SLOTS
+            && (track as usize) < TRACKS
+            && layer.is_none_or(|l| (l as usize) < LAYERS);
+        if valid {
+            let (r, s, t) = (receiver as usize, sender as usize, track as usize);
+            self.wanted[r][s][t] = layer;
             if layer.is_none() {
-                self.forwarding[receiver as usize][sender as usize] = None;
+                self.forwarding[r][s][t] = None;
             }
         }
     }
@@ -265,10 +288,12 @@ impl VideoRouter {
     /// was dropped since it last said (`dropped`). Call it before forwarding
     /// it a video frame. A link that does not keep up is moved below the
     /// largest layer it gets (to none of them, from the smallest); one that
-    /// keeps up long enough is given one more layer to try.
-    pub fn link(&mut self, now: u64, receiver: u8, congested: bool, dropped: bool) {
+    /// keeps up long enough is given one more layer to try. Returns whether
+    /// it was moved down: the video queued for it is then worth dropping,
+    /// so that the smaller layer does not wait behind the larger.
+    pub fn link(&mut self, now: u64, receiver: u8, congested: bool, dropped: bool) -> bool {
         let r = receiver as usize;
-        let top = self.forwarding[r].iter().flatten().max().copied();
+        let top = self.forwarding[r].iter().flatten().flatten().max().copied();
         let l = &mut self.links[r];
         if !congested && !dropped {
             l.congested_since = None;
@@ -282,77 +307,80 @@ impl VideoRouter {
                 l.changed_at = now;
                 l.raised_at = Some(now);
             }
-            return;
+            return false;
+        }
+        // A moment of queueing (a keyframe passing) is no sign, and does not
+        // put off a try at more either: only video dropped, or queued for long.
+        let since = *l.congested_since.get_or_insert(now);
+        if !dropped && now.saturating_sub(since) < CONGESTED_FOR {
+            return false;
         }
         l.congested_at = Some(now);
         if now.saturating_sub(l.changed_at) < LINK_SETTLE && l.changed_at != 0 {
-            return;
+            return false;
         }
-        let since = *l.congested_since.get_or_insert(now);
-        if dropped || now.saturating_sub(since) >= CONGESTED_FOR {
-            l.layers = top.map_or(l.layers.saturating_sub(1), |top| top.min(l.layers.saturating_sub(1)));
-            if l.raised_at.take().is_some_and(|at| now.saturating_sub(at) < PROBE_TRIAL) {
-                l.wait = (l.wait * 2).min(PROBE_MAX);
-            }
-            l.changed_at = now;
-            l.congested_since = None;
+        l.layers = top.map_or(l.layers.saturating_sub(1), |top| top.min(l.layers.saturating_sub(1)));
+        if l.raised_at.take().is_some_and(|at| now.saturating_sub(at) < PROBE_TRIAL) {
+            l.wait = (l.wait * 2).min(PROBE_MAX);
         }
+        l.changed_at = now;
+        l.congested_since = None;
+        true
     }
 
     /// Whether to forward a video frame of type `kind`, sent by `sender` to
     /// everyone, to `receiver`. Call it for each receiver in turn.
     pub fn forward(&mut self, now: u64, sender: u8, receiver: u8, kind: u8) -> bool {
-        let Some((layer, keyframe)) = group::wire::video_layer(kind) else { return true };
-        let (s, r) = (sender as usize, receiver as usize);
-        self.seen[s][layer as usize] = Some(now);
-        let (Some(want), Some(limit)) = (self.wanted[r][s], self.links[r].layers.checked_sub(1)) else {
-            self.forwarding[r][s] = None;
+        let Some((track, layer, keyframe)) = group::wire::video_kind(kind) else { return true };
+        let (s, r, t) = (sender as usize, receiver as usize, track as usize);
+        self.seen[s][t][layer as usize] = Some(now);
+        let (Some(want), Some(limit)) = (self.wanted[r][s][t], self.allowed(r).checked_sub(1)) else {
+            self.forwarding[r][s][t] = None;
             return false;
         };
-        let sent = |l: u8| self.seen[s][l as usize].is_some_and(|at| now.saturating_sub(at) <= LAYER_FRESH);
+        let sent = |l: u8| self.seen[s][t][l as usize].is_some_and(|at| now.saturating_sub(at) <= LAYER_FRESH);
         let target = (0..=want.min(limit)).rev().find(|&l| sent(l)).or_else(|| (0..=limit).find(|&l| sent(l)));
-        match self.forwarding[r][s] {
-            Some(current) if current == layer && layer <= limit => true,
+        let current = self.forwarding[r][s][t];
+        let (forward, next) = match current {
+            Some(current) if current == layer && layer <= limit => (true, Some(current)),
             // Too large for the link now: stopped at once.
-            Some(current) if current == layer => {
-                self.forwarding[r][s] = None;
-                false
-            }
+            Some(current) if current == layer => (false, None),
             // The new layer from its keyframe on, or at once if the old one
             // stopped (or was stopped: the receiver waits for a keyframe).
             Some(current) if target == Some(layer) && (keyframe || !sent(current) || current > limit) => {
-                self.forwarding[r][s] = Some(layer);
-                true
+                (true, Some(layer))
             }
-            Some(_) => false,
-            None if target == Some(layer) => {
-                self.forwarding[r][s] = Some(layer);
-                true
-            }
-            None => false,
-        }
+            Some(current) => (false, Some(current)),
+            None if target == Some(layer) => (true, Some(layer)),
+            None => (false, None),
+        };
+        self.forwarding[r][s][t] = next;
+        forward
     }
 
-    /// The DEMAND frames due, `(slot, layers)`: for every seated sender whose
-    /// wanted layers changed since it was last told. Layers being forwarded
-    /// count as wanted until the move away from them is done; a layer above
-    /// what a receiver's link takes is not wanted by it.
-    pub fn demands(&mut self) -> Vec<(u8, u8)> {
+    /// The DEMAND frames due, `(slot, track, layers)`: for every seated
+    /// sender and track whose wanted layers changed since it was last told.
+    /// Layers being forwarded count as wanted until the move away from them
+    /// is done; a layer above what a receiver's link takes is not wanted by it.
+    pub fn demands(&mut self) -> Vec<(u8, u8, u8)> {
         let mut due = Vec::new();
         for s in 0..SLOTS {
-            let Some(told) = self.told[s] else { continue };
-            let mut layers = 0u8;
-            for r in (0..SLOTS).filter(|&r| r != s && self.told[r].is_some()) {
-                let Some(limit) = self.links[r].layers.checked_sub(1) else { continue };
-                let forwarding = self.forwarding[r][s].filter(|&l| l <= limit);
-                for layer in [self.wanted[r][s].map(|l| l.min(limit)), forwarding].into_iter().flatten() {
-                    layers |= 1 << layer;
+            let Some(mut told) = self.told[s] else { continue };
+            for (t, told) in told.iter_mut().enumerate() {
+                let mut layers = 0u8;
+                for r in (0..SLOTS).filter(|&r| r != s && self.told[r].is_some()) {
+                    let Some(limit) = self.allowed(r).checked_sub(1) else { continue };
+                    let forwarding = self.forwarding[r][s][t].filter(|&l| l <= limit);
+                    for layer in [self.wanted[r][s][t].map(|l| l.min(limit)), forwarding].into_iter().flatten() {
+                        layers |= 1 << layer;
+                    }
+                }
+                if *told != Some(layers) {
+                    *told = Some(layers);
+                    due.push((s as u8, t as u8, layers));
                 }
             }
-            if told != Some(layers) {
-                self.told[s] = Some(Some(layers));
-                due.push((s as u8, layers));
-            }
+            self.told[s] = Some(told);
         }
         due
     }
@@ -362,10 +390,11 @@ impl VideoRouter {
     /// limit changed since they were last told.
     pub fn limits(&mut self) -> Vec<(u8, Option<u8>)> {
         let mut due = Vec::new();
-        for (r, link) in self.links.iter_mut().enumerate() {
-            if self.told[r].is_some() && link.told != link.layers {
-                link.told = link.layers;
-                due.push((r as u8, link.layers.checked_sub(1)));
+        for r in 0..SLOTS {
+            let allowed = self.allowed(r);
+            if self.told[r].is_some() && self.links[r].told != allowed {
+                self.links[r].told = allowed;
+                due.push((r as u8, allowed.checked_sub(1)));
             }
         }
         due
@@ -467,20 +496,22 @@ mod tests {
         let id = crate::group::Group::create("https://r.example").unwrap().id();
         let seated = GroupConn::Seated(1);
         let sub = |f: &[u8]| seated.receive(&id, Incoming::Binary(f));
-        assert_eq!(sub(&[0x85, 2, 1]), GroupAction::Subscribe { slot: 2, layer: Some(1) });
-        assert_eq!(sub(&[0x85, 0, 0xFF]), GroupAction::Subscribe { slot: 0, layer: None });
-        for bad in [&[0x85, 1, 0][..], &[0x85, 4, 0], &[0x85, 2, 4], &[0x85, 2], &[0x86, 3]] {
+        assert_eq!(sub(&[0x85, 2, 0, 1]), GroupAction::Subscribe { slot: 2, track: 0, layer: Some(1) });
+        assert_eq!(sub(&[0x85, 0, 1, 0xFF]), GroupAction::Subscribe { slot: 0, track: 1, layer: None });
+        let bad: [&[u8]; 6] =
+            [&[0x85, 1, 0, 0], &[0x85, 4, 0, 0], &[0x85, 2, 2, 0], &[0x85, 2, 0, 4], &[0x85, 2, 0], &[0x86, 0, 3]];
+        for bad in bad {
             assert_eq!(sub(bad), GroupAction::Close(close::PROTOCOL_ERROR), "{bad:?}");
         }
         assert_eq!(
-            GroupConn::Pending([0; 32]).receive(&id, Incoming::Binary(&[0x85, 2, 1])),
+            GroupConn::Pending([0; 32]).receive(&id, Incoming::Binary(&[0x85, 2, 0, 1])),
             GroupAction::Close(close::PROTOCOL_ERROR)
         );
     }
 
     /// Layer `l`, a keyframe or not.
     fn v(l: u8, key: bool) -> u8 {
-        group::wire::video_type(l, key)
+        group::wire::video_type(0, l, key)
     }
 
     #[test]
@@ -496,7 +527,7 @@ mod tests {
         assert!(!r.forward(2, 0, 1, v(2, false)));
         assert!(r.forward(3, 0, 1, v(1, false)));
         // Slot 1 asks for layer 2: layer 1 goes on until layer 2's keyframe.
-        r.subscribe(1, 0, Some(2));
+        r.subscribe(1, 0, 0, Some(2));
         assert!(r.forward(10, 0, 1, v(1, false)));
         assert!(!r.forward(11, 0, 1, v(2, false)));
         assert!(r.forward(12, 0, 1, v(2, true)), "switched at the keyframe");
@@ -506,7 +537,7 @@ mod tests {
         assert!(r.forward(15, 0, 2, v(1, false)));
         assert!(!r.forward(16, 0, 2, v(2, false)));
         // No video at all.
-        r.subscribe(2, 0, None);
+        r.subscribe(2, 0, 0, None);
         assert!(!r.forward(17, 0, 2, v(1, false)));
         // Frames that are not video are not the router's business.
         assert!(r.forward(18, 0, 2, group::wire::VOICE));
@@ -517,13 +548,13 @@ mod tests {
         let mut r = VideoRouter::default();
         r.seat(0);
         r.seat(1);
-        r.subscribe(1, 0, Some(2));
+        r.subscribe(1, 0, 0, Some(2));
         assert!(r.forward(0, 0, 1, v(2, true)));
         assert!(!r.forward(10, 0, 1, v(1, false)), "layer 2 is still sent");
         // Layer 2 stopped (the sender's uplink, say): layer 1, without waiting for a keyframe.
         assert!(r.forward(10 + LAYER_FRESH + 1, 0, 1, v(1, false)));
         // Asking for a layer above anything sent gets the best below it.
-        r.subscribe(1, 0, Some(3));
+        r.subscribe(1, 0, 0, Some(3));
         assert!(r.forward(2000, 0, 1, v(1, false)));
     }
 
@@ -531,24 +562,24 @@ mod tests {
     fn senders_are_told_which_layers_are_wanted() {
         let mut r = VideoRouter::default();
         r.seat(0);
-        assert_eq!(r.demands(), [(0, 0)], "alone: nothing");
+        assert_eq!(r.demands(), [(0, 0, 0), (0, 1, 0)], "alone: nothing, of either track");
         assert_eq!(r.demands(), [], "only changes");
         r.seat(1);
-        assert_eq!(r.demands(), [(0, 0b1), (1, 0b1)], "layer 0 by default");
-        r.subscribe(1, 0, Some(2));
-        assert_eq!(r.demands(), [(0, 0b100)]);
+        assert_eq!(r.demands(), [(0, 0, 0b1), (0, 1, 0b1), (1, 0, 0b1), (1, 1, 0b1)], "layer 0 by default");
+        r.subscribe(1, 0, 0, Some(2));
+        assert_eq!(r.demands(), [(0, 0, 0b100)]);
         // Forwarding layer 1 (the only one sent), while layer 2 is wanted: both.
         assert!(r.forward(0, 0, 1, v(1, true)));
-        assert_eq!(r.demands(), [(0, 0b110)]);
+        assert_eq!(r.demands(), [(0, 0, 0b110)]);
         assert!(!r.forward(1, 0, 1, v(2, false)));
         assert!(r.forward(2, 0, 1, v(2, true)));
-        assert_eq!(r.demands(), [(0, 0b100)], "layer 1 no longer, once switched");
-        r.subscribe(1, 0, None);
-        assert_eq!(r.demands(), [(0, 0)], "no video wanted, none forwarded");
-        r.subscribe(1, 0, Some(1));
-        assert_eq!(r.demands(), [(0, 0b10)]);
+        assert_eq!(r.demands(), [(0, 0, 0b100)], "layer 1 no longer, once switched");
+        r.subscribe(1, 0, 0, None);
+        assert_eq!(r.demands(), [(0, 0, 0)], "no video wanted, none forwarded");
+        r.subscribe(1, 0, 0, Some(1));
+        assert_eq!(r.demands(), [(0, 0, 0b10)]);
         r.leave(1);
-        assert_eq!(r.demands(), [(0, 0)], "the subscriber left");
+        assert_eq!(r.demands(), [(0, 0, 0), (0, 1, 0)], "the subscriber left");
     }
 
     #[test]
@@ -557,7 +588,7 @@ mod tests {
         for slot in 0..2 {
             r.seat(slot);
         }
-        r.subscribe(1, 0, Some(2));
+        r.subscribe(1, 0, 0, Some(2));
         assert!(r.forward(0, 0, 1, v(1, true)));
         assert!(r.forward(1, 0, 1, v(2, true)));
         assert_eq!(r.limits(), []);
@@ -572,17 +603,17 @@ mod tests {
         assert_eq!(r.limits(), [(1, Some(1))]);
         assert!(!r.forward(900, 0, 1, v(2, false)), "the larger layer stops at once");
         assert!(r.forward(901, 0, 1, v(1, false)), "the smaller one goes on");
-        assert_eq!(r.demands(), [(0, 0b10)], "layer 2 is no longer wanted");
+        assert_eq!(r.demands(), [(0, 0, 0b10)], "layer 2 is no longer wanted");
         // Signals are ignored while the move settles; then a drop moves it at once.
         r.link(1000, 1, true, true);
         assert_eq!(r.limits(), []);
         r.link(900 + LINK_SETTLE, 1, true, true);
         assert_eq!(r.limits(), [(1, Some(0))], "below layer 1");
         assert!(!r.forward(3000, 0, 1, v(1, true)), "a sends nothing that small");
-        assert_eq!(r.demands(), [(0, 0b1)], "so a is asked for layer 0");
+        assert_eq!(r.demands(), [(0, 0, 0b1)], "so a is asked for layer 0");
         r.link(3000 + LINK_SETTLE, 1, true, true);
         assert_eq!(r.limits(), [(1, None)], "and below that: audio only");
-        assert_eq!(r.demands(), [(0, 0)], "nothing to encode for it");
+        assert_eq!(r.demands(), [(0, 0, 0), (0, 1, 0)], "nothing to encode for it, of either track");
     }
 
     #[test]
@@ -590,7 +621,7 @@ mod tests {
         let mut r = VideoRouter::default();
         r.seat(0);
         r.seat(1);
-        r.subscribe(1, 0, Some(2));
+        r.subscribe(1, 0, 0, Some(2));
         assert!(r.forward(0, 0, 1, v(2, true)));
         r.link(10_000, 1, true, true);
         assert_eq!(r.limits(), [(1, Some(1))]);
@@ -611,5 +642,44 @@ mod tests {
         // A try that holds brings the wait back down.
         r.link(failed + 2 * PROBE_WAIT + PROBE_TRIAL, 1, false, false);
         assert_eq!(r.links[1].wait, PROBE_WAIT);
+    }
+
+    #[test]
+    fn tracks_are_routed_apart() {
+        let mut r = VideoRouter::default();
+        r.seat(0);
+        r.seat(1);
+        r.demands();
+        // b watches a's screen (track 1) large, and a's camera (track 0) small.
+        r.subscribe(1, 0, 1, Some(3));
+        r.subscribe(1, 0, 0, Some(0));
+        assert_eq!(r.demands(), [(0, 1, 0b1000)]);
+        let screen = |l, key| group::wire::video_type(1, l, key);
+        assert!(r.forward(0, 0, 1, v(0, true)), "camera, layer 0");
+        assert!(r.forward(1, 0, 1, screen(3, true)), "screen, layer 3");
+        assert!(r.forward(2, 0, 1, v(0, false)));
+        assert!(!r.forward(3, 0, 1, v(1, false)), "not the camera's larger layer");
+        assert!(r.forward(4, 0, 1, screen(3, false)));
+    }
+
+    #[test]
+    fn the_relays_own_ceiling_limits_everyone() {
+        let mut r = VideoRouter::default();
+        r.seat(0);
+        r.seat(1);
+        r.demands();
+        r.subscribe(1, 0, 0, Some(2));
+        assert!(r.forward(0, 0, 1, v(1, true)));
+        assert!(r.forward(1, 0, 1, v(2, true)));
+        // Over budget, say: layers 0 and 1 at most, for everyone.
+        r.set_ceiling(2);
+        assert_eq!(r.limits(), [(0, Some(1)), (1, Some(1))]);
+        assert!(!r.forward(2, 0, 1, v(2, false)));
+        assert!(r.forward(3, 0, 1, v(1, false)));
+        r.set_ceiling(0);
+        assert_eq!(r.limits(), [(0, None), (1, None)], "no video at all");
+        assert!(!r.forward(4, 0, 1, v(1, true)));
+        r.set_ceiling(4);
+        assert_eq!(r.limits(), [(0, Some(3)), (1, Some(3))]);
     }
 }

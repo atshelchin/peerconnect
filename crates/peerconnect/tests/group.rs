@@ -105,9 +105,9 @@ impl Relay {
         match conn.state.receive(&self.group, message) {
             GroupAction::Pong => self.conns.get_mut(&id).unwrap().pongs += 1,
             GroupAction::Join(token) => self.join(id, token),
-            GroupAction::Subscribe { slot, layer } => {
+            GroupAction::Subscribe { slot, track, layer } => {
                 let from = self.slot_of(id).unwrap();
-                self.router.subscribe(from, slot, layer);
+                self.router.subscribe(from, slot, track, layer);
                 self.tell_demands();
             }
             GroupAction::Forward { to, class } => {
@@ -124,7 +124,9 @@ impl Relay {
                         let to = self.slots.iter().position(|s| *s == Some(t)).unwrap() as u8;
                         // As the Linux relay: video queued past 32 KiB is a link not keeping up.
                         let queued: usize = self.conns[&t].queues[Class::Video.index()].iter().map(Vec::len).sum();
-                        self.router.link(now, to, queued > 32 << 10, false);
+                        if self.router.link(now, to, queued > 32 << 10, false) {
+                            self.conns.get_mut(&t).unwrap().queues[Class::Video.index()].clear();
+                        }
                         self.router.forward(now, from, to, kind)
                     });
                     self.tell_demands();
@@ -189,9 +191,9 @@ impl Relay {
     }
 
     fn tell_demands(&mut self) {
-        for (slot, layers) in self.router.demands() {
+        for (slot, track, layers) in self.router.demands() {
             if let Some(c) = self.slots[slot as usize] {
-                self.conns.get_mut(&c).unwrap().queues[0].push_back(wire::demand(layers).to_vec());
+                self.conns.get_mut(&c).unwrap().queues[0].push_back(wire::demand(track, layers).to_vec());
             }
         }
         for (slot, layer) in self.router.limits() {
@@ -1322,7 +1324,7 @@ fn video_through_a_lossy_relay_arrives_whole_in_order_and_recovers_with_keyframe
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        if to == b && wire::video_layer(frame[0]).is_some() && x % 100 < 8 { vec![] } else { vec![frame.to_vec()] }
+        if to == b && wire::video_kind(frame[0]).is_some() && x % 100 < 8 { vec![] } else { vec![frame.to_vec()] }
     }));
     let ia = sim.id(a);
     let mut keyframe_due = true;
@@ -1372,7 +1374,7 @@ fn each_member_gets_the_video_layer_it_subscribed_to() {
     sim.run(100);
     let ia = sim.id(a);
     // a sends two layers of one track; b wants the larger, c says nothing (the smallest sent).
-    sim.nodes[b].member.subscribe(ia, Some(2)).unwrap();
+    sim.nodes[b].member.subscribe(ia, 0, Some(2)).unwrap();
     let mut keyframe_due = [true; 3];
     let mut demand = 0u8;
     for i in 0..90u32 {
@@ -1387,7 +1389,7 @@ fn each_member_gets_the_video_layer_it_subscribed_to() {
             match e {
                 Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
                 // A layer newly wanted starts with a keyframe, so that the relay can move to it.
-                Event::VideoDemand { layers } => {
+                Event::VideoDemand { track: 0, layers } => {
                     for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
                         *due |= layers & !demand & 1 << layer != 0;
                     }
@@ -1417,7 +1419,7 @@ fn each_member_gets_the_video_layer_it_subscribed_to() {
     assert!(at_b.len() >= 85 && moved <= 3 && at_b[moved..].iter().all(|&l| l == 2), "b: {at_b:?}");
 
     // b moves to the smaller layer: it keeps getting pictures, and then only layer 1.
-    sim.nodes[b].member.subscribe(ia, Some(1)).unwrap();
+    sim.nodes[b].member.subscribe(ia, 0, Some(1)).unwrap();
     for i in 90..150u32 {
         for layer in [1, 2] {
             let keyframe = keyframe_due[layer as usize];
@@ -1430,7 +1432,7 @@ fn each_member_gets_the_video_layer_it_subscribed_to() {
             match e {
                 Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
                 // A layer newly wanted starts with a keyframe, so that the relay can move to it.
-                Event::VideoDemand { layers } => {
+                Event::VideoDemand { track: 0, layers } => {
                     for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
                         *due |= layers & !demand & 1 << layer != 0;
                     }

@@ -12,6 +12,8 @@
 	// reloaded tab takes its own place back at once.
 	const IDENTITY_KEY = 'peerconnect-voice:identity';
 	const NAME_KEY = 'peerconnect-voice:name';
+	/** The data saver's setting, in localStorage: it holds for every tab, as a setting should. */
+	const DATA_SAVER_KEY = 'peerconnect-voice:data-saver';
 	/** Members in a group at most (GROUP.md §3.2). */
 	const CAPACITY = 4;
 	/** Bars in a waveform, one every 40 ms: the last 1.6 s. */
@@ -29,8 +31,9 @@
 	/**
 	 * Three sizes at 30 frames a second, as meeting apps send: 720p for those
 	 * who show us large, 360p for gallery tiles, 180p for thumbnails and slow
-	 * links. Each is encoded only while someone shows it, and steps down
-	 * towards `minBitrate` while its receivers keep losing frames; the
+	 * links; and 1080p (`FULL_HD`) for the whole window, from a camera that
+	 * gives that much. Each is encoded only while someone shows it, and steps
+	 * down towards `minBitrate` while its receivers keep losing frames; the
 	 * largest stops while our uplink cannot carry them all, and the relay
 	 * gives each receiver no more than its link takes.
 	 */
@@ -42,8 +45,30 @@
 			{ layer: 2, width: 1280, height: 720, bitrate: 1_500_000, minBitrate: 300_000 }
 		]
 	};
-	/** The camera at the largest size we send. */
-	const CAMERA = { width: 1280, height: 720, frameRate: VIDEO.framerate };
+	const FULL_HD = { layer: 3, width: 1920, height: 1080, bitrate: 3_500_000, minBitrate: 800_000 };
+	/** The camera at the largest size we send, if it has it. */
+	const CAMERA = {
+		width: { ideal: 1920 },
+		height: { ideal: 1080 },
+		frameRate: { ideal: VIDEO.framerate }
+	};
+	/**
+	 * A shared screen: our second video track, sharp rather than smooth (15
+	 * frames a second, text kept crisp), from 360p for thumbnails up to 1080p
+	 * (or the screen's own size, if smaller) for the large view. A screen's
+	 * keyframes are large and seldom needed (it changes a little at a time;
+	 * receivers that lose one ask), so they come every 5 s, not 2.
+	 */
+	const SCREEN = {
+		framerate: 15,
+		keyframeInterval: 5000,
+		contentHint: 'detail' as const,
+		layers: [
+			{ layer: 1, width: 640, height: 360, bitrate: 300_000, minBitrate: 100_000 },
+			{ layer: 2, width: 1280, height: 720, bitrate: 1_000_000, minBitrate: 300_000 },
+			{ layer: 3, width: 1920, height: 1080, bitrate: 2_500_000, minBitrate: 800_000 }
+		]
+	};
 	/** Offline this long after joining, the network is probably what stops it (UDP blocked). */
 	const UNREACHABLE = 10_000;
 	/** Round trips to the relay (ms) beyond which our network is at most fair, and poor. */
@@ -82,8 +107,16 @@
 		muted: boolean;
 		deafened: boolean;
 		camera: boolean;
+		/** Sharing their screen (our video track 1); not said by older pages. */
+		screen?: boolean;
 		/** Their network, 0–3 bars, as they judge it (see `quality`); not said by older pages. */
 		net?: number;
+	}
+	/** What a tile shows: a member's camera (keyed by their ID), or their screen (see `screenKey`). */
+	interface Tile {
+		key: string;
+		person: Member;
+		screen: boolean;
 	}
 
 	const t = $derived(i18n.t.voice);
@@ -96,12 +129,15 @@
 	let voice: Voice | undefined = $state.raw();
 	let video: Video | undefined = $state.raw();
 	let frame = 0;
-	/** The canvas each member's video is drawn into. */
+	/** The canvas each tile's video is drawn into, by tile key. */
 	// eslint-disable-next-line svelte/prefer-svelte-reactivity -- bookkeeping, not rendered
 	const screens = new Map<string, HTMLCanvasElement>();
-	/** When each member's latest video frame was decoded: read by the 40 ms loop, not rendered. */
+	/** When each tile's latest video frame was decoded: read by the 40 ms loop, not rendered. */
 	// eslint-disable-next-line svelte/prefer-svelte-reactivity -- updated 15 times a second per member
 	const frames = new Map<string, number>();
+	/** Sending our screen: its own Video (track 1), and the capture. */
+	let screenVideo: Video | undefined = $state.raw();
+	let screenStream: MediaStream | undefined;
 
 	let phase: 'loading' | 'start' | 'join' | 'starting' | 'room' | 'error' = $state('loading');
 	let problems: Problem[] = $state([]);
@@ -149,15 +185,23 @@
 	let net = $state(3);
 	/** The relay sends us no video: our link is too slow for any. */
 	let videoPaused = $state(false);
-	/** Members whose video is coming in now. */
+	/** Tiles whose video is coming in now, by tile key. */
 	let watching: Record<string, boolean> = $state({});
+	/** Whether this browser can share a screen: not on phones, which have no screen to share. */
+	let canShare = $state(false);
+	/** Data saver: no video above 360p comes in (see `setMaxLayer`). */
+	let dataSaver = $state(false);
+	/** The latest screen to start, shown large unless something is pinned. */
+	let newestScreen: string | null = $state(null);
+	/** The speaker view was chosen for a screen, not by hand: back to the gallery when it ends. */
+	let viewForScreen = false;
 	// The meeting's layout, as in the usual video meeting apps.
 	/** Everyone in a grid, or one large (the one speaking, or pinned) above the others. */
 	let view: 'gallery' | 'speaker' = $state('gallery');
-	/** Whom we chose to see large; otherwise the latest to speak. */
+	/** Which tile we chose to see large; otherwise the latest screen, or the latest to speak. */
 	let pinned: string | null = $state(null);
 	let latest: string | null = $state(null);
-	/** Whom we watch across the whole window. */
+	/** Which tile we watch across the whole window. */
 	let maximized: string | null = $state(null);
 	let chatOpen = $state(false);
 	let unread = $state(0);
@@ -166,7 +210,7 @@
 	let said = 0;
 	/** Now, a second at a time: which messages are still over the video. */
 	let clock = $state(Date.now());
-	/** Width over height of each member's picture, as it arrives. */
+	/** Width over height of each tile's picture, as it arrives. */
 	let shapes: Record<string, number> = $state({});
 	/** The gallery's size, to lay the tiles out in. */
 	let area = $state({ width: 0, height: 0 });
@@ -188,10 +232,19 @@
 		...members.filter((m) => m.id !== me)
 	]);
 	const others = $derived(people.filter((m) => m.id !== me));
-	/** Who is shown large in the speaker view. */
+	/** Everyone's camera tile, each followed by their screen while it comes in (ours is not shown). */
+	const tiles: Tile[] = $derived(
+		people.flatMap((person) => [
+			{ key: person.id, person, screen: false },
+			...(watching[screenKey(person.id)]
+				? [{ key: screenKey(person.id), person, screen: true }]
+				: [])
+		])
+	);
+	/** The tile shown large in the speaker view. */
 	const featured = $derived(
-		[pinned, latest, others.find((m) => watching[m.id])?.id, others[0]?.id, me].find(
-			(id) => id && people.some((m) => m.id === id)
+		[pinned, newestScreen, latest, others.find((m) => watching[m.id])?.id, others[0]?.id, me].find(
+			(key) => key && tiles.some((t) => t.key === key)
 		) ?? me
 	);
 	/**
@@ -200,10 +253,10 @@
 	 * a phone held upright go one above the other; two tall ones side by side.
 	 */
 	const gallery = $derived.by(() => {
-		const count = Math.max(2, people.length);
-		const seen = people
-			.filter((m) => hasVideo(m.id) && shapes[m.id])
-			.map((m) => shapes[m.id])
+		const count = Math.max(2, tiles.length);
+		const seen = tiles
+			.filter((t) => hasVideo(t.key) && shapes[t.key])
+			.map((t) => shapes[t.key])
 			.sort((a, b) => a - b);
 		const middle = seen.length ? seen[seen.length >> 1] : 16 / 9;
 		const aspect = Math.min(16 / 9, Math.max(9 / 16, middle));
@@ -244,19 +297,32 @@
 		return { destroy: () => observer.disconnect() };
 	}
 
-	function hasVideo(id: string): boolean {
-		return id === me ? camera : !!watching[id];
+	/** The tile key of a member's screen. */
+	function screenKey(id: string): string {
+		return `${id} screen`;
 	}
 
-	/** Shows someone large (or back to everyone, if they already are). */
-	function enlarge(id: string) {
-		if (view === 'speaker' && pinned === id) {
+	function hasVideo(key: string): boolean {
+		return key === me ? camera : !!watching[key];
+	}
+
+	/** Shows a tile large (or back to everyone, if it already is). */
+	function enlarge(key: string) {
+		viewForScreen = false;
+		if (view === 'speaker' && pinned === key) {
 			pinned = null;
 			view = 'gallery';
 		} else {
-			pinned = id;
+			pinned = key;
 			view = 'speaker';
 		}
+	}
+
+	/** The layout, chosen by hand. */
+	function setView(next: 'gallery' | 'speaker') {
+		viewForScreen = false;
+		view = next;
+		if (next === 'gallery') pinned = null;
 	}
 
 	function toggleChat() {
@@ -279,6 +345,24 @@
 			sessionStorage.setItem(key, value);
 		} catch {
 			// not available: the identity just lasts as long as the page
+		}
+	}
+
+	/** The data saver, as last set in any tab. */
+	function savedDataSaver(): boolean {
+		try {
+			return localStorage.getItem(DATA_SAVER_KEY) === 'on';
+		} catch {
+			return false;
+		}
+	}
+
+	function toggleDataSaver() {
+		dataSaver = !dataSaver;
+		try {
+			localStorage.setItem(DATA_SAVER_KEY, dataSaver ? 'on' : 'off');
+		} catch {
+			// not available: it lasts as long as the page
 		}
 	}
 
@@ -524,11 +608,14 @@
 		});
 		c.addEventListener('left', (e) => {
 			if (!current()) return;
-			members = members.filter((m) => m.id !== e.detail.member);
-			delete waves[e.detail.member];
-			frames.delete(e.detail.member);
-			if (pinned === e.detail.member) pinned = null;
-			if (maximized === e.detail.member) maximized = null;
+			const gone = e.detail.member;
+			const theirs = (key: string | null) => key === gone || key === screenKey(gone);
+			members = members.filter((m) => m.id !== gone);
+			delete waves[gone];
+			frames.delete(gone);
+			frames.delete(screenKey(gone));
+			if (theirs(pinned)) pinned = null;
+			if (theirs(maximized)) maximized = null;
 		});
 		c.addEventListener('message', (e) => {
 			if (!current()) return;
@@ -542,6 +629,7 @@
 							muted: !!said.muted,
 							deafened: !!said.deafened,
 							camera: !!said.camera,
+							screen: !!said.screen,
 							net: Number.isInteger(said.net) ? Math.min(3, Math.max(0, said.net)) : undefined
 						};
 					}
@@ -591,8 +679,8 @@
 					...VIDEO,
 					// A card shows video once frames come: until then, the smallest layer.
 					unattached: 0,
-					onFrame: (member, decoded) => {
-						frames.set(member, performance.now());
+					onFrame: (member, decoded, track) => {
+						frames.set(track === 1 ? screenKey(member) : member, performance.now());
 						decoded.close();
 					}
 				});
@@ -605,12 +693,17 @@
 		const draw = (now: number) => {
 			if (now - last >= 40) {
 				const showing: Record<string, boolean> = {};
+				const fresh = (key: string) => now - (frames.get(key) ?? -Infinity) < VIDEO_FRESH;
 				for (const m of members) {
-					const at = frames.get(m.id);
-					if (m.id !== me && presence[m.id]?.camera && at && now - at < VIDEO_FRESH)
-						showing[m.id] = true;
+					if (m.id === me) continue;
+					if (presence[m.id]?.camera && fresh(m.id)) showing[m.id] = true;
+					if (presence[m.id]?.screen && fresh(screenKey(m.id))) showing[screenKey(m.id)] = true;
 				}
-				if (Object.keys(showing).join() !== Object.keys(watching).join()) watching = showing;
+				if (Object.keys(showing).join() !== Object.keys(watching).join()) {
+					const started = Object.keys(showing).find((k) => k.endsWith(' screen') && !watching[k]);
+					watching = showing;
+					screensChanged(started);
+				}
 				// The latest of the others to speak, for the speaker view.
 				const talker = members.find((m) => m.id !== me && speaking(m.id))?.id;
 				if (talker && talker !== latest) latest = talker;
@@ -649,10 +742,33 @@
 		if (cameraOnJoin) await toggleCamera();
 	}
 
-	/** Tells the others whether we are muted or deafened. */
+	/**
+	 * A screen started (`started`), or one stopped: a new one is shown large,
+	 * in the speaker view, as meeting apps do, unless we pinned something;
+	 * when the last one stops, the gallery is back if the screen chose it.
+	 */
+	function screensChanged(started: string | undefined) {
+		const on = Object.keys(watching).filter((k) => k.endsWith(' screen'));
+		if (started) {
+			newestScreen = started;
+			if (!pinned && view !== 'speaker') {
+				view = 'speaker';
+				viewForScreen = true;
+			}
+		} else if (newestScreen && !watching[newestScreen]) newestScreen = on.at(-1) ?? null;
+		if (!on.length && viewForScreen) {
+			viewForScreen = false;
+			view = 'gallery';
+		}
+	}
+
+	/** Tells the others whether we are muted or deafened, and what we send. */
 	function announce() {
 		try {
-			conn?.send('command', JSON.stringify({ type: 'presence', muted, deafened, camera, net }));
+			conn?.send(
+				'command',
+				JSON.stringify({ type: 'presence', muted, deafened, camera, screen: !!screenVideo, net })
+			);
 		} catch {
 			// left
 		}
@@ -711,7 +827,54 @@
 		const settings = stream.getVideoTracks()[0]?.getSettings() ?? {};
 		facingUs = settings.facingMode !== 'environment';
 		if (settings.deviceId) cameraDevice = settings.deviceId;
-		await video!.setStream(stream);
+		// 1080p only from a camera that gives it: from less, it would be 720p again, sent twice.
+		const short = Math.min(settings.width ?? 0, settings.height ?? 0);
+		await video!.setStream(stream, {
+			layers: short >= FULL_HD.height ? [...VIDEO.layers, FULL_HD] : VIDEO.layers
+		});
+	}
+
+	/** Shares a screen (the browser asks which), or stops sharing it. */
+	async function toggleShare() {
+		if (screenVideo) return stopShare();
+		const c = conn;
+		if (!c || !videoSdk) return;
+		let stream: MediaStream;
+		try {
+			stream = await navigator.mediaDevices.getDisplayMedia({
+				video: {
+					width: { max: 1920 },
+					height: { max: 1080 },
+					frameRate: { ideal: SCREEN.framerate, max: SCREEN.framerate }
+				},
+				audio: false
+			});
+		} catch {
+			return; // not chosen, or not allowed
+		}
+		try {
+			const shared = await videoSdk.startVideo(c, { ...SCREEN, track: 1, receive: false, stream });
+			if (conn !== c) {
+				shared.stop();
+				stream.getTracks().forEach((t) => t.stop());
+				return;
+			}
+			// The browser's own "Stop sharing" ends the track: we stop with it.
+			shared.addEventListener('ended', () => screenVideo === shared && stopShare());
+			screenVideo = shared;
+			screenStream = stream;
+		} catch {
+			stream.getTracks().forEach((t) => t.stop());
+		}
+		announce();
+	}
+
+	function stopShare() {
+		screenVideo?.stop();
+		screenVideo = undefined;
+		screenStream?.getTracks().forEach((t) => t.stop());
+		screenStream = undefined;
+		announce();
 	}
 
 	/**
@@ -748,29 +911,41 @@
 	}
 
 	// Each canvas gets the layer that suits its size (the video SDK sees to
-	// it); thumbnails in the speaker view's strip the smallest, which is
-	// plenty for them even on a dense screen; those behind someone watched
-	// across the whole window none.
+	// it), cameras and screens alike, so that the large view gets 1080p;
+	// thumbnails in the speaker view's strip the smallest, which is plenty
+	// for them even on a dense screen; those behind a tile watched across
+	// the whole window none.
 	$effect(() => {
 		if (!video) return;
-		const strip = view === 'speaker' && people.length > 1;
+		const strip = view === 'speaker' && tiles.length > 1;
 		for (const m of others) {
-			const layer =
-				maximized && maximized !== m.id ? null : strip && m.id !== featured ? 0 : 'auto';
-			video.setLayer(m.id, layer);
+			for (const [key, track] of [
+				[m.id, 0],
+				[screenKey(m.id), 1]
+			] as const) {
+				const layer =
+					maximized && maximized !== key ? null : strip && key !== featured ? 0 : 'auto';
+				video.setLayer(m.id, layer, { track });
+			}
 		}
 	});
 
-	/** Draws a member's video into this canvas while it is on the page. */
-	function screen(node: HTMLCanvasElement, id: string) {
-		video?.attach(id, node);
-		screens.set(id, node);
+	// Data saver: nothing above 360p comes in.
+	$effect(() => {
+		video?.setMaxLayer(dataSaver ? 1 : null);
+	});
+
+	/** Draws a member's video (track 0, the camera, or 1, the screen) into this canvas while it is on the page. */
+	function screen(node: HTMLCanvasElement, [id, track]: [string, number]) {
+		const key = track === 1 ? screenKey(id) : id;
+		video?.attach(id, node, { track });
+		screens.set(key, node);
 		return {
 			destroy() {
 				// Moving to another tile, the new canvas may already be attached.
-				if (screens.get(id) !== node) return;
-				screens.delete(id);
-				video?.attach(id, null);
+				if (screens.get(key) !== node) return;
+				screens.delete(key);
+				video?.attach(id, null, { track });
 			}
 		};
 	}
@@ -806,11 +981,15 @@
 
 	async function stop() {
 		cancelAnimationFrame(frame);
-		const [v, vd, c] = [voice, video, conn];
+		const [v, vd, sv, c] = [voice, video, screenVideo, conn];
 		voice = undefined;
 		video = undefined;
+		screenVideo = undefined;
 		conn = undefined;
 		vd?.stop();
+		sv?.stop();
+		screenStream?.getTracks().forEach((t) => t.stop());
+		screenStream = undefined;
 		cameraStream?.getTracks().forEach((t) => t.stop());
 		cameraStream = undefined;
 		await v?.stop().catch(() => {});
@@ -834,7 +1013,8 @@
 		net = 3;
 		videoPaused = false;
 		view = 'gallery';
-		pinned = latest = maximized = null;
+		viewForScreen = false;
+		pinned = latest = maximized = newestScreen = null;
 		unread = 0;
 		inviteOpen = false;
 		status = 'offline';
@@ -870,6 +1050,12 @@
 			}
 			if (disposed) return;
 			name = read(NAME_KEY) ?? '';
+			dataSaver = savedDataSaver();
+			// Not offered on phones, as meeting apps do not offer it there.
+			const mobile =
+				!!(navigator as Navigator & { userAgentData?: { mobile: boolean } }).userAgentData
+					?.mobile || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+			canShare = typeof navigator.mediaDevices?.getDisplayMedia === 'function' && !mobile;
 			if (typeof AudioEncoder === 'undefined') raise('codecs');
 			if (!sdk.groupsSupported()) raise('webtransport');
 			if (location.hash.length > 1) {
@@ -916,6 +1102,9 @@
 		| 'chat'
 		| 'invite'
 		| 'send'
+		| 'screen'
+		| 'screen-off'
+		| 'saver'
 )}
 	<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
 		{#if name === 'expand'}
@@ -955,6 +1144,17 @@
 			<path d="M4 12l16-8-6 16-2.5-6.5z" /><path d="M11.5 13.5L20 4" />
 		{:else if name === 'invite'}
 			<circle cx="10" cy="8" r="3.5" /><path d="M3.5 19a6.5 6.5 0 0 1 13 0M19 8v6M16 11h6" />
+		{:else if name === 'screen' || name === 'screen-off'}
+			<rect x="3" y="4.5" width="18" height="12" rx="2" />
+			<path d="M8.5 20h7M12 16.5V20" />
+			{#if name === 'screen'}
+				<path d="M12 13.5V8M9.5 10.5L12 8l2.5 2.5" />
+			{:else}
+				<path d="M9.5 8l5 5M14.5 8l-5 5" />
+			{/if}
+		{:else if name === 'saver'}
+			<path d="M5 19.5c0-8.5 5.5-14.5 15-14.5 0 9.5-6 15-14 15" />
+			<path d="M5 19.5l7.5-7.5" />
 		{:else if name === 'switch-camera'}
 			<path d="M4 8h3l1.5-2h7L17 8h3v11H4z" />
 			<path d="M9.5 12.5a2.8 2.8 0 0 1 5-1.2M14.5 14.5a2.8 2.8 0 0 1-5 1.2" />
@@ -1109,24 +1309,35 @@
 		</fieldset>
 	</form>
 {:else}
-	{#snippet tile(person: Member, size: 'grid' | 'large' | 'small' | 'whole')}
+	{#snippet tile(item: Tile, size: 'grid' | 'large' | 'small' | 'whole')}
+		{@const person = item.person}
+		{@const shared = item.screen}
 		{@const mine = person.id === me}
 		{@const off = mine ? muted : !!presence[person.id]?.muted || !!silenced[person.id]}
-		{@const talking = !off && speaking(person.id)}
-		{@const shown = hasVideo(person.id) && (size === 'whole' || maximized !== person.id)}
+		{@const talking = !shared && !off && speaking(person.id)}
+		{@const shown = hasVideo(item.key) && (size === 'whole' || maximized !== item.key)}
 		{@const turn = mine ? t.room.rotateMine : t.room.rotateTheirs.replace('{name}', person.name)}
 		{@const bars = mine ? net : presence[person.id]?.net}
+		{@const title = shared ? t.room.screenOf.replace('{name}', person.name) : person.name}
 		<li
 			class="person tile {size}"
+			class:screen-tile={shared}
 			class:mine
 			class:talking
-			class:off
-			ondblclick={() => size !== 'whole' && enlarge(person.id)}
+			class:off={off && !shared}
+			ondblclick={() => size !== 'whole' && enlarge(item.key)}
 		>
 			{#if shown}
 				<!-- Ours as we send it (mirrored, as a mirror would be); theirs as they arrive. -->
-				<canvas class="screen" class:mirror={mine && facingUs} use:screen={person.id}
-					>{t.room.video.replace('{name}', person.name)}</canvas
+				<canvas
+					class="screen"
+					class:mirror={mine && facingUs}
+					use:screen={[person.id, shared ? 1 : 0]}
+					>{(shared ? t.room.screenVideo : t.room.video).replace('{name}', person.name)}</canvas
+				>
+			{:else if shared}
+				<span class="avatar" style:--hue={hue(person.id)} aria-hidden="true"
+					>{@render icon('screen')}</span
 				>
 			{:else}
 				<span class="avatar" style:--hue={hue(person.id)} aria-hidden="true"
@@ -1143,12 +1354,12 @@
 						onclick={switchCamera}>{@render icon('switch-camera')}</button
 					>
 				{/if}
-				{#if shown}
+				{#if shown && !shared}
 					<button aria-label={turn} title={turn} onclick={() => rotate(person.id)}
 						>{@render icon('rotate')}</button
 					>
 				{/if}
-				{#if !mine && voice}
+				{#if !mine && !shared && voice}
 					{@const label = (silenced[person.id] ? t.room.unmuteThem : t.room.muteThem).replace(
 						'{name}',
 						person.name
@@ -1170,74 +1381,85 @@
 					>
 				{:else}
 					{#if shown}
-						{@const whole = t.room.whole.replace('{name}', person.name)}
-						<button aria-label={whole} title={whole} onclick={() => (maximized = person.id)}
+						{@const whole = t.room.whole.replace('{name}', title)}
+						<button aria-label={whole} title={whole} onclick={() => (maximized = item.key)}
 							>{@render icon('expand')}</button
 						>
 					{/if}
-					{#if people.length > 1}
+					{#if tiles.length > 1}
 						{@const pin =
-							size === 'large' && pinned === person.id
+							size === 'large' && pinned === item.key
 								? t.room.unpin
-								: t.room.pin.replace('{name}', person.name)}
+								: t.room.pin.replace('{name}', title)}
 						<button
 							class="keep"
-							class:on={pinned === person.id}
+							class:on={pinned === item.key}
 							aria-label={pin}
 							title={pin}
-							onclick={() => enlarge(person.id)}>{@render icon('pin')}</button
+							onclick={() => enlarge(item.key)}>{@render icon('pin')}</button
 						>
 					{/if}
 				{/if}
 			</span>
 			<span class="tag">
-				{#if mine && muted}<span class="flag" title={t.room.micOff}>{@render icon('mic-off')}</span
-					>{/if}
-				{#if !mine && presence[person.id]?.muted}
-					<span class="state" title={t.room.theirMicOff.replace('{name}', person.name)}
-						>{@render icon('mic-off')}<span class="sr"
-							>{t.room.theirMicOff.replace('{name}', person.name)}</span
-						></span
+				{#if shared}
+					<span class="kind-icon" aria-hidden="true">{@render icon('screen')}</span>
+					<span class="name">{title}</span>
+				{:else}
+					{#if mine && muted}<span class="flag" title={t.room.micOff}
+							>{@render icon('mic-off')}</span
+						>{/if}
+					{#if !mine && presence[person.id]?.muted}
+						<span class="state" title={t.room.theirMicOff.replace('{name}', person.name)}
+							>{@render icon('mic-off')}<span class="sr"
+								>{t.room.theirMicOff.replace('{name}', person.name)}</span
+							></span
+						>
+					{/if}
+					{#if !mine && presence[person.id]?.deafened}
+						<span class="state" title={t.room.theirHearingOff.replace('{name}', person.name)}
+							>{@render icon('headphones-off')}<span class="sr"
+								>{t.room.theirHearingOff.replace('{name}', person.name)}</span
+							></span
+						>
+					{/if}
+					<span class="name"
+						>{person.name}{#if mine}<em>&nbsp;· {t.room.you}</em>{/if}</span
 					>
-				{/if}
-				{#if !mine && presence[person.id]?.deafened}
-					<span class="state" title={t.room.theirHearingOff.replace('{name}', person.name)}
-						>{@render icon('headphones-off')}<span class="sr"
-							>{t.room.theirHearingOff.replace('{name}', person.name)}</span
-						></span
+					{#if bars !== undefined}
+						{@const said =
+							bars >= 3
+								? t.room.network.good
+								: bars === 2
+									? t.room.network.fair
+									: t.room.network.poor}
+						<span class="net bars-{bars}" role="img" aria-label={said} title={said}>
+							<svg viewBox="0 0 13 12" aria-hidden="true">
+								{#each [1, 2, 3] as n (n)}
+									<rect
+										x={(n - 1) * 5}
+										y={12 - n * 4}
+										width="3"
+										height={n * 4}
+										rx="1"
+										class:lit={n <= bars}
+									/>
+								{/each}
+							</svg>
+						</span>
+					{/if}
+					<svg
+						class="wave"
+						viewBox="0 0 {WAVE * 4} 24"
+						preserveAspectRatio="none"
+						aria-hidden="true"
 					>
+						{#each (waves[person.id] ?? []).slice(-WAVE) as v, i (i)}
+							{@const h = Math.max(2, v * 22)}
+							<rect x={i * 4 + 0.5} y={12 - h / 2} width="3" height={h} rx="1.5" />
+						{/each}
+					</svg>
 				{/if}
-				<span class="name"
-					>{person.name}{#if mine}<em>&nbsp;· {t.room.you}</em>{/if}</span
-				>
-				{#if bars !== undefined}
-					{@const said =
-						bars >= 3
-							? t.room.network.good
-							: bars === 2
-								? t.room.network.fair
-								: t.room.network.poor}
-					<span class="net bars-{bars}" role="img" aria-label={said} title={said}>
-						<svg viewBox="0 0 13 12" aria-hidden="true">
-							{#each [1, 2, 3] as n (n)}
-								<rect
-									x={(n - 1) * 5}
-									y={12 - n * 4}
-									width="3"
-									height={n * 4}
-									rx="1"
-									class:lit={n <= bars}
-								/>
-							{/each}
-						</svg>
-					</span>
-				{/if}
-				<svg class="wave" viewBox="0 0 {WAVE * 4} 24" preserveAspectRatio="none" aria-hidden="true">
-					{#each (waves[person.id] ?? []).slice(-WAVE) as v, i (i)}
-						{@const h = Math.max(2, v * 22)}
-						<rect x={i * 4 + 0.5} y={12 - h / 2} width="3" height={h} rx="1.5" />
-					{/each}
-				</svg>
 			</span>
 		</li>
 	{/snippet}
@@ -1288,19 +1510,35 @@
 		<header class="bar">
 			<span class="status {status}">{t.state[status]}</span>
 			<span class="count">{members.length} / {CAPACITY}</span>
+			{#if screenVideo}
+				<!-- Ours is not shown back to us: this says it is going out. -->
+				<span class="sharing" role="status">
+					{@render icon('screen')}<span>{t.room.sharing}</span>
+					<button onclick={stopShare}>{t.room.stopSharing}</button>
+				</span>
+			{/if}
+			<button
+				class="saver"
+				class:selected={dataSaver}
+				aria-pressed={dataSaver}
+				aria-label={t.room.dataSaver}
+				title={t.room.dataSaver}
+				onclick={toggleDataSaver}
+				>{@render icon('saver')}<span>{t.room.short.dataSaver}</span></button
+			>
 			<span class="views" role="group" aria-label={t.room.layout}>
 				<button
 					class:selected={view === 'gallery'}
 					aria-pressed={view === 'gallery'}
 					aria-label={t.room.gallery}
-					onclick={() => ((view = 'gallery'), (pinned = null))}
+					onclick={() => setView('gallery')}
 					>{@render icon('grid')}<span>{t.room.gallery}</span></button
 				>
 				<button
 					class:selected={view === 'speaker'}
 					aria-pressed={view === 'speaker'}
 					aria-label={t.room.speakerView}
-					onclick={() => (view = 'speaker')}
+					onclick={() => setView('speaker')}
 					>{@render icon('speaker-view')}<span>{t.room.speakerView}</span></button
 				>
 			</span>
@@ -1308,12 +1546,12 @@
 
 		<div class="body">
 			<section class="stage" aria-label={t.room.people}>
-				{#if view === 'speaker' && people.length > 1}
-					{@const big = people.find((m) => m.id === featured)!}
+				{#if view === 'speaker' && tiles.length > 1}
+					{@const big = tiles.find((item) => item.key === featured) ?? tiles[0]}
 					<ul class="large-one">{@render tile(big, 'large')}</ul>
 					<ul class="strip">
-						{#each people.filter((m) => m.id !== featured) as person (person.id)}
-							{@render tile(person, 'small')}
+						{#each tiles.filter((item) => item !== big) as item (item.key)}
+							{@render tile(item, 'small')}
 						{/each}
 					</ul>
 				{:else}
@@ -1323,8 +1561,8 @@
 						style:--tile-width={gallery.width ? `${gallery.width}px` : null}
 						style:--aspect={gallery.aspect}
 					>
-						{#each people as person (person.id)}
-							{@render tile(person, 'grid')}
+						{#each tiles as item (item.key)}
+							{@render tile(item, 'grid')}
 						{/each}
 						{#if people.length < 2}
 							<li class="alone">
@@ -1411,6 +1649,15 @@
 					camera ? 'live' : 'off'
 				)}
 			{/if}
+			{#if video && canShare && typeof VideoEncoder === 'function'}
+				{@render control(
+					screenVideo ? t.room.shareOn : t.room.shareOff,
+					screenVideo ? t.room.short.stopShare : t.room.short.share,
+					screenVideo ? 'screen-off' : 'screen',
+					toggleShare,
+					screenVideo ? 'live' : ''
+				)}
+			{/if}
 			{#if voice}
 				{@render control(
 					deafened ? t.room.hearOff : t.room.hearOn,
@@ -1453,15 +1700,18 @@
 	</div>
 
 	{#if maximized}
-		{@const person = people.find((m) => m.id === maximized)}
-		{#if person}
+		{@const item = tiles.find((each) => each.key === maximized)}
+		{#if item}
 			<div
 				class="full"
 				role="dialog"
 				aria-modal="true"
-				aria-label={t.room.whole.replace('{name}', person.name)}
+				aria-label={t.room.whole.replace(
+					'{name}',
+					item.screen ? t.room.screenOf.replace('{name}', item.person.name) : item.person.name
+				)}
 			>
-				<ul>{@render tile(person, 'whole')}</ul>
+				<ul>{@render tile(item, 'whole')}</ul>
 				<!-- The chat, over the picture. -->
 				{@render overlay(lines.filter((l) => clock - l.time < COMMENT + 1000).slice(-6))}
 				<div class="say">{@render composer(undefined)}</div>
@@ -1691,10 +1941,69 @@
 		opacity: 0.7;
 	}
 
+	/* We are sharing our screen: in green, as meeting apps say it, with its stop. */
+	.sharing {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		min-height: 32px;
+		padding: 0 4px 0 12px;
+		border-radius: 999px;
+		background: #15803d;
+		color: #fff;
+		font-weight: 600;
+	}
+
+	.sharing .icon {
+		width: 16px;
+		height: 16px;
+	}
+
+	.sharing button {
+		min-height: 24px;
+		padding: 0 10px;
+		border: 0;
+		border-radius: 999px;
+		background: #fff;
+		color: #b91c1c;
+		font: inherit;
+		font-size: 0.8rem;
+		cursor: pointer;
+	}
+
+	.sharing button:hover {
+		background: #fee2e2;
+	}
+
+	/* The data saver: a switch beside the layout's. */
+	.saver {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		min-height: 32px;
+		margin-left: auto;
+		padding: 0 12px;
+		border: 0;
+		border-radius: 999px;
+		background: rgb(255 255 255 / 0.08);
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+	}
+
+	.saver.selected {
+		background: rgb(74 222 128 / 0.2);
+		color: #4ade80;
+	}
+
+	.saver .icon {
+		width: 16px;
+		height: 16px;
+	}
+
 	.views {
 		display: flex;
 		gap: 4px;
-		margin-left: auto;
 		padding: 3px;
 		border-radius: 999px;
 		background: rgb(255 255 255 / 0.08);
@@ -1973,6 +2282,22 @@
 	.net.bars-1 .lit,
 	.net.bars-0 .lit {
 		fill: #f87171;
+	}
+
+	.kind-icon {
+		display: inline-grid;
+		flex: none;
+		place-items: center;
+	}
+
+	.kind-icon .icon {
+		width: 15px;
+		height: 15px;
+	}
+
+	.tile .avatar .icon {
+		width: 45%;
+		height: 45%;
 	}
 
 	.flag,
@@ -2564,7 +2889,8 @@
 			display: none;
 		}
 
-		.views span {
+		.views span,
+		.saver span {
 			display: none;
 		}
 

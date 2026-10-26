@@ -424,8 +424,9 @@ impl Member {
                     set("track", track.into());
                     set("layer", layer.into());
                 }
-                Event::VideoDemand { layers } => {
+                Event::VideoDemand { track, layers } => {
                     kind("videodemand");
+                    set("track", track.into());
                     set("layers", layers.into());
                 }
                 Event::VideoLimit { layer } => {
@@ -479,9 +480,9 @@ impl Member {
         self.0.send_video(track, layer, keyframe, timestamp, data)
     }
 
-    /// `layer` undefined: no video from `member`.
-    pub fn subscribe(&mut self, member: &str, layer: Option<u8>) -> Result<(), JsError> {
-        Ok(self.0.subscribe(member_of(member)?, layer)?)
+    /// `layer` undefined: none of `member`'s video `track`.
+    pub fn subscribe(&mut self, member: &str, track: u8, layer: Option<u8>) -> Result<(), JsError> {
+        Ok(self.0.subscribe(member_of(member)?, track, layer)?)
     }
 
     #[wasm_bindgen(js_name = sendDatagram)]

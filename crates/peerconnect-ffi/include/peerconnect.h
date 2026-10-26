@@ -67,7 +67,7 @@ typedef enum {
   PC_FULL = 21,         /* the group is full on this relay */
   PC_VIDEO = 22,        /* a whole video frame from `member`'s `track`, of `layer`: `keyframe`, `timestamp`, `data` */
   PC_KEYFRAME_REQUEST = 23, /* members need a keyframe of `layer` of our `track`: send one soon */
-  PC_VIDEO_DEMAND = 24, /* `layer` is a bitmap of our video layers someone wants: encode those (GROUP.md §7.4) */
+  PC_VIDEO_DEMAND = 24, /* `layer` is a bitmap of the layers of our video `track` someone wants: encode those */
   PC_VIDEO_LIMIT = 25,  /* our link takes video layers up to `layer` now (0xFF: none, audio only) */
 } pc_kind;
 
@@ -121,12 +121,12 @@ int32_t pc_client_send(pc_client *c, uint8_t channel, const uint8_t *data, size_
 int32_t pc_client_send_to(pc_client *c, const uint8_t member[32], uint8_t channel, const uint8_t *data, size_t len);
 void pc_client_send_voice(pc_client *c, uint16_t seq, const uint8_t *data, size_t len);
 void pc_client_send_datagram(pc_client *c, const uint8_t *member, const uint8_t *data, size_t len);
-/* Video of `layer` (0 to 3, the smallest picture first) of `track`; the relay forwards each member the
- * layer it subscribed to. */
+/* Video of `layer` (0 to 3, the smallest picture first) of `track` (0 or 1: a camera and a screen, say);
+ * the relay forwards each member the layer it subscribed to. */
 void pc_client_send_video(pc_client *c, uint8_t track, uint8_t layer, uint8_t keyframe, uint32_t timestamp,
                           const uint8_t *data, size_t len);
-/* Asks the relay for `layer` of `member`'s video (0xFF: none); kept across reconnections. */
-int32_t pc_client_subscribe(pc_client *c, const uint8_t member[32], uint8_t layer);
+/* Asks the relay for `layer` of `member`'s video `track` (0 or 1; layer 0xFF: none); kept across reconnections. */
+int32_t pc_client_subscribe(pc_client *c, const uint8_t member[32], uint8_t track, uint8_t layer);
 int32_t pc_client_request_sync(pc_client *c, const uint8_t from[32]);
 int32_t pc_client_provide_sync(pc_client *c, const uint8_t to[32], uint32_t transfer, const uint8_t *data, size_t len);
 void pc_client_decline_sync(pc_client *c, const uint8_t to[32], uint32_t transfer);
@@ -164,8 +164,8 @@ int32_t pc_member_send_datagram(pc_member *m, const uint8_t *member, const uint8
 /* A video frame of `layer` of `track` (at most 255,000 bytes), to everyone. Returns 1 if sent, 0 if not. */
 int32_t pc_member_send_video(pc_member *m, uint8_t track, uint8_t layer, uint8_t keyframe, uint32_t timestamp,
                              const uint8_t *data, size_t len);
-/* Asks the relay for `layer` of `member`'s video (0xFF: none); kept across reconnections. */
-int32_t pc_member_subscribe(pc_member *m, const uint8_t member[32], uint8_t layer);
+/* Asks the relay for `layer` of `member`'s video `track` (0 or 1; layer 0xFF: none); kept across reconnections. */
+int32_t pc_member_subscribe(pc_member *m, const uint8_t member[32], uint8_t track, uint8_t layer);
 int32_t pc_member_request_sync(pc_member *m, const uint8_t from[32]);
 int32_t pc_member_provide_sync(pc_member *m, const uint8_t to[32], uint32_t transfer, const uint8_t *data, size_t len);
 void pc_member_decline_sync(pc_member *m, const uint8_t to[32], uint32_t transfer);

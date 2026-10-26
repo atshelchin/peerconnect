@@ -139,10 +139,10 @@ impl GroupSender {
         let _ = self.command(Command::Video(track, layer, keyframe, timestamp, data.into()));
     }
 
-    /// Asks the relay for `layer` of `member`'s video, `None` for none (see
-    /// [`group::Member::subscribe`]).
-    pub fn subscribe(&self, member: MemberId, layer: Option<u8>) {
-        let _ = self.command(Command::Subscribe(member, layer));
+    /// Asks the relay for `layer` of `member`'s video `track`, `None` for
+    /// none (see [`group::Member::subscribe`]).
+    pub fn subscribe(&self, member: MemberId, track: u8, layer: Option<u8>) {
+        let _ = self.command(Command::Subscribe(member, track, layer));
     }
 
     /// Sends a datagram to one member or to all; dropped rather than delayed.
@@ -175,7 +175,7 @@ enum Command {
     SendTo(MemberId, Channel, Vec<u8>, oneshot::Sender<Result<(), SendError>>),
     Voice(u16, Vec<u8>),
     Video(u8, u8, bool, u32, Vec<u8>),
-    Subscribe(MemberId, Option<u8>),
+    Subscribe(MemberId, u8, Option<u8>),
     Datagram(Option<MemberId>, Vec<u8>),
     RequestSync(MemberId, oneshot::Sender<Result<(), SendError>>),
     ProvideSync(MemberId, u32, Vec<u8>),
@@ -240,8 +240,8 @@ async fn drive(
                 Some(Command::Video(track, layer, keyframe, timestamp, data)) => {
                     member.send_video(track, layer, keyframe, timestamp, &data);
                 }
-                Some(Command::Subscribe(of, layer)) => {
-                    let _ = member.subscribe(of, layer);
+                Some(Command::Subscribe(of, track, layer)) => {
+                    let _ = member.subscribe(of, track, layer);
                 }
                 Some(Command::Voice(seq, data)) => {
                     member.send_voice(seq, &data);

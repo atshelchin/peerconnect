@@ -56,6 +56,8 @@ install -m 644 systemd/peerconnect-relay.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now peerconnect-relay certbot-renew.timer
 ```
 
+The unit also sets the server's traffic budget (`PEERCONNECT_MONTHLY_GB`, `PEERCONNECT_MAX_MBPS`): as the relay nears it, everyone's video shrinks, never voice, and the month's usage is kept in `/var/lib/peerconnect/usage` across restarts and logged every ten minutes (`journalctl -u peerconnect-relay`). Leave room in the monthly figure for anything else the server sends.
+
 QUIC wants larger UDP buffers than most kernels allow by default:
 
 ```sh

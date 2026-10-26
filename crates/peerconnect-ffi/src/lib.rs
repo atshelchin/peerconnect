@@ -341,7 +341,8 @@ fn fill(event: Event, out: &mut PcOutput) -> (i32, Vec<u8>) {
             out.layer = layer;
             (PC_KEYFRAME_REQUEST, Vec::new())
         }
-        Event::VideoDemand { layers } => {
+        Event::VideoDemand { track, layers } => {
+            out.track = track;
             out.layer = layers;
             (PC_VIDEO_DEMAND, Vec::new())
         }
@@ -411,12 +412,12 @@ pub unsafe extern "C" fn pc_member_send_video(
     unsafe { with(m, 0, |m| m.member.send_video(track, layer, keyframe != 0, timestamp, data) as i32) }
 }
 
-/// `layer` 0xFF: no video from `member`.
+/// `layer` 0xFF: none of `member`'s video `track`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_member_subscribe(m: *mut PcMember, member: *const u8, layer: u8) -> i32 {
+pub unsafe extern "C" fn pc_member_subscribe(m: *mut PcMember, member: *const u8, track: u8, layer: u8) -> i32 {
     let Some(member) = (unsafe { id(member) }) else { return PC_INVALID };
     let layer = (layer != 0xFF).then_some(layer);
-    unsafe { with(m, PC_INVALID, |m| code(m.member.subscribe(member, layer))) }
+    unsafe { with(m, PC_INVALID, |m| code(m.member.subscribe(member, track, layer))) }
 }
 
 #[unsafe(no_mangle)]
@@ -628,17 +629,18 @@ pub unsafe extern "C" fn pc_client_send_video(
     unsafe { with_client(c, (), |c| c.conn.send_video(track, layer, keyframe != 0, timestamp, data)) }
 }
 
-/// `layer` 0xFF: no video from `member`.
+/// `layer` 0xFF: none of `member`'s video `track`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_client_subscribe(c: *mut PcClient, member: *const u8, layer: u8) -> i32 {
+pub unsafe extern "C" fn pc_client_subscribe(c: *mut PcClient, member: *const u8, track: u8, layer: u8) -> i32 {
     let Some(member) = (unsafe { id(member) }) else { return PC_INVALID };
-    if layer != 0xFF && layer >= peerconnect::group::wire::VIDEO_LAYERS {
+    use peerconnect::group::wire::{VIDEO_LAYERS, VIDEO_TRACKS};
+    if track >= VIDEO_TRACKS || (layer != 0xFF && layer >= VIDEO_LAYERS) {
         return PC_INVALID;
     }
     let layer = (layer != 0xFF).then_some(layer);
     unsafe {
         with_client(c, PC_INVALID, |c| {
-            c.conn.subscribe(member, layer);
+            c.conn.subscribe(member, track, layer);
             PC_OK
         })
     }

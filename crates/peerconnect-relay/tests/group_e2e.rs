@@ -540,7 +540,7 @@ async fn each_member_gets_the_video_layer_it_subscribed_to() {
         admitted(conn, 2).await;
     }
     // a sends layers 1 and 2; b wants 2, c says nothing and gets the smallest sent.
-    b.subscribe(a.id(), Some(2));
+    b.subscribe(a.id(), 0, Some(2));
     let sender = a.sender();
     let mut tick = tokio::time::interval(Duration::from_millis(33));
     let mut keyframe_due = [true; 3];
@@ -555,7 +555,7 @@ async fn each_member_gets_the_video_layer_it_subscribed_to() {
         while let Some(event) = a.try_next() {
             match event {
                 Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
-                Event::VideoDemand { layers } => {
+                Event::VideoDemand { track: 0, layers } => {
                     for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
                         *due |= layers & !demand & 1 << layer != 0;
                     }
@@ -599,7 +599,7 @@ async fn a_slow_link_gets_smaller_video_and_more_again_once_it_keeps_up() {
         admitted(conn, 2).await;
     }
     for conn in [&b, &c] {
-        conn.subscribe(a.id(), Some(2));
+        conn.subscribe(a.id(), 0, Some(2));
     }
     // a sends 360p at 400 kbit/s and 720p at 1.5 Mbit/s, 30 frames a second;
     // b's link takes 1 Mbit/s for the first 6 s, then whatever comes.
@@ -621,7 +621,7 @@ async fn a_slow_link_gets_smaller_video_and_more_again_once_it_keeps_up() {
         while let Some(event) = a.try_next() {
             match event {
                 Event::KeyframeRequest { layer, .. } => keyframe_due[layer as usize] = true,
-                Event::VideoDemand { layers } => {
+                Event::VideoDemand { track: 0, layers } => {
                     for (layer, due) in keyframe_due.iter_mut().enumerate().skip(1) {
                         *due |= layers & !demand & 1 << layer != 0;
                     }

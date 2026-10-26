@@ -17,8 +17,9 @@ use crate::group::wire::{self, Class};
 /// Room in the datagram buffer that video leaves for voice, which goes
 /// out in the order queued: so voice waits behind little video.
 const VOICE_RESERVE: usize = 4 << 10;
-/// Video waiting beyond which the oldest is dropped.
-const VIDEO_BACKLOG: usize = 64 << 10;
+/// Video waiting beyond which the oldest is dropped: room for a 1080p
+/// keyframe passing through.
+const VIDEO_BACKLOG: usize = 256 << 10;
 /// How often video waiting for room in the datagram buffer looks again.
 const VIDEO_RETRY: Duration = Duration::from_millis(2);
 
@@ -39,8 +40,11 @@ fn transport_config() -> quinn::TransportConfig {
         .stream_receive_window((1u32 << 20).into())
         .receive_window((4u32 << 20).into())
         .send_window(1 << 20)
-        .datagram_receive_buffer_size(Some(64 << 10))
-        .datagram_send_buffer_size(8 << 10);
+        // Room for a keyframe's burst of datagrams; a send buffer small
+        // enough that voice behind video waits little (16 KiB at 5 Mbit/s:
+        // 26 ms), large enough for 1080p.
+        .datagram_receive_buffer_size(Some(512 << 10))
+        .datagram_send_buffer_size(16 << 10);
     t
 }
 

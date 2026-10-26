@@ -18,8 +18,13 @@ pub(crate) const WHOLE_FRAME: u8 = 0xFF;
 /// A frame missing a fragment waits this long before it is asked for
 /// (fragments of a frame travel together; this covers mild reordering).
 const NACK_DELAY: u64 = 5;
-/// And is given up after this long: frames behind it wait meanwhile.
+/// And is given up after this long without a fragment of it arriving:
+/// frames behind it wait meanwhile.
 const HOLD: u64 = 300;
+/// The end of a frame is asked for only once its fragments stopped coming
+/// this long: a large keyframe arrives over a while, and asking for what is
+/// still on its way would only send it twice.
+const TAIL_STALL: u64 = 30;
 /// How often to ask for a keyframe, at most, per sender and track.
 const KEYFRAME_RETRY: u64 = 500;
 /// Frames kept by a sender for resending: this long, and this many bytes.
@@ -251,6 +256,29 @@ struct Partial {
     timestamp: u32,
     parts: Vec<Option<Vec<u8>>>,
     have: u8,
+    /// When its latest fragment arrived, and the highest index arrived.
+    last_at: u64,
+    highest: u8,
+}
+
+impl Partial {
+    /// The fragments to ask for now: those missing before the highest one
+    /// arrived (lost, or overtaken), and those after it once they stopped coming.
+    fn missing(&self, now: u64) -> Vec<u8> {
+        let stalled = now.saturating_sub(self.last_at) >= TAIL_STALL;
+        (0..self.count).filter(|&i| self.parts[i as usize].is_none() && (i < self.highest || stalled)).collect()
+    }
+
+    /// When something of it can first be asked for: now if a fragment is
+    /// missing before the highest arrived, else once its end stopped coming.
+    fn askable_at(&self) -> Option<u64> {
+        let missing = |i: u8| self.parts[i as usize].is_none();
+        if (0..self.highest).any(missing) {
+            Some(0)
+        } else {
+            (self.highest + 1..self.count).any(missing).then_some(self.last_at + TAIL_STALL)
+        }
+    }
 }
 
 impl TrackIn {
@@ -326,12 +354,16 @@ impl Incoming {
             timestamp: f.timestamp,
             parts: vec![None; f.count as usize],
             have: 0,
+            last_at: now,
+            highest: 0,
         });
         if partial.count != f.count || partial.parts[f.index as usize].is_some() {
             return; // inconsistent, or a duplicate
         }
         partial.parts[f.index as usize] = Some(f.data.to_vec());
         partial.have += 1;
+        partial.last_at = now;
+        partial.highest = partial.highest.max(f.index);
         Self::advance(t, now, out);
     }
 
@@ -385,8 +417,7 @@ impl Incoming {
     fn tick_layers(&mut self, now: u64, rtt: u64, out: &mut Vec<Action>) {
         for t in &mut self.tracks {
             let Some(since) = t.blocked_since else { continue };
-            let waited = now.saturating_sub(since);
-            if waited >= HOLD {
+            if now.saturating_sub(Self::progress(t, since)) >= HOLD {
                 // Give up on the frame at `next`, missing or incomplete.
                 let next = t.next.unwrap();
                 t.frames.remove(&0);
@@ -400,22 +431,32 @@ impl Incoming {
                 continue;
             }
             let due = NACK_DELAY + u64::from(t.nacks) * (rtt.max(20) + NACK_DELAY);
-            if t.nacks < 2 && waited >= due {
-                t.nacks += 1;
+            if t.nacks < 2 && now.saturating_sub(since) >= due {
                 let next = t.next.unwrap();
                 let highest = t.frames.keys().next_back().copied().unwrap_or(0);
-                for key in 0..=highest {
-                    let frame = next.wrapping_add(key as u32);
-                    let indices: Vec<u8> = match t.frames.get(&key) {
-                        Some(p) => (0..p.count).filter(|&i| p.parts[i as usize].is_none()).collect(),
-                        None => vec![WHOLE_FRAME],
-                    };
-                    if !indices.is_empty() {
-                        out.push(Action::Nack { track: t.track, layer: t.layer, frame, indices });
-                    }
+                let nacks: Vec<Action> = (0..=highest)
+                    .filter_map(|key| {
+                        let indices = match t.frames.get(&key) {
+                            Some(p) => p.missing(now),
+                            None => vec![WHOLE_FRAME],
+                        };
+                        let frame = next.wrapping_add(key as u32);
+                        (!indices.is_empty()).then_some(Action::Nack { track: t.track, layer: t.layer, frame, indices })
+                    })
+                    .collect();
+                // Nothing to ask for yet (a frame still arriving) uses up no try.
+                if !nacks.is_empty() {
+                    t.nacks += 1;
+                    out.extend(nacks);
                 }
             }
         }
+    }
+
+    /// When the frame holding `t` up last made progress: its latest fragment,
+    /// or when it started holding things up.
+    fn progress(t: &TrackIn, since: u64) -> u64 {
+        t.frames.get(&0).map_or(since, |p| p.last_at.max(since))
     }
 
     /// The tracks seen from this sender.
@@ -432,8 +473,15 @@ impl Incoming {
             .iter()
             .filter_map(|t| {
                 let since = t.blocked_since?;
-                let nack = (t.nacks < 2).then(|| since + NACK_DELAY + u64::from(t.nacks) * (rtt.max(20) + NACK_DELAY));
-                Some(nack.map_or(since + HOLD, |n| n.min(since + HOLD)))
+                let hold = Self::progress(t, since) + HOLD;
+                let due = since + NACK_DELAY + u64::from(t.nacks) * (rtt.max(20) + NACK_DELAY);
+                // The first time anything can be asked for: a frame missing whole
+                // or a hole at once, the end of a frame once it stopped coming.
+                let highest = t.frames.keys().next_back().copied().unwrap_or(0);
+                let askable =
+                    (0..=highest).filter_map(|key| t.frames.get(&key).map_or(Some(0), Partial::askable_at)).min();
+                let nack = askable.filter(|_| t.nacks < 2).map(|at| at.max(due));
+                Some(nack.map_or(hold, |n| n.min(hold)))
             })
             .min()
     }
@@ -524,7 +572,29 @@ mod tests {
         rx.push(0, 0, &parts[0], &mut out);
         rx.push(0, 0, &parts[1], &mut out);
         rx.tick(NACK_DELAY, 20, &mut out);
+        assert!(out.is_empty(), "the end may still be on its way");
+        assert_eq!(rx.deadline(20), Some(TAIL_STALL));
+        rx.tick(TAIL_STALL, 20, &mut out);
         assert_eq!(out, [Action::Nack { track: 0, layer: 0, frame: 0, indices: vec![2] }]);
+    }
+
+    #[test]
+    fn a_large_keyframe_arriving_slowly_is_waited_for_not_asked_for() {
+        let mut rx = Incoming::default();
+        let mut out = Vec::new();
+        // 200 fragments, one every 3 ms over a slow link: 600 ms, twice HOLD.
+        let parts = fragments(0, 0, true, 0, &frame(200_000, 0)).unwrap();
+        for (i, part) in parts.iter().enumerate() {
+            let now = 3 * i as u64;
+            rx.tick(now, 20, &mut out);
+            rx.push(now, 0, part, &mut out);
+        }
+        assert_eq!(delivered(&out), [(true, 0, 200_000)]);
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::Nack { .. } | Action::RequestKeyframe { .. })),
+            "{:?}",
+            out.len()
+        );
     }
 
     #[test]

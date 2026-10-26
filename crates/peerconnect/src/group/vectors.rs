@@ -243,10 +243,10 @@ fn generate() -> String {
     deliver(&mut r, &abort);
     frames.push(sealed("sync_abort", &s_fixed.key, abort, vec![("transfer", "16909061".into())]));
 
-    // Video (§7.4): a keyframe of layer 2 in two fragments, the second lost;
-    // R asks for it again, and S resends it to R alone. Then a frame of
-    // layer 1 of another track that cannot be decoded without its keyframe:
-    // R asks for one.
+    // Video (§7.4): a keyframe of layer 2 of track 1 in two fragments, the
+    // second lost; R asks for it again, and S resends it to R alone. Then a
+    // frame of layer 1 of track 0 that cannot be decoded without its
+    // keyframe: R asks for one.
     let picture = [&[1u8][..], &(0..1499u32).map(|i| i as u8).collect::<Vec<u8>>()].concat();
     assert!(s.send_video(1, 2, true, 9000, &picture));
     let [video0, video1] = <[Vec<u8>; 2]>::try_from(drain(&mut s).0).unwrap();
@@ -266,7 +266,7 @@ fn generate() -> String {
     let (part0, part1) = picture.split_at(wire::MAX_VIDEO_FRAGMENT);
     frames.push(sealed("video_fragment", &s_fixed.key, video0, video_fields(0, part0)));
     frames.push(sealed("video_fragment_lost", &s_fixed.key, video1.clone(), video_fields(1, part1)));
-    r.handle_timeout(5);
+    r.handle_timeout(30); // the end of a frame is asked for once it stopped coming
     let nack = only(drain(&mut r).0);
     s.handle_binary(0, &nack);
     frames.push(sealed(
@@ -278,7 +278,7 @@ fn generate() -> String {
     let again = only(drain(&mut s).0);
     deliver(&mut r, &again);
     frames.push(sealed("video_resent", &s_fixed.key, again, video_fields(1, part1)));
-    assert!(s.send_video(2, 1, false, 9033, b"\x01delta"));
+    assert!(s.send_video(0, 1, false, 9033, b"\x01delta"));
     let delta = only(drain(&mut s).0);
     let request = only(deliver(&mut r, &delta));
     frames.push(sealed(
@@ -286,7 +286,7 @@ fn generate() -> String {
         &s_fixed.key,
         delta,
         vec![
-            ("track", "2".into()),
+            ("track", "0".into()),
             ("layer", "1".into()),
             ("frame", "0".into()),
             ("index", "0".into()),
@@ -297,8 +297,8 @@ fn generate() -> String {
         ],
     ));
     s.handle_binary(0, &request);
-    assert_eq!(drain(&mut s).1, [Event::KeyframeRequest { from: r_id, track: 2, layer: 1 }]);
-    frames.push(sealed("keyframe_request", &r_fixed.key, request, vec![("track", "2".into()), ("layer", "1".into())]));
+    assert_eq!(drain(&mut s).1, [Event::KeyframeRequest { from: r_id, track: 0, layer: 1 }]);
+    frames.push(sealed("keyframe_request", &r_fixed.key, request, vec![("track", "0".into()), ("layer", "1".into())]));
 
     // What R's application saw, in order: everything, exactly once.
     let message = |from, channel, data: &[u8], direct| Event::Message { from, channel, data: data.to_vec(), direct };
@@ -353,10 +353,11 @@ fn generate() -> String {
     }
     field("welcome_s", text(&hex(&wire::welcome(2, 1))));
     field("welcome_r", text(&hex(&wire::welcome(0, 1 << 2))));
-    // R asks for layer 2 of S's video; the relay tells S that layers 1 and 2 are wanted.
-    field("subscribe_r", text(&hex(&wire::subscribe(2, Some(2)))));
-    field("subscribe_r_none", text(&hex(&wire::subscribe(2, None))));
-    field("demand_s", text(&hex(&wire::demand(0b110))));
+    // R asks for layer 2 of S's video track 1 (none of track 0); the relay
+    // tells S that layers 1 and 2 of track 1 are wanted.
+    field("subscribe_r", text(&hex(&wire::subscribe(2, 1, Some(2)))));
+    field("subscribe_r_none", text(&hex(&wire::subscribe(2, 0, None))));
+    field("demand_s", text(&hex(&wire::demand(1, 0b110))));
     // The relay tells R its link takes layers up to 1 now, then none.
     field("limit_r", text(&hex(&wire::limit(Some(1)))));
     field("limit_r_none", text(&hex(&wire::limit(None))));

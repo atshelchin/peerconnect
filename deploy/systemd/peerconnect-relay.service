@@ -12,6 +12,13 @@ ExecStart=/usr/local/bin/peerconnect-relay
 Environment=PEERCONNECT_LISTEN=0.0.0.0:443
 Environment=PEERCONNECT_TLS_CERT=/etc/peerconnect/tls/fullchain.pem
 Environment=PEERCONNECT_TLS_KEY=/etc/peerconnect/tls/privkey.pem
+# The server's traffic: its month's allowance (shared with anything else on
+# it, so leave room) and a rate to stay under. Video shrinks for everyone as
+# they are approached; voice never does. The month's usage survives restarts.
+Environment=PEERCONNECT_MONTHLY_GB=1500
+Environment=PEERCONNECT_MAX_MBPS=500
+Environment=PEERCONNECT_USAGE_FILE=/var/lib/peerconnect/usage
+StateDirectory=peerconnect
 # Port 443 without root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

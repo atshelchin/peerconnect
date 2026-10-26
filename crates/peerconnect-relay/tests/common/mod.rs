@@ -156,8 +156,8 @@ pub struct Wire {
     /// Whether to read what arrives; while not, QUIC flow control holds the
     /// relay back, as it would for a member that stopped reading.
     reading: watch::Sender<bool>,
-    /// The DEMANDs the relay sent (GROUP.md §3.3), kept apart from the rest.
-    pub demands: Vec<u8>,
+    /// The DEMANDs the relay sent (GROUP.md §3.3), `(track, layers)`, kept apart from the rest.
+    pub demands: Vec<(u8, u8)>,
     _endpoint: quinn::Endpoint,
 }
 
@@ -268,7 +268,9 @@ impl Wire {
             // Longer than the join timeout, for tests that wait it out.
             let got = timeout(Duration::from_secs(20), self.got.recv()).await.expect("nothing arrived");
             match got.unwrap_or(Got::Closed(None)) {
-                Got::Frame(Class::Command, f) if f.len() == 2 && f[0] == wire::DEMAND => self.demands.push(f[1]),
+                Got::Frame(Class::Command, f) if f.len() == 3 && f[0] == wire::DEMAND => {
+                    self.demands.push((f[1], f[2]))
+                }
                 got => return got,
             }
         }

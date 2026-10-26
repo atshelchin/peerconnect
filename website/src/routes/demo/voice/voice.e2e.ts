@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 // Chromium's fake microphone (a beep) and camera (a moving pattern), and no
 // permission prompt.
@@ -26,8 +26,25 @@ test('a damaged link says so, in Chinese too', async ({ page }) => {
 	await expect(page.getByRole('button', { name: '创建房间' })).toBeVisible();
 });
 
-// Talks through the public relay, so it needs the network: run with
-// PEERCONNECT_DEMO_E2E=1.
+/**
+ * Opens a new room: on the relay `PEERCONNECT_DEMO_RELAY` names (a local
+ * `quic://127.0.0.1:<port>` one, say), else on the public one. Returns its link.
+ */
+async function newRoom(page: Page): Promise<string> {
+	const relay = process.env.PEERCONNECT_DEMO_RELAY;
+	if (relay) {
+		const { Group } = await import('peerconnect');
+		await page.goto(`/demo/voice#${encodeURIComponent(Group.create(relay).toString())}`);
+	} else {
+		await page.goto('/demo/voice');
+		await page.getByRole('button', { name: 'Create a room' }).click();
+		await expect(page).toHaveURL(/#[\w-]{43}$/);
+	}
+	return page.url();
+}
+
+// Talks through the public relay (or PEERCONNECT_DEMO_RELAY's), so it needs
+// the network: run with PEERCONNECT_DEMO_E2E=1.
 test('three browsers hear each other and chat', async ({ browser }) => {
 	test.skip(
 		!process.env.PEERCONNECT_DEMO_E2E,
@@ -38,10 +55,7 @@ test('three browsers hear each other and chat', async ({ browser }) => {
 		(await browser.newContext({ locale, permissions: ['microphone'] })).newPage();
 	const [a, b, c] = [await open(), await open('zh-CN'), await open()];
 
-	await a.goto('/demo/voice');
-	await a.getByRole('button', { name: 'Create a room' }).click();
-	await expect(a).toHaveURL(/#[\w-]{43}$/);
-	const link = a.url();
+	const link = await newRoom(a);
 	// Microphones on when joining (they are off unless asked for).
 	await a.getByLabel('Your name').fill('Alice');
 	await a.getByLabel('Microphone on when I join').check();
@@ -113,21 +127,22 @@ test('the camera turns on and off from our own card', async ({ page }) => {
 	const mine = page.locator('.person.mine');
 	await expect(mine.locator('.screen')).toHaveCount(0); // off until asked
 	await page.getByRole('button', { name: 'Turn your camera on: everyone sees you' }).click();
-	// What we send, as the others will see it: the fake camera is wide, sent at 720p.
+	// What we send, as the others will see it at best: the fake camera is wide and gives
+	// 1080p, which is sent too.
 	const preview = mine.locator('canvas.screen');
 	await expect(preview).toBeVisible();
 	const size = () => preview.evaluate((c: HTMLCanvasElement) => [c.width, c.height]);
-	await expect.poll(size, { timeout: 10_000 }).toEqual([1280, 720]);
+	await expect.poll(size, { timeout: 10_000 }).toEqual([1920, 1080]);
 	// Turned a quarter turn, for everyone: tall.
 	await page
 		.getByRole('button', { name: 'Turn your picture a quarter turn, for everyone' })
 		.click();
-	await expect.poll(size, { timeout: 10_000 }).toEqual([720, 1280]);
+	await expect.poll(size, { timeout: 10_000 }).toEqual([1080, 1920]);
 	await page.getByRole('button', { name: 'Turn your camera off' }).click();
 	await expect(mine.locator('.screen')).toHaveCount(0);
 });
 
-// Through the public relay too: run with PEERCONNECT_DEMO_E2E=1.
+// Through the public relay (or PEERCONNECT_DEMO_RELAY's) too: run with PEERCONNECT_DEMO_E2E=1.
 test('two browsers see each other on their cards', async ({ browser }) => {
 	test.skip(
 		!process.env.PEERCONNECT_DEMO_E2E,
@@ -137,12 +152,10 @@ test('two browsers see each other on their cards', async ({ browser }) => {
 	const open = async () =>
 		(await browser.newContext({ permissions: ['microphone', 'camera'] })).newPage();
 	const [a, b] = [await open(), await open()];
-	await a.goto('/demo/voice');
-	await a.getByRole('button', { name: 'Create a room' }).click();
-	await expect(a).toHaveURL(/#[\w-]{43}$/);
+	const link = await newRoom(a);
 	await a.getByLabel('Your name').fill('Alice');
 	await a.getByRole('button', { name: 'Join', exact: true }).click();
-	await b.goto(a.url());
+	await b.goto(link);
 	await b.getByLabel('Your name').fill('Bob');
 	await b.getByRole('button', { name: 'Join', exact: true }).click();
 	for (const page of [a, b])

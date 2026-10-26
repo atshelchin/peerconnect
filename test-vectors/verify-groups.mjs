@@ -65,9 +65,9 @@ assert.equal(v.endpoint, `${v.relay_url}/g1/${v.group_id_text}`);
 assert.deepEqual(hex(v.welcome_s), cat([0x83, 2], u32(1 << 0)));
 assert.deepEqual(hex(v.welcome_r), cat([0x83, 0], u32(1 << 2)));
 // SUBSCRIBE (slot, layer; 0xFF for none) and DEMAND (a bitmap of layers), §3.2.
-assert.deepEqual(hex(v.subscribe_r), Buffer.from([0x85, 2, 2]));
-assert.deepEqual(hex(v.subscribe_r_none), Buffer.from([0x85, 2, 0xff]));
-assert.deepEqual(hex(v.demand_s), Buffer.from([0x86, 0b110]));
+assert.deepEqual(hex(v.subscribe_r), Buffer.from([0x85, 2, 1, 2]));
+assert.deepEqual(hex(v.subscribe_r_none), Buffer.from([0x85, 2, 0, 0xff]));
+assert.deepEqual(hex(v.demand_s), Buffer.from([0x86, 1, 0b110]));
 // LIMIT: the largest layer the member's link takes now, 0xFF for none.
 assert.deepEqual(hex(v.limit_r), Buffer.from([0x87, 1]));
 assert.deepEqual(hex(v.limit_r_none), Buffer.from([0x87, 0xff]));
@@ -113,8 +113,8 @@ for (const [who, slot, to, echo] of [
 
 // §4.3, §5, §6: every sealed frame, rebuilt from its fields.
 const CONTROL = 0x02, COMMAND = 0x03, VOICE = 0x21, DATAGRAM = 0x22, CHAT = 0x41, BULK = 0x61;
-// Video fragments carry their layer and whether they are part of a keyframe in the type (§7.4).
-const video = (f) => 0x30 | (Number(f.layer) << 1) | (f.keyframe ? 1 : 0);
+// Video fragments carry their track, layer and whether they are part of a keyframe in the type (§7.4).
+const video = (f) => 0x30 | (Number(f.track) << 3) | (Number(f.layer) << 1) | (f.keyframe ? 1 : 0);
 // §7.4: track[1] frame[4] index[1] count[1] flags[1] timestamp[4] ‖ data.
 const fragment = (f) => cat([f.track], u32(f.frame), [f.index, f.count, f.keyframe ? 1 : 0], u32(f.timestamp), hex(f.data));
 const message = (f) => cat([0x00], u64(f.id), ascii(f.payload));

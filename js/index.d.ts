@@ -130,10 +130,10 @@ export interface GroupEventMap {
   /** Members need a keyframe of `layer` of our `track` (they lost some, or are moving to it): send one soon. */
   keyframerequest: CustomEvent<{ from: string; track: number; layer: number }>;
   /**
-   * Which of our video layers someone wants (bit n: layer n). Encode only those; for a
-   * wanted layer we do not send, the nearest below it, or else our lowest.
+   * Which layers of our video `track` (0 or 1) someone wants (bit n: layer n). Encode only
+   * those; for a wanted layer we do not send, the nearest below it, or else our lowest.
    */
-  videodemand: CustomEvent<{ layers: number }>;
+  videodemand: CustomEvent<{ track: number; layers: number }>;
   /**
    * The relay moved what our link takes (GROUP.md §3.3): video layers up to `layer`, 3
    * meaning all of them, or none (`null`: the link is too slow, audio only). It lowers this
@@ -166,22 +166,28 @@ export class GroupConnection extends EventTarget {
   readonly members: Map<string, Uint8Array>;
   /** The latest round trip to the relay in milliseconds. */
   readonly rtt: number | undefined;
+  /** Drops our video of `track` above `layer` still waiting to be sent (used by `peerconnect/video` when the uplink cannot carry a layer). */
+  dropQueuedVideo(track: number, layer: number): void;
   /** Whether a WebTransport session to the relay is open now. */
   readonly connected: boolean;
-  /** The latest "videodemand" (bit n: layer n is wanted), undefined until the relay says. */
-  readonly videoDemand: number | undefined;
+  /**
+   * The latest "videodemand" of each of our tracks: `videoDemand[track]` (bit n: layer n
+   * of that track is wanted), undefined until the relay says.
+   */
+  readonly videoDemand: readonly [number | undefined, number | undefined];
   /**
    * The latest "videolimit": the largest layer our link takes, 3 (all) until the relay says
    * otherwise and again on each new session; `null`, no video at all (audio only).
    */
   readonly videoLimit: number | null;
   /**
-   * How far our own video is backed up on the way out: bytes waiting to be sent now, and
-   * bytes dropped (the oldest, past the backlog) since we joined. Cheap to read;
+   * How far our own video is backed up on the way out: bytes waiting to be sent now (at
+   * most 256 KiB; beyond, the oldest is dropped), bytes dropped since we joined, and the
+   * pace video has been leaving at (bytes per second, smoothed). Cheap to read;
    * `peerconnect/video` reads it to stop its largest layer while the uplink cannot carry
    * them all.
    */
-  readonly videoBacklog: { queued: number; dropped: number };
+  readonly videoBacklog: { queued: number; dropped: number; pace: number };
   /** Broadcasts a message (up to 16,352 bytes) and returns its id. */
   send(channel: Channel, data: Data): number;
   /** Sends to one member only; not resent if the connection drops. */
@@ -191,18 +197,20 @@ export class GroupConnection extends EventTarget {
   /** Sends data that is dropped rather than delayed; false if not sent. */
   sendDatagram(data: Data, to?: string): boolean;
   /**
-   * Sends a video frame of `layer` (0–3, smallest picture first) of `track` (up to
-   * 255,000 bytes); the relay forwards each member the layer it subscribed to, which
-   * gets it whole and in order ("video"), or asks for a keyframe ("keyframerequest").
-   * False if not sent.
+   * Sends a video frame of `layer` (0–3, smallest picture first) of `track` (0 or 1: a
+   * camera and a screen, say), up to 255,000 bytes; the relay forwards each member the
+   * layer of each track it subscribed to, which gets it whole and in order ("video"), or
+   * asks for a keyframe ("keyframerequest"). False if not sent (another track or layer, a
+   * larger frame, not joined).
    */
   sendVideo(track: number, layer: number, keyframe: boolean, timestamp: number, data: Data): boolean;
   /**
-   * Asks the relay for `layer` (0–3) of `member`'s video from now on, `null` for none.
-   * It forwards the nearest layer `member` sends, switching at a keyframe; layer 0 (or
-   * the nearest) until asked.
+   * Asks the relay for `layer` (0–3) of `member`'s video `track` (0 or 1) from now on,
+   * `null` for none. It forwards the nearest layer `member` sends, switching at a
+   * keyframe; layer 0 (or the nearest) of each track until asked. Throws for another
+   * track or layer.
    */
-  subscribe(member: string, layer: number | null | undefined): void;
+  subscribe(member: string, track: number, layer: number | null | undefined): void;
   requestSync(from: string): void;
   provideSync(to: string, transfer: number, snapshot: Data): void;
   declineSync(to: string, transfer: number): void;

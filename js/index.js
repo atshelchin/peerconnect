@@ -162,8 +162,29 @@ export class Connection extends EventTarget {
 
 /** Bytes unsent on the voice stream beyond which voice frames are dropped. */
 const VOICE_BACKLOG = 4 << 10;
-/** Video waiting to be sent beyond which the oldest is dropped. */
-const VIDEO_BACKLOG = 64 << 10;
+/** Video waiting to be sent beyond which the oldest is dropped: room for a 1080p keyframe. */
+const VIDEO_BACKLOG = 256 << 10;
+/** Resent video is not queued behind more than this much video (see `WebTransportLink.send`). */
+const RESEND_ROOM = 32 << 10;
+/** Incoming datagrams the browser may hold for us: a keyframe's worth and more (255 fragments at most). */
+const INCOMING_DATAGRAMS = 1024;
+/** How often (ms, at least) the pace video leaves at is measured. */
+const PACE_EVERY = 100;
+/**
+ * The video pacer: video leaves at most this many times faster than it
+ * comes (smoothed over `OFFERED_EVERY` ms or so), at least at `PACER_MIN`
+ * bytes a second, and fast enough to send what waits within `PACER_DRAIN`
+ * ms, with `PACER_BURST` bytes, or 50 ms' worth, going at once. A keyframe
+ * (a 1080p one is 100–250 KB) then reaches the relay over a fraction of a
+ * second rather than all at once, and waits in our backlog rather than in
+ * the relay's budget for each receiver, which the frame after it would
+ * overflow; voice, behind it in the same datagram queue, waits less too.
+ */
+const PACER_FACTOR = 2.5;
+const PACER_MIN = 1 << 20;
+const PACER_DRAIN = 200;
+const PACER_BURST = 16 << 10;
+const OFFERED_EVERY = 500;
 /** WebTransport stream priorities, by class (0 command, 1 voice, 2 chat, 3 bulk, 4 video): higher goes first. */
 const SEND_ORDER = [4, 3, 2, 0, 1];
 
@@ -219,8 +240,12 @@ export class GroupConnection extends EventTarget {
   members = new Map();
   /** Our member ID. */
   id;
-  /** Which of our video layers the relay last said are wanted (bit n: layer n), if it has. */
-  videoDemand = undefined;
+  /**
+   * Which layers of each of our video tracks the relay last said are
+   * wanted: `videoDemand[track]` (track 0 or 1), bit n for layer n;
+   * undefined until it says.
+   */
+  videoDemand = [undefined, undefined];
   /**
    * The largest video layer our link takes now, as the relay last said
    * ("videolimit"): 3, all of them, until it says otherwise; `null`, none
@@ -238,6 +263,8 @@ export class GroupConnection extends EventTarget {
   #epoch = performance.now();
   /** Video bytes dropped by sessions before the open one. */
   #videoDropped = 0;
+  /** Within `sendVideo`: the video it puts out is new, not resent. */
+  #sendingVideo = false;
 
   constructor(group, identity, profile, webTransport) {
     super();
@@ -259,13 +286,24 @@ export class GroupConnection extends EventTarget {
 
   /**
    * How far our own video is backed up on the way out: bytes waiting to be
-   * sent now, and bytes dropped (the oldest, past the backlog) since we
-   * joined. Cheap to read: `peerconnect/video` reads it every frame to stop
-   * its largest layer while the uplink cannot carry them all.
+   * sent now, bytes dropped (the oldest, past the backlog) since we
+   * joined, and the pace video has been leaving at (bytes per second,
+   * smoothed), which says how long what waits will take. Cheap to read:
+   * `peerconnect/video` reads it every frame to stop its largest layer
+   * while the uplink cannot carry them all.
    */
+  /** Drops our video of `track` above `layer` still waiting to be sent (see `peerconnect/video`). */
+  dropQueuedVideo(track, layer) {
+    this.#link?.dropVideo(track, layer);
+  }
+
   get videoBacklog() {
     const link = this.#link;
-    return { queued: link?.videoQueued ?? 0, dropped: this.#videoDropped + (link?.videoDropped ?? 0) };
+    return {
+      queued: link?.videoQueued ?? 0,
+      dropped: this.#videoDropped + (link?.videoDropped ?? 0),
+      pace: link?.videoPace ?? 0,
+    };
   }
 
   /**
@@ -289,26 +327,33 @@ export class GroupConnection extends EventTarget {
 
   /**
    * Sends a video frame of `layer` (0–3, from the smallest picture up) of
-   * `track` (up to 255,000 bytes), cut into fragments that each fit a
-   * datagram; the relay forwards each member the layer it subscribed to,
+   * `track` (0 or 1: a camera and a screen, say), up to 255,000 bytes, cut
+   * into fragments that each fit a datagram; false for another track or
+   * layer, or a larger frame. The relay forwards each member the layer of
+   * each track it subscribed to,
    * and receivers get it whole, in order, as a "video" event, and ask for a
    * keyframe ("keyframerequest") when they lose one for good. Dropped,
    * oldest first, when the connection backs up. Send only the layers that
-   * "videodemand" says are wanted. See `startVideo` in `peerconnect/video`
-   * for camera video.
+   * "videodemand" says are wanted, track by track. See `startVideo` in
+   * `peerconnect/video` for camera and screen video.
    */
   sendVideo(track, layer, keyframe, timestamp, data) {
-    return this.#do(() => this.#member.sendVideo(track, layer, keyframe, timestamp >>> 0, bytes(data)));
+    this.#sendingVideo = true;
+    try {
+      return this.#do(() => this.#member.sendVideo(track, layer, keyframe, timestamp >>> 0, bytes(data)));
+    } finally {
+      this.#sendingVideo = false;
+    }
   }
 
   /**
-   * Asks the relay for `layer` of `member`'s video from now on (`null`: none
-   * of it), also after either of us reconnects. It forwards the nearest layer
-   * `member` sends, switching at a keyframe; until asked, layer 0 or the
-   * nearest.
+   * Asks the relay for `layer` of `member`'s video `track` (0 or 1) from
+   * now on (`null`: none of it), also after either of us reconnects. It
+   * forwards the nearest layer `member` sends, switching at a keyframe;
+   * until asked, layer 0 or the nearest, of each track.
    */
-  subscribe(member, layer) {
-    this.#do(() => this.#member.subscribe(member, layer ?? undefined));
+  subscribe(member, track, layer) {
+    this.#do(() => this.#member.subscribe(member, track, layer ?? undefined));
   }
 
   /** Sends data that is dropped rather than delayed, to one member or (no `to`) everyone. */
@@ -352,7 +397,8 @@ export class GroupConnection extends EventTarget {
           this.#open(out.url);
           break;
         case "send":
-          this.#send(out.data, out.class);
+          // Video sent other than by `sendVideo` is resent, asked for by a receiver.
+          this.#send(out.data, out.class, out.class === 4 && !this.#sendingVideo);
           break;
         case "ping":
           this.#link?.ping();
@@ -373,7 +419,7 @@ export class GroupConnection extends EventTarget {
           this.#emit(out);
           break;
         case "videodemand":
-          this.videoDemand = out.layers;
+          this.videoDemand[out.track] = out.layers;
           this.#emit(out);
           break;
         case "videolimit":
@@ -407,8 +453,8 @@ export class GroupConnection extends EventTarget {
     this.dispatchEvent(new CustomEvent("videolimit", { detail: { layer } }));
   }
 
-  #send(frame, kind) {
-    this.#link?.send(frame, kind);
+  #send(frame, kind, resent) {
+    this.#link?.send(frame, kind, resent);
   }
 
   /** Opens a WebTransport session to the group's endpoint. */
@@ -486,6 +532,11 @@ class WebTransportLink {
   /** Video bytes dropped from that queue, for falling behind. */
   #videoDropped = 0;
   #pacing = false;
+  /** The pace video leaves at (bytes per second, smoothed), and what has left since it was last measured. */
+  #pace = { rate: 0, since: performance.now(), bytes: 0, busy: false };
+  /** The pace video comes at, likewise, and the pacer's allowance (bytes that may go now). */
+  #offered = { rate: 0, since: performance.now(), bytes: 0 };
+  #allowance = { bytes: PACER_BURST, at: performance.now() };
 
   constructor(url, on, options) {
     this.#on = on;
@@ -502,6 +553,11 @@ class WebTransportLink {
         const datagrams = session.datagrams;
         // Voice older than this is worth nothing: let the browser drop it.
         if ("outgoingMaxAge" in datagrams) datagrams.outgoingMaxAge = 200;
+        // Chromium keeps one incoming datagram by default and drops the
+        // rest of a burst it is handed faster than we read: a 1080p
+        // keyframe arrives as some 250 at once.
+        if ("incomingHighWaterMark" in datagrams) datagrams.incomingHighWaterMark = INCOMING_DATAGRAMS;
+        if ("incomingMaxBufferedDatagrams" in datagrams) datagrams.incomingMaxBufferedDatagrams = INCOMING_DATAGRAMS;
         this.#datagrams = (datagrams.createWritable?.() ?? datagrams.writable).getWriter();
         this.#readStreams();
         this.#readDatagrams();
@@ -516,10 +572,18 @@ class WebTransportLink {
     );
   }
 
-  send(frame, kind) {
+  /** Queues a frame of class `kind`; `resent`: video a receiver asked for again. */
+  send(frame, kind, resent = false) {
     if (kind === 4) {
+      // Receivers ask for what is missing of a frame 5 ms after its first
+      // part (GROUP.md §7.4), sooner than a large one takes to arrive
+      // whole: while much of our video still waits here, what they ask
+      // for most likely does too, and sending it twice would only push out
+      // what follows.
+      if (resent && this.#videoBytes > RESEND_ROOM) return;
       this.#video.push(frame);
       this.#videoBytes += frame.length;
+      measure(this.#offered, frame.length, OFFERED_EVERY);
       while (this.#videoBytes > VIDEO_BACKLOG) {
         const dropped = this.#video.shift().length;
         this.#videoBytes -= dropped;
@@ -541,6 +605,18 @@ class WebTransportLink {
     this.#queue(0, new Uint8Array(0));
   }
 
+  /**
+   * Drops the video waiting here of `track` above `layer`, by the frame type
+   * (GROUP.md §7.4): a layer our uplink stopped, whose old frames would only
+   * delay the smaller ones behind them.
+   */
+  dropVideo(track, layer) {
+    const above = (frame) => frame[0] >= 0x30 && frame[0] <= 0x3f && ((frame[0] >> 3) & 1) === track && ((frame[0] >> 1) & 3) > layer;
+    const kept = this.#video.filter((frame) => !above(frame));
+    this.#videoBytes = kept.reduce((n, frame) => n + frame.length, 0);
+    this.#video = kept;
+  }
+
   /** Video bytes waiting for room among the datagrams (or on the video stream). */
   get videoQueued() {
     return this.#videoBytes + this.#queued[4];
@@ -548,6 +624,45 @@ class WebTransportLink {
 
   get videoDropped() {
     return this.#videoDropped;
+  }
+
+  get videoPace() {
+    return this.#pace.rate;
+  }
+
+  /**
+   * Video handed on to the browser. The pace is what leaves while video
+   * waits, which is what our uplink takes: time with nothing waiting is not
+   * counted, or a keyframe after a quiet spell would look slow to leave.
+   */
+  #videoLeft(bytes) {
+    const p = this.#pace;
+    const now = performance.now();
+    if (!p.busy) {
+      p.busy = true;
+      p.since = now;
+      p.bytes = 0;
+    }
+    p.bytes += bytes;
+    if (now - p.since >= PACE_EVERY) {
+      const rate = (p.bytes * 1000) / (now - p.since);
+      p.rate = p.rate ? 0.7 * p.rate + 0.3 * rate : rate;
+      p.since = now;
+      p.bytes = 0;
+    }
+    if (this.#videoBytes === 0) p.busy = false;
+  }
+
+  /** Milliseconds until the pacer lets `bytes` of video go; 0 (and taken from the allowance) if now. */
+  #paced(bytes) {
+    const now = performance.now();
+    const rate = Math.max(PACER_MIN, PACER_FACTOR * this.#offered.rate, (this.#videoBytes * 1000) / PACER_DRAIN);
+    const a = this.#allowance;
+    a.bytes = Math.min(Math.max(PACER_BURST, rate / 20), a.bytes + (rate * (now - a.at)) / 1000);
+    a.at = now;
+    if (a.bytes < bytes) return Math.max(1, ((bytes - a.bytes) * 1000) / rate);
+    a.bytes -= bytes;
+    return 0;
   }
 
   /**
@@ -572,8 +687,14 @@ class WebTransportLink {
           await Promise.race([writer.ready, new Promise((resolve) => setTimeout(resolve, 5))]);
           continue;
         }
+        const wait = this.#paced(frame.length);
+        if (wait) {
+          await new Promise((resolve) => setTimeout(resolve, wait));
+          continue;
+        }
         this.#videoBytes -= this.#video.shift().length;
         writer.write(frame).catch(() => {});
+        this.#videoLeft(frame.length);
       }
     } finally {
       this.#pacing = false;
@@ -625,6 +746,7 @@ class WebTransportLink {
         const batch = concat(this.#queues[kind].splice(0));
         this.#queued[kind] = 0;
         writer.write(batch).catch(() => {});
+        if (kind === 4) this.#videoLeft(batch.length);
       }
     } catch {
       // The session is gone: `closed` says so.
@@ -675,6 +797,16 @@ class WebTransportLink {
       this.#on?.binary(this, value);
     }
   }
+}
+
+/** Adds `bytes` to a rate measured every `every` ms or so: bytes per second, smoothed. */
+function measure(m, bytes, every) {
+  m.bytes += bytes;
+  const now = performance.now();
+  if (now - m.since < every) return;
+  m.rate = 0.7 * m.rate + (0.3 * m.bytes * 1000) / (now - m.since);
+  m.since = now;
+  m.bytes = 0;
 }
 
 function concat(parts) {

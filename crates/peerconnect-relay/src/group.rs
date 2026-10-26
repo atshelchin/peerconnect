@@ -41,8 +41,11 @@ const BACKLOG: usize = 256 << 10;
 /// How long senders wait for a recipient to work off its backlog before
 /// it is disconnected.
 const BACKLOG_WAIT: Duration = Duration::from_secs(5);
-/// Video bytes queued towards a member beyond which its link is not keeping
-/// up (some 170 ms of 720p), if that lasts (GROUP.md §3.3).
+/// Video queued towards a member beyond which its link is not keeping up,
+/// if that lasts (GROUP.md §3.3): what takes this long to send at the pace
+/// it is being sent, and at least [`VIDEO_CONGESTED`] bytes, so that a
+/// keyframe passing through is no sign of trouble.
+const VIDEO_CONGESTED_FOR: Duration = Duration::from_millis(250);
 const VIDEO_CONGESTED: usize = 32 << 10;
 
 /// The slots of one group, and which layer of whose video goes to whom.
@@ -62,9 +65,9 @@ fn now_ms() -> u64 {
 /// Sends DEMAND to every sender whose wanted layers changed, and LIMIT to
 /// every receiver whose link limit did.
 fn tell_demands(slots: &[Option<Seat>; gwire::MAX_SLOTS], router: &mut VideoRouter) {
-    for (slot, layers) in router.demands() {
+    for (slot, track, layers) in router.demands() {
         if let Some(seat) = &slots[slot as usize] {
-            seat.outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::demand(layers)));
+            seat.outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::demand(track, layers)));
         }
     }
     for (slot, layer) in router.limits() {
@@ -101,6 +104,18 @@ pub(crate) struct Outbox {
     video_limit: usize,
     /// Video was dropped since the video router last asked.
     video_dropped: std::sync::atomic::AtomicBool,
+    /// The pace video leaves at while some waits, bytes per second
+    /// (smoothed): what the member's link takes.
+    video_pace: Mutex<Pace>,
+    traffic: Arc<crate::traffic::Traffic>,
+}
+
+/// How fast video leaves, while some waits.
+struct Pace {
+    since: Instant,
+    bytes: usize,
+    rate: f64,
+    busy: bool,
 }
 
 #[derive(Default)]
@@ -118,7 +133,12 @@ impl Queues {
 }
 
 impl Outbox {
-    pub(crate) fn new(limit: usize, voice_limit: usize, video_limit: usize) -> Arc<Outbox> {
+    pub(crate) fn new(
+        limit: usize,
+        voice_limit: usize,
+        video_limit: usize,
+        traffic: Arc<crate::traffic::Traffic>,
+    ) -> Arc<Outbox> {
         Arc::new(Outbox {
             queues: Mutex::default(),
             ready: Notify::new(),
@@ -130,6 +150,8 @@ impl Outbox {
             voice_limit,
             video_limit,
             video_dropped: std::sync::atomic::AtomicBool::new(false),
+            video_pace: Mutex::new(Pace { since: Instant::now(), bytes: 0, rate: 0.0, busy: false }),
+            traffic,
         })
     }
 
@@ -170,7 +192,18 @@ impl Outbox {
     /// waiting, and whether some was dropped since it last asked.
     fn video_link(&self) -> (bool, bool) {
         let queued = self.queues.lock().unwrap().bytes[Class::Video.index()];
-        (queued > VIDEO_CONGESTED, self.video_dropped.swap(false, Ordering::Relaxed))
+        let pace = self.video_pace.lock().unwrap().rate;
+        let long = queued as f64 > pace * VIDEO_CONGESTED_FOR.as_secs_f64();
+        (queued > VIDEO_CONGESTED && long, self.video_dropped.swap(false, Ordering::Relaxed))
+    }
+
+    /// Drops the video queued: its link was moved to smaller layers, and the
+    /// larger frames ahead of them would only delay them.
+    fn drop_video(&self) {
+        let mut q = self.queues.lock().unwrap();
+        let video = Class::Video.index();
+        q.classes[video].clear();
+        q.bytes[video] = 0;
     }
 
     /// Waits until the recipient's command and chat backlog is below
@@ -228,12 +261,35 @@ impl Outbox {
             let msg = q.classes[class].pop_front().unwrap();
             q.bytes[class] -= msg.len();
             taken += msg.len().max(1);
+            if class == Class::Video.index() {
+                self.video_left(msg.len(), q.bytes[class]);
+            }
+            self.traffic.sent(msg.len());
             batch.push(msg);
         }
         if q.backlog() <= BACKLOG && self.waiting.load(Ordering::SeqCst) > 0 {
             self.drained.notify_waiters();
         }
         batch
+    }
+
+    /// Video bytes on their way out, `waiting` still queued: the pace video
+    /// leaves at while some waits, measured every tenth of a second or so.
+    /// Time with nothing waiting is not counted, or a keyframe after a quiet
+    /// spell would look slow to leave.
+    fn video_left(&self, bytes: usize, waiting: usize) {
+        let mut p = self.video_pace.lock().unwrap();
+        if !p.busy {
+            (p.busy, p.since, p.bytes) = (true, Instant::now(), 0);
+        }
+        p.bytes += bytes;
+        let elapsed = p.since.elapsed();
+        if elapsed >= Duration::from_millis(100) {
+            let rate = p.bytes as f64 / elapsed.as_secs_f64();
+            p.rate = if p.rate > 0.0 { 0.7 * p.rate + 0.3 * rate } else { rate };
+            (p.since, p.bytes) = (Instant::now(), 0);
+        }
+        p.busy = waiting > 0;
     }
 
     /// Takes frames of `class` from the front while they add up to at most
@@ -250,6 +306,10 @@ impl Outbox {
             let msg = q.classes[i].pop_front().unwrap();
             q.bytes[i] -= msg.len();
             taken += msg.len();
+            if class == Class::Video {
+                self.video_left(msg.len(), q.bytes[i]);
+            }
+            self.traffic.sent(msg.len());
             batch.push(msg);
         }
         batch
@@ -321,25 +381,36 @@ impl GroupRoom {
         Some(slot as u8)
     }
 
-    /// The connection in `slot` wants `layer` of `other`'s video.
-    fn subscribe(&self, id: u64, slot: u8, other: u8, layer: Option<u8>) {
+    /// The connection in `slot` wants `layer` of `other`'s video `track`.
+    fn subscribe(&self, id: u64, slot: u8, other: u8, track: u8, layer: Option<u8>) {
         let slots = self.slots.lock().unwrap();
         if holds(&slots, slot, id) {
             let mut router = self.router.lock().unwrap();
-            router.subscribe(slot, other, layer);
+            router.subscribe(slot, other, track, layer);
             tell_demands(&slots, &mut router);
         }
     }
 
     /// Fans a frame out. Returns the recipients that are behind (to wait
     /// for), or `None` once this connection no longer holds its slot.
-    fn forward(&self, id: u64, slot: u8, to: Option<u8>, class: Class, msg: Bytes) -> Option<Vec<Arc<Outbox>>> {
+    fn forward(
+        &self,
+        id: u64,
+        slot: u8,
+        to: Option<u8>,
+        class: Class,
+        msg: Bytes,
+        ceiling: u8,
+    ) -> Option<Vec<Arc<Outbox>>> {
         let slots = self.slots.lock().unwrap();
         if !holds(&slots, slot, id) {
             return None;
         }
         // Video to everyone goes to each in the layer it wants (GROUP.md §3.3).
         let mut router = (class == Class::Video && to.is_none()).then(|| self.router.lock().unwrap());
+        if let Some(router) = &mut router {
+            router.set_ceiling(ceiling);
+        }
         let now = now_ms();
         let mut behind = Vec::new();
         for (i, seat) in slots.iter().enumerate() {
@@ -347,7 +418,9 @@ impl GroupRoom {
                 && to.map_or(i != slot as usize, |to| i == to as usize)
                 && router.as_mut().is_none_or(|r| {
                     let (congested, dropped) = seat.outbox.video_link();
-                    r.link(now, i as u8, congested, dropped);
+                    if r.link(now, i as u8, congested, dropped) {
+                        seat.outbox.drop_video();
+                    }
                     r.forward(now, slot, i as u8, msg[0])
                 })
                 && seat.outbox.push(class, msg.clone())
@@ -417,7 +490,7 @@ impl Bucket {
 impl Relay {
     pub(crate) fn group_outbox(&self) -> Arc<Outbox> {
         let config = &self.config;
-        Outbox::new(config.group_queue_bytes, config.voice_queue_bytes, config.video_queue_bytes)
+        Outbox::new(config.group_queue_bytes, config.voice_queue_bytes, config.video_queue_bytes, self.traffic.clone())
     }
 
     /// Runs a group connection: reads `link`, while `writer` drains `outbox`.
@@ -481,7 +554,7 @@ impl Relay {
                         Some(wait) if !wait.is_zero() => sleep(wait).await,
                         Some(_) => {}
                     }
-                    let Some(behind) = room.forward(*id, *slot, to, class, msg) else {
+                    let Some(behind) = room.forward(*id, *slot, to, class, msg, self.traffic.ceiling()) else {
                         break; // replaced
                     };
                     // Hold this sender back until slow recipients catch up
@@ -494,9 +567,9 @@ impl Relay {
                         }
                     }
                 }
-                GroupAction::Subscribe { slot: other, layer } => {
+                GroupAction::Subscribe { slot: other, track, layer } => {
                     if let Some((room, id, slot)) = &seated {
-                        room.subscribe(*id, *slot, other, layer);
+                        room.subscribe(*id, *slot, other, track, layer);
                     }
                 }
                 GroupAction::Close(code) => break outbox.close(code),
@@ -538,7 +611,7 @@ mod tests {
 
     #[test]
     fn outbox_sends_urgent_first_and_drops_late_voice() {
-        let outbox = Outbox::new(1 << 20, 100, 1000);
+        let outbox = Outbox::new(1 << 20, 100, 1000, crate::traffic::Traffic::new());
         outbox.push(Class::Bulk, Bytes::from(vec![0x61, 0, 0xFF]));
         outbox.push(Class::Chat, Bytes::from(vec![0x41, 0, 0xFF]));
         outbox.push(Class::Voice, Bytes::from(vec![0x21, 0, 0xFF]));
@@ -559,7 +632,7 @@ mod tests {
 
     #[test]
     fn video_beyond_its_budget_loses_its_oldest() {
-        let outbox = Outbox::new(1 << 20, 100, 1000);
+        let outbox = Outbox::new(1 << 20, 100, 1000, crate::traffic::Traffic::new());
         for i in 0..5u8 {
             outbox
                 .push(Class::Video, Bytes::from(vec![0x31, i, 0xFF].into_iter().chain([0; 297]).collect::<Vec<u8>>()));
@@ -577,7 +650,7 @@ mod tests {
 
     #[test]
     fn outbox_overflow_closes_and_purge_forgets_a_slot() {
-        let outbox = Outbox::new(100, 100, 1000);
+        let outbox = Outbox::new(100, 100, 1000, crate::traffic::Traffic::new());
         outbox.push(Class::Chat, Bytes::from(vec![0x41, 3, 0xFF, 0]));
         outbox.push(Class::Chat, Bytes::from(vec![0x41, 4, 0xFF, 0]));
         outbox.push(Class::Command, Bytes::copy_from_slice(&gwire::member(3, true)));
@@ -591,14 +664,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_backlog_holds_senders_back_until_it_drains() {
-        let outbox = Outbox::new(4 << 20, 100, 1000);
+        let outbox = Outbox::new(4 << 20, 100, 1000, crate::traffic::Traffic::new());
         let mut behind = false;
         for _ in 0..20 {
             behind = outbox.push(Class::Chat, Bytes::from(vec![0x41; 16 << 10]));
         }
         assert!(behind);
         // Bulk does not count: it has its own window.
-        let bulk = Outbox::new(4 << 20, 100, 1000);
+        let bulk = Outbox::new(4 << 20, 100, 1000, crate::traffic::Traffic::new());
         assert!(!bulk.push(Class::Bulk, Bytes::from(vec![0x61; 1 << 20])));
 
         let reader = outbox.clone();
@@ -613,7 +686,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_recipient_that_does_not_catch_up_is_dropped() {
-        let outbox = Outbox::new(4 << 20, 100, 1000);
+        let outbox = Outbox::new(4 << 20, 100, 1000, crate::traffic::Traffic::new());
         for _ in 0..20 {
             outbox.push(Class::Command, Bytes::from(vec![0x03; 16 << 10]));
         }

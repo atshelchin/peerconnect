@@ -98,23 +98,31 @@ const BULK_CHUNK: usize = 4 << 10;
 /// Snapshot bytes held that arrived before their SYNC_BEGIN, at most: more
 /// than a provider's window lets it send unacknowledged.
 const MAX_EARLY_BULK: usize = 2 << 20;
-/// Sealed frame types, each with its own counter: video's are a layer and
-/// whether a keyframe (GROUP.md §7.4).
-const SEALED: [u8; 14] = [
+/// Sealed frame types, each with its own counter: video's (0x30–0x3F) are
+/// a track, a layer and whether a keyframe (GROUP.md §7.4).
+const SEALED: [u8; 22] = [
     wire::CONTROL,
     wire::COMMAND,
     wire::VOICE,
     wire::DATAGRAM,
     wire::CHAT,
     wire::BULK,
-    wire::VIDEO,
-    wire::VIDEO + 1,
-    wire::VIDEO + 2,
-    wire::VIDEO + 3,
-    wire::VIDEO + 4,
-    wire::VIDEO + 5,
-    wire::VIDEO + 6,
-    wire::VIDEO + 7,
+    0x30,
+    0x31,
+    0x32,
+    0x33,
+    0x34,
+    0x35,
+    0x36,
+    0x37,
+    0x38,
+    0x39,
+    0x3A,
+    0x3B,
+    0x3C,
+    0x3D,
+    0x3E,
+    0x3F,
 ];
 
 #[derive(Debug, Clone)]
@@ -241,10 +249,11 @@ pub enum Event {
         track: u8,
         layer: u8,
     },
-    /// The relay says which of our video layers someone wants (bit n: layer
-    /// n). Encode those, and no others; for a wanted layer we do not send,
-    /// send the nearest below it, or else our lowest (GROUP.md §7.4).
+    /// The relay says which layers of our video `track` someone wants (bit
+    /// n: layer n). Encode those, and no others; for a wanted layer we do not
+    /// send, send the nearest below it, or else our lowest (GROUP.md §7.4).
     VideoDemand {
+        track: u8,
         layers: u8,
     },
     /// The relay says how much video our link takes now: layers up to
@@ -356,9 +365,9 @@ pub struct Member {
     video_out: video::Outgoing,
     /// Others' video being put back together, by slot.
     video_in: Vec<(u8, video::Incoming)>,
-    /// The layer of each member's video we asked the relay for, by member:
-    /// asked again whenever the member is (re)admitted.
-    subscriptions: Vec<(MemberId, Option<u8>)>,
+    /// The layer of each member's video tracks we asked the relay for, by
+    /// member and track: asked again whenever the member is (re)admitted.
+    subscriptions: Vec<(MemberId, u8, Option<u8>)>,
 }
 
 /// Messages we broadcast, kept for resending.
@@ -855,8 +864,8 @@ impl Member {
             Phase::Joined(_) => match kind {
                 wire::MEMBER => self.handle_member(now, frame),
                 wire::DEMAND => {
-                    if let &[_, layers, ..] = frame {
-                        self.emit(Event::VideoDemand { layers });
+                    if let &[_, track, layers, ..] = frame {
+                        self.emit(Event::VideoDemand { track, layers });
                     }
                 }
                 wire::LIMIT => {
@@ -939,7 +948,8 @@ impl Member {
     }
 
     /// Sends a video frame (at most [`wire::MAX_VIDEO_FRAME`] bytes) of
-    /// `layer` (0 to 3, from the smallest picture up) of `track` to everyone,
+    /// `layer` (0 to 3, from the smallest picture up) of `track` (0 or 1: a
+    /// camera and a screen, say) to everyone,
     /// cut into fragments that each fit a datagram (GROUP.md §7.4). Frames are
     /// numbered per track and layer; receivers deliver them whole and in
     /// order, ask for lost fragments once, and drop what follows a frame lost
@@ -948,44 +958,41 @@ impl Member {
     /// ([`Member::subscribe`]); [`Event::VideoDemand`] says which are wanted.
     /// Returns false if it was not sent.
     pub fn send_video(&mut self, track: u8, layer: u8, keyframe: bool, timestamp: u32, data: &[u8]) -> bool {
-        if self.joined().is_none() || layer >= wire::VIDEO_LAYERS {
+        if self.joined().is_none() || track >= wire::VIDEO_TRACKS || layer >= wire::VIDEO_LAYERS {
             return false;
         }
         let Some(fragments) = self.video_out.send(self.clock, track, layer, keyframe, timestamp, data) else {
             return false;
         };
         for fragment in fragments {
-            if !self.seal_to(wire::video_type(layer, keyframe), BROADCAST, &fragment) {
+            if !self.seal_to(wire::video_type(track, layer, keyframe), BROADCAST, &fragment) {
                 return false;
             }
         }
         true
     }
 
-    /// Asks the relay for `layer` of `member`'s video (`None`: none of it),
-    /// from now on and whenever `member` is back after a reconnection. The
-    /// relay forwards the nearest layer the member sends, moving at a
-    /// keyframe; until a member says, the relay forwards layer 0 or the
-    /// nearest. Asks `member` for a keyframe of that layer, to move soon.
-    pub fn subscribe(&mut self, member: MemberId, layer: Option<u8>) -> Result<(), SendError> {
+    /// Asks the relay for `layer` of `member`'s video `track` (`None`: none
+    /// of it), from now on and whenever `member` is back after a
+    /// reconnection. The relay forwards the nearest layer the member sends,
+    /// moving at a keyframe; until a member says, the relay forwards layer 0
+    /// or the nearest. Asks `member` for a keyframe of that layer, to move soon.
+    pub fn subscribe(&mut self, member: MemberId, track: u8, layer: Option<u8>) -> Result<(), SendError> {
         if self.state == State::Closed {
             return Err(SendError::Closed);
         }
-        if layer.is_some_and(|l| l >= wire::VIDEO_LAYERS) {
+        if track >= wire::VIDEO_TRACKS || layer.is_some_and(|l| l >= wire::VIDEO_LAYERS) {
             return Err(SendError::TooLarge);
         }
-        match self.subscriptions.iter_mut().find(|(m, _)| *m == member) {
-            Some((_, l)) => *l = layer,
-            None => self.subscriptions.push((member, layer)),
+        match self.subscriptions.iter_mut().find(|(m, t, _)| (*m, *t) == (member, track)) {
+            Some((_, _, l)) => *l = layer,
+            None => self.subscriptions.push((member, track, layer)),
         }
         let Some(slot) = self.slot_of_member(member) else { return Ok(()) };
-        self.send_subscription(slot, layer);
-        if let Some(layer) = layer {
-            let tracks: Vec<u8> =
-                self.video_in.iter().filter(|(s, _)| *s == slot).flat_map(|(_, v)| v.tracks()).collect();
-            for track in tracks {
-                self.seal_to(wire::CONTROL, slot, &[control::KEYFRAME_REQUEST, track, layer]);
-            }
+        self.send_subscription(slot, track, layer);
+        let seen = self.video_in.iter().any(|(s, v)| *s == slot && v.tracks().contains(&track));
+        if let (true, Some(layer)) = (seen, layer) {
+            self.seal_to(wire::CONTROL, slot, &[control::KEYFRAME_REQUEST, track, layer]);
         }
         Ok(())
     }
@@ -999,9 +1006,11 @@ impl Member {
         let mut asks = Vec::new();
         for (slot, v) in &self.video_in {
             let Some(member) = self.admitted(*slot).map(|a| a.identity) else { continue };
-            let wanted = self.subscriptions.iter().find(|(m, _)| *m == member).map_or(Some(0), |&(_, l)| l);
-            if let Some(wanted) = wanted {
-                asks.extend(v.tracks().into_iter().map(|track| (*slot, track, wanted.min(limit))));
+            for track in v.tracks() {
+                let wanted = self.subscriptions.iter().find(|(m, t, _)| (*m, *t) == (member, track));
+                if let Some(wanted) = wanted.map_or(Some(0), |&(_, _, l)| l) {
+                    asks.push((*slot, track, wanted.min(limit)));
+                }
             }
         }
         for (slot, track, layer) in asks {
@@ -1009,9 +1018,9 @@ impl Member {
         }
     }
 
-    fn send_subscription(&mut self, slot: u8, layer: Option<u8>) {
+    fn send_subscription(&mut self, slot: u8, track: u8, layer: Option<u8>) {
         if self.joined().is_some() {
-            self.output.push_back(Output::Send(wire::subscribe(slot, layer).to_vec(), Class::Command));
+            self.output.push_back(Output::Send(wire::subscribe(slot, track, layer).to_vec(), Class::Command));
         }
     }
 
@@ -1281,8 +1290,10 @@ impl Member {
         let Some(remote) = self.joined_mut().and_then(|j| j.remotes[slot as usize].as_mut()) else { return };
         remote.state = Admission::Admitted(announce);
         self.emit(Event::Joined { member: identity, profile });
-        if let Some(&(_, layer)) = self.subscriptions.iter().find(|(m, _)| *m == identity) {
-            self.send_subscription(slot, layer);
+        let again: Vec<(u8, Option<u8>)> =
+            self.subscriptions.iter().filter(|(m, _, _)| *m == identity).map(|&(_, t, l)| (t, l)).collect();
+        for (track, layer) in again {
+            self.send_subscription(slot, track, layer);
         }
         for channel in [Channel::Command, Channel::Chat] {
             let start = match channel {
@@ -1373,9 +1384,10 @@ impl Member {
                 }
             }
             wire::DATAGRAM => self.emit(Event::Datagram { from: sender, data: plaintext }),
-            kind if let Some((layer, keyframe)) = wire::video_layer(kind) => {
-                // The relay switches layers by the type's keyframe bit: it must not lie.
-                if video::parse(&plaintext).is_none_or(|f| f.keyframe != keyframe) {
+            kind if let Some((track, layer, keyframe)) = wire::video_kind(kind) => {
+                // The relay routes by the type's track and switches layers by
+                // its keyframe bit: they must not lie.
+                if video::parse(&plaintext).is_none_or(|f| f.track != track || f.keyframe != keyframe) {
                     return;
                 }
                 let now = self.clock;
@@ -1447,11 +1459,11 @@ impl Member {
                     self.pump_transfers();
                 }
             }
-            control::VIDEO_NACK if data.len() >= 7 && data[1] < wire::VIDEO_LAYERS => {
+            control::VIDEO_NACK if data.len() >= 7 && data[0] < wire::VIDEO_TRACKS && data[1] < wire::VIDEO_LAYERS => {
                 let (track, layer, frame) = (data[0], data[1], u32_at(data, 2));
                 for fragment in self.video_out.resend(self.clock, track, layer, frame, &data[6..]) {
                     let keyframe = video::parse(&fragment).is_some_and(|f| f.keyframe);
-                    self.seal_to(wire::video_type(layer, keyframe), from, &fragment);
+                    self.seal_to(wire::video_type(track, layer, keyframe), from, &fragment);
                 }
             }
             control::KEYFRAME_REQUEST if data.len() >= 2 && data[1] < wire::VIDEO_LAYERS => {
@@ -2211,7 +2223,7 @@ mod tests {
         // The keyframe's second fragment is lost, the first time only.
         let mut broadcast = 0;
         let (_, got) = video_between(&mut a, &mut b, 1, 200, |f| {
-            if wire::video_layer(f[0]).is_none() || f[2] != BROADCAST {
+            if wire::video_kind(f[0]).is_none() || f[2] != BROADCAST {
                 return false;
             }
             broadcast += 1;
@@ -2229,7 +2241,7 @@ mod tests {
         assert!(a.send_video(0, 0, false, 1, b"lost"));
         assert!(a.send_video(0, 0, false, 2, b"after"));
         // Frame 1 never arrives, nor do its resends.
-        let lost = |f: &[u8]| f[0] == wire::video_type(0, false) && f.len() == 7 + 12 + 4 + 16;
+        let lost = |f: &[u8]| f[0] == wire::video_type(0, 0, false) && f.len() == 7 + 12 + 4 + 16;
         let (asked, got) = video_between(&mut a, &mut b, 1, 600, lost);
         assert_eq!(frames_from(&got, ia), [(true, 0, b"key".to_vec())], "frame 2 cannot be decoded without 1");
         assert!(
@@ -2253,13 +2265,14 @@ mod tests {
         let types: Vec<u8> = std::iter::from_fn(|| a.poll_output())
             .filter_map(|o| if let Output::Send(f, _) = o { Some(f[0]) } else { None })
             .collect();
-        assert_eq!(types, [wire::video_type(1, true), wire::video_type(2, true)]);
+        assert_eq!(types, [wire::video_type(0, 1, true), wire::video_type(0, 2, true)]);
+        assert!(!a.send_video(wire::VIDEO_TRACKS, 0, true, 0, b"x"), "no such track");
 
         // b asks the relay for layer 2 of a's video, and asks a for a keyframe of it once it has seen a's video.
         assert!(a.send_video(0, 1, false, 33, b"small delta"));
         let (_, got) = video_between(&mut a, &mut b, 1, 10, |_| false);
         assert!(got.is_empty() || frames_from(&got, ia).len() <= 1);
-        b.subscribe(ia, Some(2)).unwrap();
+        b.subscribe(ia, 0, Some(2)).unwrap();
         let mut relay = Vec::new();
         let mut peer = Vec::new();
         while let Some(out) = b.poll_output() {
@@ -2267,7 +2280,7 @@ mod tests {
                 if f[0] >= 0x80 { relay.push(f) } else { peer.push(f) }
             }
         }
-        assert_eq!(relay, [wire::subscribe(0, Some(2)).to_vec()]);
+        assert_eq!(relay, [wire::subscribe(0, 0, Some(2)).to_vec()]);
         for f in &peer {
             a.handle_binary(20, f);
         }
@@ -2275,14 +2288,15 @@ mod tests {
             .filter_map(|o| if let Output::Event(e) = o { Some(e) } else { None })
             .collect();
         assert!(asked.contains(&Event::KeyframeRequest { from: ib, track: 0, layer: 2 }), "{asked:?}");
-        assert_eq!(b.subscribe(ia, Some(wire::VIDEO_LAYERS)), Err(SendError::TooLarge));
+        assert_eq!(b.subscribe(ia, 0, Some(wire::VIDEO_LAYERS)), Err(SendError::TooLarge));
+        assert_eq!(b.subscribe(ia, wire::VIDEO_TRACKS, Some(0)), Err(SendError::TooLarge));
 
         // The relay's DEMAND reaches the application.
-        a.handle_binary(30, &wire::demand(0b110));
+        a.handle_binary(30, &wire::demand(1, 0b110));
         let demand: Vec<Event> = std::iter::from_fn(|| a.poll_output())
             .filter_map(|o| if let Output::Event(e) = o { Some(e) } else { None })
             .collect();
-        assert_eq!(demand, [Event::VideoDemand { layers: 0b110 }]);
+        assert_eq!(demand, [Event::VideoDemand { track: 1, layers: 0b110 }]);
     }
 
     #[test]

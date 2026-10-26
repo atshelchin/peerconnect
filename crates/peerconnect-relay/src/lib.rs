@@ -45,8 +45,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 mod group;
 pub mod quic;
 mod tls;
+mod traffic;
 
 pub use tls::Tls;
+pub use traffic::Budget;
 
 /// A connection that accepts nothing forwarded to it for this long is closed.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,6 +93,9 @@ pub struct Config {
     /// files change. Without it the relay serves plain `ws://`, and raw QUIC
     /// with a certificate of its own making.
     pub tls: Option<Tls>,
+    /// What the relay may send members of groups, a month and a second:
+    /// beyond it, everyone's video shrinks (voice and the rest never do).
+    pub budget: Budget,
 }
 
 impl Default for Config {
@@ -103,10 +108,11 @@ impl Default for Config {
             max_group_members: peerconnect::group::wire::MAX_SLOTS,
             group_queue_bytes: 2 << 20,
             voice_queue_bytes: 8 << 10,
-            video_queue_bytes: 64 << 10,
+            video_queue_bytes: 256 << 10,
             group_rate: 2 << 20,
             group_burst: 4 << 20,
             tls: None,
+            budget: Budget::default(),
         }
     }
 }
@@ -144,9 +150,11 @@ pub async fn serve_all(
         slots: Arc::new(Semaphore::new(config.max_connections)),
         next_id: AtomicU64::new(0),
         stop: watch::channel(false).0,
+        traffic: traffic::Traffic::new(),
         config,
     });
     let watcher = tokio::spawn(certificate.clone().watch());
+    tokio::spawn(traffic::watch(relay.traffic.clone(), relay.config.budget.clone(), relay.stop.subscribe()));
     if let Some(endpoint) = &endpoint {
         tokio::spawn(relay.clone().serve_quic(endpoint.clone()));
     }
@@ -180,6 +188,8 @@ struct Relay {
     slots: Arc<Semaphore>,
     next_id: AtomicU64,
     stop: watch::Sender<bool>,
+    /// What group connections send, and the video ceiling that keeps it in budget.
+    traffic: Arc<traffic::Traffic>,
     config: Config,
 }
 

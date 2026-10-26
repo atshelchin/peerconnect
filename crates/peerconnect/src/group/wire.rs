@@ -15,10 +15,11 @@ pub const JOIN: u8 = 0x81;
 pub const WELCOME: u8 = 0x83;
 /// Relay → member: `slot[1] present[1]`.
 pub const MEMBER: u8 = 0x84;
-/// Member → relay: `slot[1] layer[1]`, the layer of that member's video to
-/// forward us ([`NO_VIDEO`]: none).
+/// Member → relay: `slot[1] track[1] layer[1]`, the layer of that member's
+/// video track to forward us ([`NO_VIDEO`]: none).
 pub const SUBSCRIBE: u8 = 0x85;
-/// Relay → member: `layers[1]`, a bitmap of our video layers someone wants.
+/// Relay → member: `track[1] layers[1]`, a bitmap of the layers of our
+/// video track someone wants.
 pub const DEMAND: u8 = 0x86;
 /// Relay → member: `layer[1]`, the largest video layer our link takes now
 /// ([`NO_VIDEO`]: none, audio only).
@@ -34,10 +35,13 @@ pub const COMMAND: u8 = 0x03;
 pub const VOICE: u8 = 0x21;
 /// Application data that is dropped rather than delayed (positions, poses).
 pub const DATAGRAM: u8 = 0x22;
-/// Fragments of video frames (GROUP.md §7.4): `VIDEO | layer << 1 |
-/// keyframe`, 0x30–0x37, so that a relay can forward each member the layer
-/// it wants, and switch layers at a keyframe, without reading anything else.
+/// Fragments of video frames (GROUP.md §7.4): `VIDEO | track << 3 | layer
+/// << 1 | keyframe`, 0x30–0x3F, so that a relay can forward each member the
+/// layer it wants of each track, and switch layers at a keyframe, without
+/// reading anything else.
 pub const VIDEO: u8 = 0x30;
+/// Video tracks a member may send: 0 (a camera, say) and 1 (a screen).
+pub const VIDEO_TRACKS: u8 = 2;
 /// Video layers, from 0 (the smallest) up.
 pub const VIDEO_LAYERS: u8 = 4;
 pub const CHAT: u8 = 0x41;
@@ -70,15 +74,16 @@ pub const MAX_VIDEO_FRAGMENT: usize = 1000;
 pub const MAX_VIDEO_FRAME: usize = 255 * MAX_VIDEO_FRAGMENT;
 pub const MAX_PROFILE_LEN: usize = 1024;
 
-/// The type of a video fragment of `layer`.
-pub fn video_type(layer: u8, keyframe: bool) -> u8 {
-    debug_assert!(layer < VIDEO_LAYERS);
-    VIDEO | layer << 1 | keyframe as u8
+/// The type of a video fragment of `layer` of `track`.
+pub fn video_type(track: u8, layer: u8, keyframe: bool) -> u8 {
+    debug_assert!(track < VIDEO_TRACKS && layer < VIDEO_LAYERS);
+    VIDEO | track << 3 | layer << 1 | keyframe as u8
 }
 
-/// The layer of a video fragment's type, and whether it is part of a keyframe.
-pub fn video_layer(kind: u8) -> Option<(u8, bool)> {
-    (VIDEO..VIDEO + 2 * VIDEO_LAYERS).contains(&kind).then_some(((kind >> 1) & 3, kind & 1 == 1))
+/// The track and layer of a video fragment's type, and whether it is part
+/// of a keyframe.
+pub fn video_kind(kind: u8) -> Option<(u8, u8, bool)> {
+    (VIDEO..VIDEO + 16).contains(&kind).then_some(((kind >> 3) & 1, (kind >> 1) & 3, kind & 1 == 1))
 }
 
 pub const TOKEN_LEN: usize = 16;
@@ -158,14 +163,14 @@ pub fn member(slot: u8, present: bool) -> [u8; MEMBER_LEN] {
     [MEMBER, slot, present as u8]
 }
 
-/// SUBSCRIBE: forward us `layer` of `slot`'s video (`None`: no video).
-pub fn subscribe(slot: u8, layer: Option<u8>) -> [u8; 3] {
-    [SUBSCRIBE, slot, layer.unwrap_or(NO_VIDEO)]
+/// SUBSCRIBE: forward us `layer` of `slot`'s video `track` (`None`: none of it).
+pub fn subscribe(slot: u8, track: u8, layer: Option<u8>) -> [u8; 4] {
+    [SUBSCRIBE, slot, track, layer.unwrap_or(NO_VIDEO)]
 }
 
-/// DEMAND: which of the member's video layers someone wants (bit n: layer n).
-pub fn demand(layers: u8) -> [u8; 2] {
-    [DEMAND, layers]
+/// DEMAND: which layers of the member's video `track` someone wants (bit n: layer n).
+pub fn demand(track: u8, layers: u8) -> [u8; 3] {
+    [DEMAND, track, layers]
 }
 
 /// LIMIT: the largest layer the member's link takes now (`None`: no video).

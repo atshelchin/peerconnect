@@ -44,8 +44,11 @@ pub fn transport_config() -> quinn::TransportConfig {
         .stream_receive_window((256u32 << 10).into())
         .receive_window((1u32 << 20).into())
         .send_window(1 << 20)
-        .datagram_receive_buffer_size(Some(64 << 10))
-        .datagram_send_buffer_size(8 << 10);
+        // Room for a keyframe's burst of datagrams; a send buffer small
+        // enough that voice behind video waits little (16 KiB at 5 Mbit/s:
+        // 26 ms), large enough for 1080p.
+        .datagram_receive_buffer_size(Some(512 << 10))
+        .datagram_send_buffer_size(16 << 10);
     t
 }
 
