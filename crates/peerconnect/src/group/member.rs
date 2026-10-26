@@ -36,7 +36,7 @@ mod control {
     pub const SYNC_BEGIN: u8 = 0x11;
     pub const SYNC_ACK: u8 = 0x12;
     pub const SYNC_ABORT: u8 = 0x13;
-    /// `track[1] layer[1] frame[4] index...`: video fragments to send again (`0xFF`: all).
+    /// `track[1] layer[1] frame[4] index[2]...`: video fragments to send again (`0xFFFF`: all).
     pub const VIDEO_NACK: u8 = 0x20;
     /// `track[1] layer[1]`: a keyframe of that layer, please.
     pub const KEYFRAME_REQUEST: u8 = 0x21;
@@ -1461,7 +1461,8 @@ impl Member {
             }
             control::VIDEO_NACK if data.len() >= 7 && data[0] < wire::VIDEO_TRACKS && data[1] < wire::VIDEO_LAYERS => {
                 let (track, layer, frame) = (data[0], data[1], u32_at(data, 2));
-                for fragment in self.video_out.resend(self.clock, track, layer, frame, &data[6..]) {
+                let indices: Vec<u16> = data[6..].chunks_exact(2).map(|i| u16::from_be_bytes([i[0], i[1]])).collect();
+                for fragment in self.video_out.resend(self.clock, track, layer, frame, &indices) {
                     let keyframe = video::parse(&fragment).is_some_and(|f| f.keyframe);
                     self.seal_to(wire::video_type(track, layer, keyframe), from, &fragment);
                 }
@@ -1516,6 +1517,7 @@ impl Member {
                     self.emit(Event::Video { from: sender, track, layer, keyframe, timestamp, data });
                 }
                 video::Action::Nack { track, layer, frame, indices } => {
+                    let indices: Vec<u8> = indices.iter().flat_map(|i| i.to_be_bytes()).collect();
                     let nack = [&[control::VIDEO_NACK, track, layer][..], &frame.to_be_bytes(), &indices].concat();
                     self.seal_to(wire::CONTROL, slot, &nack);
                 }
@@ -2241,7 +2243,7 @@ mod tests {
         assert!(a.send_video(0, 0, false, 1, b"lost"));
         assert!(a.send_video(0, 0, false, 2, b"after"));
         // Frame 1 never arrives, nor do its resends.
-        let lost = |f: &[u8]| f[0] == wire::video_type(0, 0, false) && f.len() == 7 + 12 + 4 + 16;
+        let lost = |f: &[u8]| f[0] == wire::video_type(0, 0, false) && f.len() == 7 + 14 + 4 + 16;
         let (asked, got) = video_between(&mut a, &mut b, 1, 600, lost);
         assert_eq!(frames_from(&got, ia), [(true, 0, b"key".to_vec())], "frame 2 cannot be decoded without 1");
         assert!(

@@ -66,12 +66,13 @@ pub const MAX_PLAINTEXT_LEN: usize = MAX_FRAME_LEN - SEALED_HEADER_LEN - TAG_LEN
 pub const MAX_PAYLOAD_LEN: usize = MAX_PLAINTEXT_LEN - 9;
 /// Largest voice frame or datagram.
 pub const MAX_DATAGRAM_LEN: usize = MAX_PLAINTEXT_LEN - 2;
-/// Video: a fragment's header, `track[1] frame[4] index[1] count[1] flags[1] timestamp[4]`.
-pub const VIDEO_HEADER_LEN: usize = 12;
+/// Video: a fragment's header, `track[1] frame[4] index[2] count[2] flags[1] timestamp[4]`.
+pub const VIDEO_HEADER_LEN: usize = 14;
 /// Video data per fragment, at most: small enough for a QUIC datagram on any path.
 pub const MAX_VIDEO_FRAGMENT: usize = 1000;
-/// Largest video frame: 255 fragments.
-pub const MAX_VIDEO_FRAME: usize = 255 * MAX_VIDEO_FRAGMENT;
+pub const MAX_VIDEO_FRAGMENTS: usize = 1000;
+/// Largest video frame: about 1 MB, room for a 1080p screen's keyframe.
+pub const MAX_VIDEO_FRAME: usize = MAX_VIDEO_FRAGMENTS * MAX_VIDEO_FRAGMENT;
 pub const MAX_PROFILE_LEN: usize = 1024;
 
 /// The type of a video fragment of `layer` of `track`.

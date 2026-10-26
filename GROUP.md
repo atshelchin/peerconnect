@@ -152,7 +152,7 @@ VIDEO frames sent to one member (resent fragments, §7.4) are forwarded regardle
 
 A relay MUST deliver the frames of one class from one connection to another in the order sent (over QUIC, voice excepted: §3.6). It SHOULD hold a queue per class for each recipient and always send from the most urgent non-empty queue, so that a less urgent class never delays a more urgent one beyond the frame being written. Relay frames go with the command class.
 
-Real-time frames: a relay SHOULD drop a voice frame, instead of queueing it, when more than a few kilobytes (the reference relay: 8 KiB) of command and voice frames are already waiting for that recipient. Late audio is worse than lost audio. It SHOULD give video a budget of its own, room for a large keyframe (the reference relay: 256 KiB per recipient), and drop the *oldest* video frames queued to stay within it: an old picture is worth less than a new one.
+Real-time frames: a relay SHOULD drop a voice frame, instead of queueing it, when more than a few kilobytes (the reference relay: 8 KiB) of command and voice frames are already waiting for that recipient. Late audio is worse than lost audio. It SHOULD give video a budget of its own, room for the largest frame (the reference relay: 1 MiB per recipient), and drop the *oldest* video frames queued to stay within it: an old picture is worth less than a new one.
 
 A relay MAY also limit everyone's video to keep its own traffic within a budget (a month's transfer, a rate), as it limits a slow link (below), and tell members the same way, with LIMIT; voice, commands and chat are never limited. The reference relay lets video shrink to layers up to 1 from 80% of its monthly budget, to layer 0 from 95%, and stops it at 100%; and above its rate it shrinks video a layer every 10 s, growing it back after 30 s below 70% of it.
 
@@ -285,7 +285,7 @@ CONTROL kinds:
 | `0x11` | SYNC_BEGIN | `transfer[4] ‖ length[8] ‖ count[1] ‖ (incarnation[8] ‖ next[8]) × count` |
 | `0x12` | SYNC_ACK | `transfer[4] ‖ received[8]` |
 | `0x13` | SYNC_ABORT | `transfer[4]` |
-| `0x20` | VIDEO_NACK | `track[1] ‖ layer[1] ‖ frame[4] ‖ index[1] × n`: fragments of our frame to send again, `0xFF` for all of them (§7.4) |
+| `0x20` | VIDEO_NACK | `track[1] ‖ layer[1] ‖ frame[4] ‖ index[2] × n`: fragments of our frame to send again, `0xFFFF` for all of them (§7.4) |
 | `0x21` | KEYFRAME_REQUEST | `track[1] ‖ layer[1]`: a keyframe of this layer of this track, please (§7.4) |
 
 Channel `0x00` is commands, `0x01` is chat. Receivers MUST ignore unknown types, kinds and channels, so that later revisions can add them.
@@ -359,10 +359,10 @@ Commands are signed by nobody but arrive from an admitted sender, whose identity
 
 ### 7.4 Video
 
-A video frame (an encoded picture) is cut into **fragments** of at most **1,000 bytes** of data, each its own VIDEO frame, so that each fits a QUIC datagram on any path; a frame has at most 255 fragments (255,000 bytes). The plaintext of each:
+A video frame (an encoded picture) is cut into **fragments** of at most **1,000 bytes** of data, each its own VIDEO frame, so that each fits a QUIC datagram on any path; a frame has at most 1,000 fragments (1,000,000 bytes: a 1080p screen's keyframe can take 200–400 KB). The plaintext of each:
 
 ```
-track[1] ‖ frame[4] ‖ index[1] ‖ count[1] ‖ flags[1] ‖ timestamp[4] ‖ data
+track[1] ‖ frame[4] ‖ index[2] ‖ count[2] ‖ flags[1] ‖ timestamp[4] ‖ data
 ```
 
 `track` (0 or 1) lets one member send two videos (a camera and a screen, say); it MUST agree with the type's track. The layer is in the frame's type (§3.3): each layer of a track is a video of its own, numbered on its own. `frame` numbers the layer's frames, from 0, wrapping at 2³². Fragment `index` of `count` holds bytes `index × 1000` onwards of the frame. `flags` bit 0 marks a **keyframe**, which decodes on its own; other frames need every frame since the last keyframe; it MUST agree with the type's keyframe bit. `timestamp` is the sender's, in its own units.
@@ -389,11 +389,11 @@ The codec is the application's. Implementations that want to interoperate with t
 | Members | ≤ 4 (4 slots) | relay (4429) |
 | Frame size | ≤ 16,384 bytes | relay (1009) |
 | Message payload | ≤ 16,352 bytes | senders |
-| Video frame | ≤ 255 fragments of ≤ 1,000 bytes | senders |
+| Video frame | ≤ 1,000 fragments of ≤ 1,000 bytes | senders |
 | Video tracks, layers | 2 tracks (0–1) of 4 layers (0–3); a layer counts as sent for 1 s after its last frame; a layer left behind is ignored for 1 s | relays, receivers |
 | A link not keeping up | video dropped, or queued video > 32 KiB and > 250 ms of its pace for ≥ 300 ms; then one layer down, at most every 2 s | relays (reference), senders |
 | A link given more | after 8 s of keeping up, doubling up to 60 s after a try that fails within 5 s | relays (reference), senders |
-| Video queued per recipient | 256 KiB, oldest dropped (reference relay) | relays |
+| Video queued per recipient | 1 MiB, oldest dropped (reference relay) | relays |
 | Video: ask for a fragment / give a frame up / ask for a keyframe | after 5 ms / 300 ms / at most every 500 ms | receivers |
 | Video kept for resending | 500 ms, ≤ 2 MiB; resent at ≤ 512 KiB/s | senders |
 | Profile | ≤ 1,024 bytes | senders |

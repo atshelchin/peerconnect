@@ -17,9 +17,9 @@ use crate::group::wire::{self, Class};
 /// Room in the datagram buffer that video leaves for voice, which goes
 /// out in the order queued: so voice waits behind little video.
 const VOICE_RESERVE: usize = 4 << 10;
-/// Video waiting beyond which the oldest is dropped: room for a 1080p
-/// keyframe passing through.
-const VIDEO_BACKLOG: usize = 256 << 10;
+/// Video waiting beyond which the oldest is dropped: room for the largest
+/// frame (a 1080p screen's keyframe) passing through.
+const VIDEO_BACKLOG: usize = 1 << 20;
 /// How often video waiting for room in the datagram buffer looks again.
 const VIDEO_RETRY: Duration = Duration::from_millis(2);
 

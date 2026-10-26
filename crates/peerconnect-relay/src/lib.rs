@@ -108,7 +108,7 @@ impl Default for Config {
             max_group_members: peerconnect::group::wire::MAX_SLOTS,
             group_queue_bytes: 2 << 20,
             voice_queue_bytes: 8 << 10,
-            video_queue_bytes: 256 << 10,
+            video_queue_bytes: 1 << 20,
             group_rate: 2 << 20,
             group_burst: 4 << 20,
             tls: None,

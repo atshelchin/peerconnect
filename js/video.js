@@ -46,6 +46,15 @@ const CODECS = [
   { id: 4, codec: "av01.0.04M.08" },
 ];
 /** H.264 for large layers: High 4.0 takes 1080p, Main 3.1 720p (and level 3.1 no more). */
+/** Frames a hardware encoder may hold before we skip new ones (VideoToolbox holds three or four). */
+const HARDWARE_QUEUE = 6;
+/**
+ * A hardware encoder that puts out nothing this long (ms) while frames wait
+ * in it is taken to have failed, and the layer goes on in software. Some
+ * hold their frames for seconds at a size they do not like (VideoToolbox's
+ * H.264 at 1080p, measured), which looks like a frozen picture to everyone.
+ */
+const HARDWARE_STALL = 1000;
 const AVC_1080 = "avc1.640028";
 const AVC_720 = "avc1.4d401f";
 
@@ -62,8 +71,8 @@ const STRAINED = 2;
 /** Tracks 0–1, layers 0–3. */
 const TRACKS = 2;
 const LAYERS = 4;
-/** The largest video frame the protocol carries: 255 fragments of 1000 bytes (GROUP.md §7.4). */
-const MAX_FRAME = 255 * 1000;
+/** The largest video frame the protocol carries: 1000 fragments of 1000 bytes (GROUP.md §7.4). */
+const MAX_FRAME = 1000 * 1000;
 /**
  * After a frame too large to send, a layer's bitrate (and size, if it came
  * to that) stays down this long (ms), then comes back a step at a time.
@@ -475,6 +484,7 @@ export class Video extends EventTarget {
       error: (e) => this.#failed(l, encoder, e),
     });
     l.encoder = encoder;
+    l.fedAt = l.outputAt = null;
     l.size = null; // configured for the first frame's shape
     l.keyframeDue = true; // receivers moving to it start there
     l.broken = false;
@@ -604,9 +614,15 @@ export class Video extends EventTarget {
     for (const l of this.#layers) {
       const encoder = l.encoder;
       if (!encoder || encoder.state === "closed") continue;
-      // Skip frames while the encoder is behind.
-      if (encoder.encodeQueueSize > 2) {
+      // Skip frames while the encoder is behind. Hardware encoders keep a
+      // few frames in their pipeline before the first comes out: starved of
+      // input below that, they would put out nothing at all.
+      if (encoder.encodeQueueSize > (l.codec?.hardware ? HARDWARE_QUEUE : 2)) {
         l.stats.skipped++;
+        if (l.codec?.hardware && l.fedAt !== null && now - Math.max(l.fedAt, l.outputAt ?? 0) > HARDWARE_STALL) {
+          encoder.close();
+          this.#failed(l, encoder, new Error("the hardware encoder stalled"));
+        }
         continue;
       }
       const [w, h] = fit(sw, sh, { width: l.width * l.scale, height: l.height * l.scale });
@@ -628,6 +644,7 @@ export class Video extends EventTarget {
         l.keyframeAt = 0;
         l.lastKeyframe = now;
       }
+      l.fedAt ??= now;
       encoder.encode(frame, { keyFrame });
       frame.close();
       this.#raise(l, now);
@@ -677,6 +694,7 @@ export class Video extends EventTarget {
     if (!l.encoder) return; // stopped meanwhile
     const keyframe = chunk.type === "key";
     l.stats.encoded++;
+    l.outputAt = performance.now();
     if (1 + chunk.byteLength > MAX_FRAME) {
       // More than the protocol carries: not sent, and neither is what
       // follows until a keyframe (it would refer to this one), which comes
@@ -912,6 +930,9 @@ function layerState({ layer, width, height, bitrate, minBitrate, codec }, defaul
     codec: null,
     fallback: null,
     encoder: null,
+    /** When the encoder was first given a frame, and last put one out (to tell a stalled one). */
+    fedAt: null,
+    outputAt: null,
     canvas: null,
     size: null,
     /** Below 1 while frames came out too large even at the lowest bitrate. */

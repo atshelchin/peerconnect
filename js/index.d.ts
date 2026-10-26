@@ -198,7 +198,7 @@ export class GroupConnection extends EventTarget {
   sendDatagram(data: Data, to?: string): boolean;
   /**
    * Sends a video frame of `layer` (0–3, smallest picture first) of `track` (0 or 1: a
-   * camera and a screen, say), up to 255,000 bytes; the relay forwards each member the
+   * camera and a screen, say), up to 1,000,000 bytes; the relay forwards each member the
    * layer of each track it subscribed to, which gets it whole and in order ("video"), or
    * asks for a keyframe ("keyframerequest"). False if not sent (another track or layer, a
    * larger frame, not joined).

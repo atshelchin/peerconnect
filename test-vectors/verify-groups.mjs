@@ -116,7 +116,7 @@ const CONTROL = 0x02, COMMAND = 0x03, VOICE = 0x21, DATAGRAM = 0x22, CHAT = 0x41
 // Video fragments carry their track, layer and whether they are part of a keyframe in the type (§7.4).
 const video = (f) => 0x30 | (Number(f.track) << 3) | (Number(f.layer) << 1) | (f.keyframe ? 1 : 0);
 // §7.4: track[1] frame[4] index[1] count[1] flags[1] timestamp[4] ‖ data.
-const fragment = (f) => cat([f.track], u32(f.frame), [f.index, f.count, f.keyframe ? 1 : 0], u32(f.timestamp), hex(f.data));
+const fragment = (f) => cat([f.track], u32(f.frame), u16(f.index), u16(f.count), [f.keyframe ? 1 : 0], u32(f.timestamp), hex(f.data));
 const message = (f) => cat([0x00], u64(f.id), ascii(f.payload));
 const builders = {
   //            type      from to         plaintext
@@ -144,7 +144,7 @@ const builders = {
   sync_abort: (f) => [CONTROL, 2, 0, cat([0x13], u32(f.transfer))],
   video_fragment: (f) => [video(f), 2, BROADCAST, fragment(f)],
   video_fragment_lost: (f) => [video(f), 2, BROADCAST, fragment(f)],
-  video_nack: (f) => [CONTROL, 0, 2, cat([0x20, f.track, f.layer], u32(f.frame), f.indices)],
+  video_nack: (f) => [CONTROL, 0, 2, cat([0x20, f.track, f.layer], u32(f.frame), ...f.indices.map(u16))],
   video_resent: (f) => [video(f), 2, 0, fragment(f)],
   video_delta: (f) => [video(f), 2, BROADCAST, fragment(f)],
   keyframe_request: (f) => [CONTROL, 0, 2, cat([0x21, f.track, f.layer])],

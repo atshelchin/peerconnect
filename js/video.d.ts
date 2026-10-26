@@ -85,7 +85,7 @@ export interface VideoLayerStats {
   bitrate: number;
   /**
    * Frames encoded, sent, keyframes among them, frames skipped (encoder behind), frames
-   * too large for the protocol (255,000 bytes: not sent, and the bitrate stepped down),
+   * too large for the protocol (1,000,000 bytes: not sent, and the bitrate stepped down),
    * keyframe requests heard.
    */
   encoded: number;

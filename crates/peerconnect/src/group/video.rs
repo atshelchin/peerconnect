@@ -8,12 +8,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use super::wire::{MAX_VIDEO_FRAGMENT, MAX_VIDEO_FRAME, VIDEO_HEADER_LEN};
+use super::wire::{MAX_VIDEO_FRAGMENT, MAX_VIDEO_FRAGMENTS, MAX_VIDEO_FRAME, VIDEO_HEADER_LEN};
 
 /// Fragment flags.
 pub(crate) const KEYFRAME: u8 = 0x01;
 /// In a NACK, "every fragment of the frame" (none of it arrived).
-pub(crate) const WHOLE_FRAME: u8 = 0xFF;
+pub(crate) const WHOLE_FRAME: u16 = 0xFFFF;
 
 /// A frame missing a fragment waits this long before it is asked for
 /// (fragments of a frame travel together; this covers mild reordering).
@@ -40,13 +40,13 @@ const HOLD_FRAMES: usize = 64;
 /// they were already on their way, and are not the start of a move back.
 const LEFT_GRACE: u64 = 1000;
 
-/// A fragment's plaintext: `track frame[4] index count flags timestamp[4] ‖ data`.
+/// A fragment's plaintext: `track frame[4] index[2] count[2] flags timestamp[4] ‖ data`.
 pub(crate) fn fragments(track: u8, frame: u32, keyframe: bool, timestamp: u32, data: &[u8]) -> Option<Vec<Vec<u8>>> {
     if data.is_empty() || data.len() > MAX_VIDEO_FRAME {
         return None;
     }
     let chunks: Vec<&[u8]> = data.chunks(MAX_VIDEO_FRAGMENT).collect();
-    let count = chunks.len() as u8;
+    let count = chunks.len() as u16;
     let flags = if keyframe { KEYFRAME } else { 0 };
     Some(
         chunks
@@ -56,7 +56,9 @@ pub(crate) fn fragments(track: u8, frame: u32, keyframe: bool, timestamp: u32, d
                 let mut p = Vec::with_capacity(VIDEO_HEADER_LEN + chunk.len());
                 p.push(track);
                 p.extend_from_slice(&frame.to_be_bytes());
-                p.extend_from_slice(&[index as u8, count, flags]);
+                p.extend_from_slice(&(index as u16).to_be_bytes());
+                p.extend_from_slice(&count.to_be_bytes());
+                p.push(flags);
                 p.extend_from_slice(&timestamp.to_be_bytes());
                 p.extend_from_slice(chunk);
                 p
@@ -70,8 +72,8 @@ pub(crate) fn fragments(track: u8, frame: u32, keyframe: bool, timestamp: u32, d
 pub(crate) struct Fragment<'a> {
     pub track: u8,
     pub frame: u32,
-    pub index: u8,
-    pub count: u8,
+    pub index: u16,
+    pub count: u16,
     pub keyframe: bool,
     pub timestamp: u32,
     pub data: &'a [u8],
@@ -79,8 +81,9 @@ pub(crate) struct Fragment<'a> {
 
 pub(crate) fn parse(plaintext: &[u8]) -> Option<Fragment<'_>> {
     let header = plaintext.get(..VIDEO_HEADER_LEN)?;
-    let (index, count) = (header[5], header[6]);
-    if count == 0 || index >= count {
+    let index = u16::from_be_bytes([header[5], header[6]]);
+    let count = u16::from_be_bytes([header[7], header[8]]);
+    if count == 0 || index >= count || count as usize > MAX_VIDEO_FRAGMENTS {
         return None;
     }
     Some(Fragment {
@@ -88,8 +91,8 @@ pub(crate) fn parse(plaintext: &[u8]) -> Option<Fragment<'_>> {
         frame: u32::from_be_bytes(header[1..5].try_into().unwrap()),
         index,
         count,
-        keyframe: header[7] & KEYFRAME != 0,
-        timestamp: u32::from_be_bytes(header[8..12].try_into().unwrap()),
+        keyframe: header[9] & KEYFRAME != 0,
+        timestamp: u32::from_be_bytes(header[10..14].try_into().unwrap()),
         data: &plaintext[VIDEO_HEADER_LEN..],
     })
 }
@@ -163,7 +166,7 @@ impl Outgoing {
 
     /// The fragments a receiver asked for again (`NACK`), those still kept
     /// and within the resend rate.
-    pub(crate) fn resend(&mut self, now: u64, track: u8, layer: u8, frame: u32, indices: &[u8]) -> Vec<Vec<u8>> {
+    pub(crate) fn resend(&mut self, now: u64, track: u8, layer: u8, frame: u32, indices: &[u16]) -> Vec<Vec<u8>> {
         let elapsed = now.saturating_sub(self.tokens_at) as f64 / 1000.0;
         self.tokens = (self.tokens + elapsed * RESEND_RATE).min(RESEND_BURST);
         self.tokens_at = now;
@@ -214,7 +217,7 @@ pub(crate) enum Action {
     /// A whole frame, in order, decodable (it follows a keyframe without loss).
     Deliver { track: u8, layer: u8, keyframe: bool, timestamp: u32, data: Vec<u8> },
     /// Ask the sender for these fragments of `frame` again.
-    Nack { track: u8, layer: u8, frame: u32, indices: Vec<u8> },
+    Nack { track: u8, layer: u8, frame: u32, indices: Vec<u16> },
     /// Ask the sender for a keyframe.
     RequestKeyframe { track: u8, layer: u8 },
 }
@@ -251,20 +254,20 @@ struct TrackIn {
 
 struct Partial {
     frame: u32,
-    count: u8,
+    count: u16,
     keyframe: bool,
     timestamp: u32,
     parts: Vec<Option<Vec<u8>>>,
-    have: u8,
+    have: u16,
     /// When its latest fragment arrived, and the highest index arrived.
     last_at: u64,
-    highest: u8,
+    highest: u16,
 }
 
 impl Partial {
     /// The fragments to ask for now: those missing before the highest one
     /// arrived (lost, or overtaken), and those after it once they stopped coming.
-    fn missing(&self, now: u64) -> Vec<u8> {
+    fn missing(&self, now: u64) -> Vec<u16> {
         let stalled = now.saturating_sub(self.last_at) >= TAIL_STALL;
         (0..self.count).filter(|&i| self.parts[i as usize].is_none() && (i < self.highest || stalled)).collect()
     }
@@ -272,7 +275,7 @@ impl Partial {
     /// When something of it can first be asked for: now if a fragment is
     /// missing before the highest arrived, else once its end stopped coming.
     fn askable_at(&self) -> Option<u64> {
-        let missing = |i: u8| self.parts[i as usize].is_none();
+        let missing = |i: u16| self.parts[i as usize].is_none();
         if (0..self.highest).any(missing) {
             Some(0)
         } else {
@@ -514,9 +517,13 @@ mod tests {
         assert_eq!((f.track, f.frame, f.index, f.count, f.keyframe, f.timestamp), (3, 7, 2, 3, true, 99));
         assert!(fragments(0, 0, false, 0, &[]).is_none());
         assert!(fragments(0, 0, false, 0, &vec![0; MAX_VIDEO_FRAME + 1]).is_none());
-        assert_eq!(fragments(0, 0, false, 0, &vec![0; MAX_VIDEO_FRAME]).unwrap().len(), 255);
+        assert_eq!(fragments(0, 0, false, 0, &vec![0; MAX_VIDEO_FRAME]).unwrap().len(), MAX_VIDEO_FRAGMENTS);
         assert!(parse(&[0; 5]).is_none());
-        assert!(parse(&[0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0]).is_none(), "index beyond count");
+        assert!(parse(&[0, 0, 0, 0, 0, 0, 3, 0, 3, 0, 0, 0, 0, 0]).is_none(), "index beyond count");
+        assert!(
+            parse(&[0, 0, 0, 0, 0, 0, 0, 0x03, 0xE9, 0, 0, 0, 0, 0]).is_none(),
+            "more fragments than a frame may have"
+        );
     }
 
     #[test]

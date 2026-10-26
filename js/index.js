@@ -162,12 +162,12 @@ export class Connection extends EventTarget {
 
 /** Bytes unsent on the voice stream beyond which voice frames are dropped. */
 const VOICE_BACKLOG = 4 << 10;
-/** Video waiting to be sent beyond which the oldest is dropped: room for a 1080p keyframe. */
-const VIDEO_BACKLOG = 256 << 10;
+/** Video waiting to be sent beyond which the oldest is dropped: room for the largest frame (a 1080p screen's keyframe). */
+const VIDEO_BACKLOG = 1 << 20;
 /** Resent video is not queued behind more than this much video (see `WebTransportLink.send`). */
 const RESEND_ROOM = 32 << 10;
-/** Incoming datagrams the browser may hold for us: a keyframe's worth and more (255 fragments at most). */
-const INCOMING_DATAGRAMS = 1024;
+/** Incoming datagrams the browser may hold for us: the largest keyframe (1000 fragments) and more. */
+const INCOMING_DATAGRAMS = 2048;
 /** How often (ms, at least) the pace video leaves at is measured. */
 const PACE_EVERY = 100;
 /**
@@ -327,7 +327,7 @@ export class GroupConnection extends EventTarget {
 
   /**
    * Sends a video frame of `layer` (0–3, from the smallest picture up) of
-   * `track` (0 or 1: a camera and a screen, say), up to 255,000 bytes, cut
+   * `track` (0 or 1: a camera and a screen, say), up to 1,000,000 bytes, cut
    * into fragments that each fit a datagram; false for another track or
    * layer, or a larger frame. The relay forwards each member the layer of
    * each track it subscribed to,

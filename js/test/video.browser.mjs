@@ -380,7 +380,9 @@ try {
       // Nothing above what each subscribed to, track by track (below, at the start, before
       // the layer asked for runs: the relay forwards the nearest below).
       assert.ok(layer(both.b.camera, 1).received <= 3, "b never gets the camera's layer 1 (but at the start, see simulcast)");
-      assert.equal(layer(both.c.screen, 2).received + layer(both.c.screen, 3).received, 0, "c never gets the screen's layers 2 or 3");
+      // The screen has no layer below 1, so until layer 1 runs (H.264 starts later than VP8)
+      // the relay forwards c the lowest that does.
+      assert.ok(layer(both.c.screen, 2).received + layer(both.c.screen, 3).received <= 6, "c never gets the screen's layers 2 or 3 (but at the start)");
       assert.ok(layer(both.b.screen, 3).decoded > 60, `b decoded ${layer(both.b.screen, 3).decoded} of the screen's layer 3`);
       assert.ok(layer(both.b.camera, 0).decoded > 80, `b decoded ${layer(both.b.camera, 0).decoded} of the camera's layer 0`);
       assert.ok(layer(both.c.screen, 1).decoded > 60 && layer(both.c.camera, 1).decoded > 80, "c decodes both");
@@ -431,8 +433,10 @@ try {
       const [first] = results;
       assert.equal(first.stats.b.width, 1920, "decoded at 1920 wide");
       assert.ok(first.keyframes.every((k) => k.size > 64 << 10 && k.decoded?.width === 1920), "keyframes over 64 KiB, at 1920 wide");
-      // Noisier: frames over 255,000 bytes even at the lowest bitrate, skipped until a smaller picture fits.
-      assert.ok(results[1].stats.a.layers[0].oversized > 0, "the noisier picture's frames were too large at first");
+      // Keyframes over the 255,000 bytes a frame once had (a 1080p screen's, in H.264 above
+      // all) arrive whole, and none is too large.
+      assert.ok(results.some((r) => r.keyframes.some((k) => k.size > 255_000 && k.decoded?.width === 1920)), "a keyframe over 255,000 bytes, decoded");
+      for (const r of results) assert.equal(r.stats.a.layers[0].oversized, 0, "no frame too large");
     }
   }
 } catch (e) {
