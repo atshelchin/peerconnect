@@ -15,11 +15,12 @@ pub(crate) const KEYFRAME: u8 = 0x01;
 /// In a NACK, "every fragment of the frame" (none of it arrived).
 pub(crate) const WHOLE_FRAME: u16 = 0xFFFF;
 
-/// A frame missing a fragment waits this long before it is asked for
-/// (fragments of a frame travel together; this covers mild reordering).
+/// A fragment known missing waits this long before it is asked for
+/// (fragments of a frame travel together; this covers mild reordering),
+/// and is asked for once more a round trip later.
 const NACK_DELAY: u64 = 5;
-/// And is given up after this long without a fragment of it arriving:
-/// frames behind it wait meanwhile.
+/// A frame is given up after this long without a fragment of it arriving,
+/// or a round trip and a half if longer: frames behind it wait meanwhile.
 const HOLD: u64 = 300;
 /// The end of a frame is asked for only once its fragments stopped coming
 /// this long: a large keyframe arrives over a while, and asking for what is
@@ -249,6 +250,7 @@ struct TrackIn {
     keyframe_asked: Option<u64>,
     /// When `next` started holding up a later frame.
     blocked_since: Option<u64>,
+    /// Times frames missing whole were asked for.
     nacks: u8,
 }
 
@@ -262,26 +264,55 @@ struct Partial {
     /// When its latest fragment arrived, and the highest index arrived.
     last_at: u64,
     highest: u16,
+    /// Per fragment, what was asked: a large keyframe arrives over longer
+    /// than a round trip, so each fragment is asked for twice, not the frame.
+    asks: Vec<Ask>,
+}
+
+#[derive(Clone, Copy)]
+struct Ask {
+    /// When a later fragment arrived without it (`u64::MAX`: none yet).
+    known: u64,
+    tries: u8,
+    at: u64,
 }
 
 impl Partial {
-    /// The fragments to ask for now: those missing before the highest one
-    /// arrived (lost, or overtaken), and those after it once they stopped coming.
-    fn missing(&self, now: u64) -> Vec<u16> {
-        let stalled = now.saturating_sub(self.last_at) >= TAIL_STALL;
-        (0..self.count).filter(|&i| self.parts[i as usize].is_none() && (i < self.highest || stalled)).collect()
-    }
-
-    /// When something of it can first be asked for: now if a fragment is
-    /// missing before the highest arrived, else once its end stopped coming.
-    fn askable_at(&self) -> Option<u64> {
-        let missing = |i: u16| self.parts[i as usize].is_none();
-        if (0..self.highest).any(missing) {
-            Some(0)
-        } else {
-            (self.highest + 1..self.count).any(missing).then_some(self.last_at + TAIL_STALL)
+    /// When fragment `i` is to be asked for: once a later one arrived without
+    /// it (lost, or overtaken), or, at the end, once fragments stopped coming;
+    /// and once more a round trip after that.
+    fn due(&self, i: usize, rtt: u64) -> Option<u64> {
+        if self.parts[i].is_some() {
+            return None;
+        }
+        let a = self.asks[i];
+        match a.tries {
+            0 if a.known != u64::MAX => Some(a.known + NACK_DELAY),
+            0 => Some(self.last_at + TAIL_STALL),
+            1 => Some(a.at + rtt.max(20) + NACK_DELAY),
+            _ => None,
         }
     }
+
+    /// The fragments to ask for now, marked as asked for.
+    fn ask(&mut self, now: u64, rtt: u64) -> Vec<u16> {
+        let indices: Vec<u16> = (0..self.count).filter(|&i| self.due(i as usize, rtt).is_some_and(|at| at <= now)).collect();
+        for &i in &indices {
+            let a = &mut self.asks[i as usize];
+            (a.tries, a.at) = (a.tries + 1, now);
+        }
+        indices
+    }
+
+    /// When something of it can first be asked for.
+    fn askable_at(&self, rtt: u64) -> Option<u64> {
+        (0..self.count as usize).filter_map(|i| self.due(i, rtt)).min()
+    }
+}
+
+/// How long a frame holding others up may go without a fragment arriving.
+fn hold(rtt: u64) -> u64 {
+    HOLD.max(rtt * 3 / 2)
 }
 
 impl TrackIn {
@@ -343,11 +374,13 @@ impl Incoming {
         let key = t.key(f.frame);
         if key >= HOLD_FRAMES as u64 {
             // Far ahead: give up on everything before it.
-            t.frames.retain(|&k, _| k >= key);
-            t.next = Some(f.frame);
-            t.frames = std::mem::take(&mut t.frames).into_iter().map(|(k, p)| (k - key, p)).collect();
+            Self::skip_to(t, key);
             t.broken = true;
-            t.blocked_since = None;
+        } else if key > 0 && t.broken && f.keyframe {
+            // Nothing before a keyframe can be decoded now: start from it,
+            // not waiting for frames that may never come (sent while the
+            // relay forwarded us another layer, say).
+            Self::skip_to(t, key);
         }
         let key = t.key(f.frame);
         let partial = t.frames.entry(key).or_insert_with(|| Partial {
@@ -359,9 +392,17 @@ impl Incoming {
             have: 0,
             last_at: now,
             highest: 0,
+            asks: vec![Ask { known: u64::MAX, tries: 0, at: 0 }; f.count as usize],
         });
         if partial.count != f.count || partial.parts[f.index as usize].is_some() {
             return; // inconsistent, or a duplicate
+        }
+        // Those between the highest so far and this one are missing now.
+        let from = if partial.have == 0 { 0 } else { partial.highest as usize + 1 };
+        for i in from..f.index as usize {
+            if partial.parts[i].is_none() && partial.asks[i].known == u64::MAX {
+                partial.asks[i].known = now;
+            }
         }
         partial.parts[f.index as usize] = Some(f.data.to_vec());
         partial.have += 1;
@@ -370,12 +411,25 @@ impl Incoming {
         Self::advance(t, now, out);
     }
 
+    /// Makes the frame `key` frames on the next, giving up those before it.
+    fn skip_to(t: &mut TrackIn, key: u64) {
+        t.frames.retain(|&k, _| k >= key);
+        t.frames = std::mem::take(&mut t.frames).into_iter().map(|(k, p)| (k - key, p)).collect();
+        t.next = t.next.map(|n| n.wrapping_add(key as u32));
+        t.blocked_since = None;
+        t.nacks = 0;
+    }
+
     /// Delivers what is complete from `next` on, and keeps track of what holds it up.
     fn advance(t: &mut TrackIn, now: u64, out: &mut Vec<Action>) {
         loop {
-            let complete = t.frames.get(&0).is_some_and(|p| p.have == p.count);
-            if !complete {
-                break;
+            let whole = |p: &Partial| p.have == p.count;
+            if !t.frames.get(&0).is_some_and(whole) {
+                // A whole keyframe further on: what is missing before it is not needed.
+                match t.frames.iter().find(|&(&k, p)| k > 0 && p.keyframe && whole(p)) {
+                    Some((&key, _)) => Self::skip_to(t, key),
+                    None => break,
+                }
             }
             let p = t.frames.remove(&0).unwrap();
             t.next = Some(p.frame.wrapping_add(1));
@@ -420,7 +474,7 @@ impl Incoming {
     fn tick_layers(&mut self, now: u64, rtt: u64, out: &mut Vec<Action>) {
         for t in &mut self.tracks {
             let Some(since) = t.blocked_since else { continue };
-            if now.saturating_sub(Self::progress(t, since)) >= HOLD {
+            if now.saturating_sub(Self::progress(t, since)) >= hold(rtt) {
                 // Give up on the frame at `next`, missing or incomplete.
                 let next = t.next.unwrap();
                 t.frames.remove(&0);
@@ -433,27 +487,33 @@ impl Incoming {
                 Self::advance(t, now, out);
                 continue;
             }
-            let due = NACK_DELAY + u64::from(t.nacks) * (rtt.max(20) + NACK_DELAY);
-            if t.nacks < 2 && now.saturating_sub(since) >= due {
-                let next = t.next.unwrap();
-                let highest = t.frames.keys().next_back().copied().unwrap_or(0);
-                let nacks: Vec<Action> = (0..=highest)
-                    .filter_map(|key| {
-                        let indices = match t.frames.get(&key) {
-                            Some(p) => p.missing(now),
-                            None => vec![WHOLE_FRAME],
-                        };
-                        let frame = next.wrapping_add(key as u32);
-                        (!indices.is_empty()).then_some(Action::Nack { track: t.track, layer: t.layer, frame, indices })
-                    })
-                    .collect();
-                // Nothing to ask for yet (a frame still arriving) uses up no try.
-                if !nacks.is_empty() {
-                    t.nacks += 1;
-                    out.extend(nacks);
+            let whole = t.nacks < 2 && now.saturating_sub(since) >= Self::whole_due(t, rtt);
+            let next = t.next.unwrap();
+            let highest = t.frames.keys().next_back().copied().unwrap_or(0);
+            let mut asked_whole = false;
+            for key in 0..=highest {
+                let indices = match t.frames.get_mut(&key) {
+                    Some(p) => p.ask(now, rtt),
+                    None if whole => {
+                        asked_whole = true;
+                        vec![WHOLE_FRAME]
+                    }
+                    None => continue,
+                };
+                if !indices.is_empty() {
+                    let frame = next.wrapping_add(key as u32);
+                    out.push(Action::Nack { track: t.track, layer: t.layer, frame, indices });
                 }
             }
+            if asked_whole {
+                t.nacks += 1;
+            }
         }
+    }
+
+    /// When frames missing whole are next asked for, from when they started holding things up.
+    fn whole_due(t: &TrackIn, rtt: u64) -> u64 {
+        NACK_DELAY + u64::from(t.nacks) * (rtt.max(20) + NACK_DELAY)
     }
 
     /// When the frame holding `t` up last made progress: its latest fragment,
@@ -476,15 +536,14 @@ impl Incoming {
             .iter()
             .filter_map(|t| {
                 let since = t.blocked_since?;
-                let hold = Self::progress(t, since) + HOLD;
-                let due = since + NACK_DELAY + u64::from(t.nacks) * (rtt.max(20) + NACK_DELAY);
-                // The first time anything can be asked for: a frame missing whole
-                // or a hole at once, the end of a frame once it stopped coming.
+                let hold = Self::progress(t, since) + hold(rtt);
+                let whole = (t.nacks < 2).then(|| since + Self::whole_due(t, rtt));
+                // The first time anything can be asked for.
                 let highest = t.frames.keys().next_back().copied().unwrap_or(0);
-                let askable =
-                    (0..=highest).filter_map(|key| t.frames.get(&key).map_or(Some(0), Partial::askable_at)).min();
-                let nack = askable.filter(|_| t.nacks < 2).map(|at| at.max(due));
-                Some(nack.map_or(hold, |n| n.min(hold)))
+                let askable = (0..=highest)
+                    .filter_map(|key| t.frames.get(&key).map_or(whole, |p| p.askable_at(rtt)))
+                    .min();
+                Some(askable.map_or(hold, |n| n.min(hold)))
             })
             .min()
     }
@@ -602,6 +661,73 @@ mod tests {
             "{:?}",
             out.len()
         );
+    }
+
+    #[test]
+    fn a_large_keyframe_over_a_long_path_gets_back_what_it_lost_throughout() {
+        // 300 fragments, one every 2 ms (600 ms), 280 ms there and back, every
+        // 25th lost: those lost after the first round trip are asked for too.
+        let rtt = 280;
+        let parts = fragments(0, 0, true, 0, &frame(300_000, 0)).unwrap();
+        let mut rx = Incoming::default();
+        let mut out = Vec::new();
+        let mut arrivals: Vec<(u64, usize)> = (0..parts.len()).filter(|i| i % 25 != 24).map(|i| (2 * i as u64, i)).collect();
+        let mut asked = vec![0; parts.len()];
+        for now in 0..2000 {
+            for &(_, i) in arrivals.iter().filter(|&&(at, _)| at == now) {
+                rx.push(now, 0, &parts[i], &mut out);
+            }
+            if rx.deadline(rtt).is_some_and(|at| at <= now) {
+                rx.tick(now, rtt, &mut out);
+            }
+            for action in std::mem::take(&mut out) {
+                match action {
+                    Action::Nack { indices, .. } => {
+                        for i in indices {
+                            asked[i as usize] += 1;
+                            arrivals.push((now + rtt, i as usize));
+                        }
+                    }
+                    other => out.push(other),
+                }
+            }
+        }
+        assert_eq!(delivered(&out), [(true, 0, 300_000)]);
+        assert!(!out.iter().any(|a| matches!(a, Action::RequestKeyframe { .. })));
+        assert!(asked.iter().enumerate().all(|(i, &n)| n == usize::from(i % 25 == 24)), "each lost fragment asked for once");
+    }
+
+    #[test]
+    fn a_layer_forwarded_again_starts_at_its_keyframe_not_waiting_for_what_was_not() {
+        // Frames 0 and 1 of a layer, then 2 to 9 not forwarded us (another
+        // layer was), then the layer again from its keyframe, 10.
+        let mut tx = Outgoing::default();
+        let mut rx = Incoming::default();
+        let mut out = Vec::new();
+        for i in 0..12u32 {
+            let f = tx.send(66 * u64::from(i), 0, 3, i == 0 || i == 10, i, &frame(3000, i as u8)).unwrap();
+            if !(2..10).contains(&i) {
+                for part in &f {
+                    rx.push(66 * u64::from(i), 3, part, &mut out);
+                }
+            }
+        }
+        let got: Vec<u32> = delivered(&out).iter().map(|&(_, timestamp, _)| timestamp).collect();
+        assert_eq!(got, [0, 1, 10, 11], "at once, nothing given up first");
+        assert!(!out.iter().any(|a| matches!(a, Action::RequestKeyframe { .. })));
+
+        // Broken (it joined mid-stream): a keyframe's first fragment is where it starts.
+        let mut rx = Incoming::default();
+        let mut out = Vec::new();
+        let delta = tx.send(800, 0, 3, false, 12, &frame(100, 12)).unwrap();
+        rx.push(800, 3, &delta[0], &mut out);
+        let _lost = tx.send(866, 0, 3, false, 13, &frame(100, 13)).unwrap();
+        let key = tx.send(933, 0, 3, true, 14, &frame(3000, 14)).unwrap();
+        for part in key.iter().rev() {
+            rx.push(933, 3, part, &mut out);
+        }
+        assert_eq!(delivered(&out), [(true, 14, 3000)]);
+        assert!(!out.iter().any(|a| matches!(a, Action::Nack { frame: 13, .. })), "frame 13 not asked for");
     }
 
     #[test]

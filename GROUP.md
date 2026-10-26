@@ -369,10 +369,10 @@ track[1] ‖ frame[4] ‖ index[2] ‖ count[2] ‖ flags[1] ‖ timestamp[4] �
 
 A receiver delivers whole frames, in order, and only decodable ones:
 
-- A frame waits for its missing fragments. After **5 ms** without them (fragments travel together; this covers mild reordering) the receiver sends the sender VIDEO_NACK for them, or for the whole frame if none of it came, and asks once more a round trip later. Frames behind it wait.
-- A frame not whole **300 ms** after it started holding up others is given up. Since what follows cannot be decoded, the receiver drops frames until the next keyframe, and sends KEYFRAME_REQUEST, at most every **500 ms** per sender and track. So does a receiver whose first frame of a track is not a keyframe (one that joined mid-stream).
+- A frame waits for its missing fragments. A fragment is missing once a later one of its frame arrived without it, or, at the end of a frame, once its fragments stopped coming for **30 ms** (a large keyframe arrives over a while). **5 ms** after it is known missing (fragments travel together; this covers mild reordering) the receiver sends the sender VIDEO_NACK for it, and asks once more a round trip later: each fragment twice, however long its frame takes to arrive (a 1080p keyframe can take longer than a round trip). A frame none of which came is asked for whole, twice the same way. Frames behind it wait.
+- A frame that holds up others and receives nothing of it for **300 ms**, or a round trip and a half if longer, is given up. Since what follows cannot be decoded, the receiver drops frames until the next keyframe, and sends KEYFRAME_REQUEST, at most every **500 ms** per sender and track. So does a receiver whose first frame of a track is not a keyframe (one that joined mid-stream).
 
-A sender keeps its frames for **500 ms** (and at most 2 MiB) to answer VIDEO_NACK, resending the fragments asked for to that member alone, as VIDEO frames of the same type with the same plaintext, at most **512 KiB/s** in all. It tells its application of keyframe requests at most every 500 ms per track and layer, however many members ask, and the application sends a keyframe of that layer soon after.
+A sender keeps its frames for **500 ms** (and at most 2 MiB) to answer VIDEO_NACK, resending the fragments asked for to that member alone, as VIDEO frames of the same type with the same plaintext, at most **512 KiB/s** in all, and ahead of the video it has queued since: a frame waits for them. It tells its application of keyframe requests at most every 500 ms per track and layer, however many members ask, and the application sends a keyframe of that layer soon after.
 
 **Layers.** A sender SHOULD encode only the layers DEMAND says are wanted: for each wanted layer, the one it sends that is nearest below or equal to it, else its lowest, which is what the relay forwards (§3.3). A layer that becomes wanted SHOULD start with a keyframe, so that the relay can move members to it at once. A member that subscribes to a layer of a sender whose video it already receives also sends that sender KEYFRAME_REQUEST for the new layer of each of its tracks. A member keeps its subscriptions across reconnections, sending SUBSCRIBE again whenever it admits the member concerned.
 
@@ -394,7 +394,7 @@ The codec is the application's. Implementations that want to interoperate with t
 | A link not keeping up | video dropped, or queued video > 32 KiB and > 250 ms of its pace for ≥ 300 ms; then one layer down, at most every 2 s | relays (reference), senders |
 | A link given more | after 8 s of keeping up, doubling up to 60 s after a try that fails within 5 s | relays (reference), senders |
 | Video queued per recipient | 1 MiB, oldest dropped (reference relay) | relays |
-| Video: ask for a fragment / give a frame up / ask for a keyframe | after 5 ms / 300 ms / at most every 500 ms | receivers |
+| Video: ask for a fragment / give a frame up / ask for a keyframe | 5 ms after it is missing, twice / 300 ms (1.5 round trips) without progress / at most every 500 ms | receivers |
 | Video kept for resending | 500 ms, ≤ 2 MiB; resent at ≤ 512 KiB/s | senders |
 | Profile | ≤ 1,024 bytes | senders |
 | Snapshot window | 16 KiB – 1 MiB unacknowledged, adapting to the delay it adds (50 ms by default) | providers |

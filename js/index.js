@@ -164,8 +164,6 @@ export class Connection extends EventTarget {
 const VOICE_BACKLOG = 4 << 10;
 /** Video waiting to be sent beyond which the oldest is dropped: room for the largest frame (a 1080p screen's keyframe). */
 const VIDEO_BACKLOG = 1 << 20;
-/** Resent video is not queued behind more than this much video (see `WebTransportLink.send`). */
-const RESEND_ROOM = 32 << 10;
 /** Incoming datagrams the browser may hold for us: the largest keyframe (1000 fragments) and more. */
 const INCOMING_DATAGRAMS = 2048;
 /** How often (ms, at least) the pace video leaves at is measured. */
@@ -187,6 +185,11 @@ const PACER_BURST = 16 << 10;
 const OFFERED_EVERY = 500;
 /** WebTransport stream priorities, by class (0 command, 1 voice, 2 chat, 3 bulk, 4 video): higher goes first. */
 const SEND_ORDER = [4, 3, 2, 0, 1];
+
+/** The video track of a frame, by its type (GROUP.md §7.4). */
+function videoTrack(frame) {
+  return frame[0] >= 0x30 && frame[0] <= 0x3f ? (frame[0] >> 3) & 1 : 0;
+}
 
 /** Whether this runtime can join groups: it needs WebTransport. */
 export function groupsSupported() {
@@ -526,8 +529,13 @@ class WebTransportLink {
   #queued = [0, 0, 0, 0, 0];
   #writing = [false, false, false, false, false];
   #datagrams = null;
-  /** Video frames waiting for room among the datagrams. */
-  #video = [];
+  /**
+   * Video frames waiting for room among the datagrams, by track. The tracks
+   * take turns, so that a large keyframe of one (a screen's) does not hold
+   * up the other (a camera's).
+   */
+  #video = [[], []];
+  #videoTurn = 0;
   #videoBytes = 0;
   /** Video bytes dropped from that queue, for falling behind. */
   #videoDropped = 0;
@@ -575,17 +583,18 @@ class WebTransportLink {
   /** Queues a frame of class `kind`; `resent`: video a receiver asked for again. */
   send(frame, kind, resent = false) {
     if (kind === 4) {
-      // Receivers ask for what is missing of a frame 5 ms after its first
-      // part (GROUP.md §7.4), sooner than a large one takes to arrive
-      // whole: while much of our video still waits here, what they ask
-      // for most likely does too, and sending it twice would only push out
-      // what follows.
-      if (resent && this.#videoBytes > RESEND_ROOM) return;
-      this.#video.push(frame);
+      // Receivers ask for a fragment once a later one arrived without it, or
+      // once the end of a frame stopped coming (GROUP.md §7.4): it was lost,
+      // and a frame, perhaps a keyframe, waits for it. It goes first, not
+      // behind the video queued since (the member limits how much is resent).
+      const queue = this.#video[videoTrack(frame)];
+      if (resent) queue.unshift(frame);
+      else queue.push(frame);
       this.#videoBytes += frame.length;
       measure(this.#offered, frame.length, OFFERED_EVERY);
       while (this.#videoBytes > VIDEO_BACKLOG) {
-        const dropped = this.#video.shift().length;
+        const [a, b] = this.#video;
+        const dropped = (a.length >= b.length ? a : b).shift().length;
         this.#videoBytes -= dropped;
         this.#videoDropped += dropped;
       }
@@ -612,9 +621,8 @@ class WebTransportLink {
    */
   dropVideo(track, layer) {
     const above = (frame) => frame[0] >= 0x30 && frame[0] <= 0x3f && ((frame[0] >> 3) & 1) === track && ((frame[0] >> 1) & 3) > layer;
-    const kept = this.#video.filter((frame) => !above(frame));
-    this.#videoBytes = kept.reduce((n, frame) => n + frame.length, 0);
-    this.#video = kept;
+    this.#video = this.#video.map((queue) => queue.filter((frame) => !above(frame)));
+    this.#videoBytes = this.#video.flat().reduce((n, frame) => n + frame.length, 0);
   }
 
   /** Video bytes waiting for room among the datagrams (or on the video stream). */
@@ -674,12 +682,13 @@ class WebTransportLink {
     if (this.#pacing) return;
     this.#pacing = true;
     try {
-      while (this.#video.length && !this.#closed) {
+      while (this.#videoBytes > 0 && !this.#closed) {
         const writer = this.#datagrams;
         if (!writer) return; // not open yet: sent once it is
-        const frame = this.#video[0];
+        const queue = this.#video[this.#videoTurn].length ? this.#video[this.#videoTurn] : this.#video[this.#videoTurn ^ 1];
+        const frame = queue[0];
         if (frame.length > (this.#session.datagrams.maxDatagramSize ?? 1024)) {
-          this.#videoBytes -= this.#video.shift().length;
+          this.#videoBytes -= queue.shift().length;
           this.#queue(4, frame);
           continue;
         }
@@ -692,7 +701,8 @@ class WebTransportLink {
           await new Promise((resolve) => setTimeout(resolve, wait));
           continue;
         }
-        this.#videoBytes -= this.#video.shift().length;
+        this.#videoBytes -= queue.shift().length;
+        this.#videoTurn ^= 1;
         writer.write(frame).catch(() => {});
         this.#videoLeft(frame.length);
       }

@@ -56,12 +56,14 @@
 	 * A shared screen: our second video track, sharp rather than smooth (15
 	 * frames a second, text kept crisp), from 360p for thumbnails up to 1080p
 	 * (or the screen's own size, if smaller) for the large view. A screen's
-	 * keyframes are large and seldom needed (it changes a little at a time;
-	 * receivers that lose one ask), so they come every 5 s, not 2.
+	 * keyframes are large (a 1080p one is 200–450 KB, and the picture waits
+	 * the 300 ms or so it takes to send) and seldom needed: it changes a
+	 * little at a time, and receivers that lose one, or move to another
+	 * layer, ask. So they come every 20 s, not 2.
 	 */
 	const SCREEN = {
 		framerate: 15,
-		keyframeInterval: 5000,
+		keyframeInterval: 20_000,
 		contentHint: 'detail' as const,
 		layers: [
 			{ layer: 1, width: 640, height: 360, bitrate: 300_000, minBitrate: 100_000 },
