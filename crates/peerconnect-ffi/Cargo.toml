@@ -15,7 +15,9 @@ name = "peerconnect_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-peerconnect = { path = "../peerconnect" }
+# `client`: pc_client_* connects over QUIC by itself, on the library's threads.
+peerconnect = { path = "../peerconnect", features = ["client"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 peerconnect-relay = { path = "../peerconnect-relay" }

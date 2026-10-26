@@ -1,116 +1,52 @@
 //! End-to-end tests of groups over real sockets: the Tokio group client
-//! against a relay. As in `e2e.rs`, set `PEERCONNECT_RELAY` to test any
-//! relay; tests that restart the relay or change its settings only run
-//! in-process. With `PEERCONNECT_TRANSPORT=quic`, the in-process relay also
-//! serves QUIC and members connect over it (raw protocol checks still use
-//! WebSockets, so groups mix both).
+//! against a relay, over QUIC, the only way groups travel. As in `e2e.rs`,
+//! set `PEERCONNECT_RELAY` to test any relay, here by its group relay URL
+//! (`https://…` or `quic://…`); tests that restart the relay or change its
+//! settings only run in-process. The in-process relay serves QUIC on the UDP
+//! port of the same number as its TCP one.
 
-use std::collections::HashSet;
+mod common;
+
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
-use peerconnect::client::group::{self, GroupConnection, Via};
-use peerconnect::group::transport::{self, Transport};
-use peerconnect::group::{Channel, Config, Event, Group, Identity, Member, MemberId, Output, wire};
+use common::{LocalRelay, Path, Wire, admitted, join, join_frame, wait, wait_up_to};
+use futures_util::StreamExt;
+use peerconnect::client::group::GroupConnection;
+use peerconnect::group::{Channel, Class, Event, Group, Identity, MemberId, wire};
 use peerconnect::wire::close;
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
+/// The relay under test: in-process, or the one `PEERCONNECT_RELAY` names.
 struct Relay {
     url: String,
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    local: Option<LocalRelay>,
 }
 
 impl Relay {
     async fn start() -> Relay {
         if let Ok(url) = std::env::var("PEERCONNECT_RELAY") {
-            return Relay { url, stop: None, task: None };
+            assert!(
+                url.starts_with("https://") || url.starts_with("quic://"),
+                "PEERCONNECT_RELAY={url}: groups travel over QUIC only, so an https:// or quic:// URL"
+            );
+            return Relay { url, local: None };
         }
         Relay::bind_with("127.0.0.1:0", Default::default()).await
     }
 
     async fn bind_with(addr: &str, config: peerconnect_relay::Config) -> Relay {
-        let quic = std::env::var("PEERCONNECT_TRANSPORT").is_ok_and(|t| t == "quic");
-        // QUIC on the UDP port of the same number.
-        let (listener, udp) = loop {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            if !quic {
-                break (listener, None);
-            }
-            match std::net::UdpSocket::bind(listener.local_addr().unwrap()) {
-                Ok(udp) => break (listener, Some(udp)),
-                Err(_) if addr.ends_with(":0") => continue,
-                Err(err) => panic!("{err}"),
-            }
-        };
-        let url = format!("{}://{}", if quic { "quic" } else { "ws" }, listener.local_addr().unwrap());
-        let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            peerconnect_relay::serve_all(listener, udp, config, async {
-                let _ = stopped.await;
-            })
-            .await
-            .unwrap()
-        });
-        Relay { url, stop: Some(stop), task: Some(task) }
-    }
-
-    /// The relay's WebSocket URL.
-    fn websocket(&self) -> String {
-        websocket_url(&self.url)
+        let local = LocalRelay::bind(addr, config, true).await;
+        Relay { url: local.url("quic"), local: Some(local) }
     }
 
     fn external(&self) -> bool {
-        self.task.is_none()
+        self.local.is_none()
     }
 
-    async fn shutdown(mut self) {
-        let _ = self.stop.take().unwrap().send(());
-        self.task.take().unwrap().await.unwrap();
+    async fn shutdown(self) {
+        self.local.unwrap().shutdown().await;
     }
-}
-
-fn join(group: &Group, name: &str) -> GroupConnection {
-    let config = Config { profile: name.as_bytes().to_vec(), ..Config::default() };
-    let conn = group::join(group.clone(), Identity::generate(), config).unwrap();
-    if group.relay().starts_with("quic://") {
-        OVER_QUIC.lock().unwrap().insert(conn.id());
-    }
-    conn
-}
-
-/// Members that must be connected over QUIC once admitted, not fallen back.
-static OVER_QUIC: std::sync::Mutex<std::collections::BTreeSet<MemberId>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-async fn wait(conn: &mut GroupConnection, what: impl Fn(&Event) -> bool) -> Event {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let event = conn.next().await.expect("connection ended");
-            if what(&event) {
-                return event;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for event")
-}
-
-/// Waits until `conn` has admitted `count` other members.
-async fn admitted(conn: &mut GroupConnection, count: usize) {
-    let mut seen = HashSet::new();
-    while seen.len() < count {
-        match wait(conn, |e| matches!(e, Event::Joined { .. } | Event::Left { .. })).await {
-            Event::Joined { member, .. } => seen.insert(member),
-            Event::Left { member } => seen.remove(&member),
-            _ => unreachable!(),
-        };
-    }
-    let expected = if OVER_QUIC.lock().unwrap().contains(&conn.id()) { Via::Quic } else { Via::WebSocket };
-    assert_eq!(conn.via(), Some(expected));
 }
 
 async fn message(conn: &mut GroupConnection, from: MemberId) -> (Channel, String) {
@@ -297,63 +233,15 @@ async fn a_newcomer_syncs_a_4_mb_world_while_commands_flow() {
     eprintln!("{} KiB snapshot in {took:?}", size >> 10);
 }
 
-// Raw protocol checks against the relay.
+// Raw protocol checks against the relay, over raw QUIC: the path first on
+// the command stream, then each class on a stream of its own, voice as
+// datagrams.
 
-type RawWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// Connects and joins by hand; returns the socket, the slot and the bitmap.
-async fn raw_join(group: &Group, identity: &Identity) -> (RawWs, u8, u32) {
-    let mut ws = raw(group).await;
-    let hello = next_binary(&mut ws).await;
-    ws.send(Message::binary(join_frame(group, identity, &hello))).await.unwrap();
-    let welcome = next_binary(&mut ws).await;
-    assert_eq!(welcome.len(), wire::WELCOME_LEN);
-    assert_eq!(welcome[0], wire::WELCOME);
-    (ws, welcome[1], u32::from_be_bytes(welcome[2..].try_into().unwrap()))
-}
-
-async fn raw(group: &Group) -> RawWs {
-    tokio_tungstenite::connect_async(websocket_url(&group.endpoint())).await.unwrap().0
-}
-
-/// The WebSocket a relay URL (or a URL under one) falls back to.
-fn websocket_url(url: &str) -> String {
-    match transport::transports(url).pop() {
-        Some(Transport::WebSocket(url)) => url,
-        other => panic!("{other:?}"),
-    }
-}
-
-/// The JOIN a member sends for this HELLO, without going through a driver.
-fn join_frame(group: &Group, identity: &Identity, hello: &[u8]) -> Vec<u8> {
-    let mut m = Member::new(group.clone(), Identity::from_seed(*identity.seed()), Config::default(), 0).unwrap();
-    m.poll_output();
-    m.handle_open(0);
-    m.handle_binary(0, hello);
-    match m.poll_output() {
-        Some(Output::Send(frame, _)) => frame,
-        other => panic!("{other:?}"),
-    }
-}
-
-async fn next_binary(ws: &mut RawWs) -> Vec<u8> {
-    loop {
-        match timeout(Duration::from_secs(20), ws.next()).await.unwrap() {
-            Some(Ok(Message::Binary(b))) => return b.to_vec(),
-            Some(Ok(Message::Text(t))) if t == "pong" => {}
-            other => panic!("expected a binary frame, got {other:?}"),
-        }
-    }
-}
-
-async fn close_code(ws: &mut RawWs) -> Option<u16> {
-    loop {
-        match timeout(Duration::from_secs(20), ws.next()).await.expect("no close") {
-            Some(Ok(Message::Close(frame))) => return frame.map(|f| f.code.into()),
-            Some(Ok(_)) => {}
-            Some(Err(_)) | None => return None,
-        }
-    }
+/// Connects and joins by hand; returns the session, the slot and the bitmap.
+async fn raw_join(group: &Group, identity: &Identity) -> (Wire, u8, u32) {
+    let mut wire = Wire::raw(&group.endpoint()).await;
+    let (slot, present) = wire.join(group, identity).await;
+    (wire, slot, present)
 }
 
 #[tokio::test]
@@ -366,50 +254,53 @@ async fn relay_conformance() {
     assert_eq!((slot_a, present), (0, 0));
     let (mut b, slot_b, present) = raw_join(&group, &ib).await;
     assert_eq!((slot_b, present), (1, 1));
-    assert_eq!(next_binary(&mut a).await, wire::member(1, true));
+    assert_eq!(a.frame().await, wire::member(1, true));
 
-    // Frames go to everyone else, or to one slot, verbatim.
+    // Frames go to everyone else, or to one slot, verbatim, on their class's stream.
     let broadcast = vec![wire::COMMAND, slot_b, wire::BROADCAST, 9, 9];
-    b.send(Message::binary(broadcast.clone())).await.unwrap();
-    assert_eq!(next_binary(&mut a).await, broadcast);
+    b.send(Class::Command, &broadcast).await;
+    assert_eq!(a.next().await, common::Got::Frame(Class::Command, broadcast));
     let (mut c, slot_c, _) = raw_join(&group, &ic).await;
-    assert_eq!(next_binary(&mut a).await, wire::member(slot_c, true));
-    assert_eq!(next_binary(&mut b).await, wire::member(slot_c, true));
+    assert_eq!(a.frame().await, wire::member(slot_c, true));
+    assert_eq!(b.frame().await, wire::member(slot_c, true));
     let direct = vec![wire::CHAT, slot_a, slot_c, 1];
-    a.send(Message::binary(direct.clone())).await.unwrap();
-    assert_eq!(next_binary(&mut c).await, direct);
+    a.send(Class::Chat, &direct).await;
+    assert_eq!(c.next().await, common::Got::Frame(Class::Chat, direct));
     let largest = [&[wire::BULK, slot_a, slot_b][..], &vec![7; wire::MAX_FRAME_LEN - 3]].concat();
-    a.send(Message::binary(largest.clone())).await.unwrap();
-    assert_eq!(next_binary(&mut b).await, largest);
+    a.send(Class::Bulk, &largest).await;
+    assert_eq!(b.next().await, common::Got::Frame(Class::Bulk, largest));
+    let voice = vec![wire::VOICE, slot_c, wire::BROADCAST, 5, 5];
+    c.datagram(&voice);
+    assert_eq!(a.next().await, common::Got::Datagram(voice.clone()));
+    assert_eq!(b.next().await, common::Got::Datagram(voice));
 
     // The same identity takes its old slot back; the others hear of a new connection there.
     let (mut b2, slot, _) = raw_join(&group, &ib).await;
     assert_eq!(slot, slot_b);
-    assert_eq!(close_code(&mut b).await, Some(close::REPLACED));
-    assert_eq!(next_binary(&mut a).await, wire::member(slot_b, true));
-    assert_eq!(next_binary(&mut c).await, wire::member(slot_b, true));
+    assert_eq!(b.closed().await, Some(close::REPLACED));
+    assert_eq!(a.frame().await, wire::member(slot_b, true));
+    assert_eq!(c.frame().await, wire::member(slot_b, true));
 
     // The replaced connection's frames go nowhere.
-    let _ = b.send(Message::binary(vec![wire::COMMAND, slot_b, wire::BROADCAST, 6])).await;
+    b.send(Class::Command, &[wire::COMMAND, slot_b, wire::BROADCAST, 6]).await;
 
     // Lying about the slot, relay frames and oversized frames are refused.
-    b2.send(Message::binary(vec![wire::COMMAND, slot_a, wire::BROADCAST])).await.unwrap();
-    assert_eq!(close_code(&mut b2).await, Some(close::PROTOCOL_ERROR));
-    assert_eq!(next_binary(&mut a).await, wire::member(slot_b, false));
-    assert_eq!(next_binary(&mut c).await, wire::member(slot_b, false));
-    c.send(Message::binary([&[wire::BULK, slot_c, wire::BROADCAST][..], &vec![0; wire::MAX_FRAME_LEN]].concat()))
-        .await
-        .unwrap();
-    assert_eq!(close_code(&mut c).await, Some(close::TOO_BIG));
-    assert_eq!(next_binary(&mut a).await, wire::member(slot_c, false));
-    a.send(Message::binary(vec![wire::WELCOME, 0, 0, 0, 0, 0])).await.unwrap();
-    assert_eq!(close_code(&mut a).await, Some(close::PROTOCOL_ERROR));
+    b2.send(Class::Command, &[wire::COMMAND, slot_a, wire::BROADCAST]).await;
+    assert_eq!(b2.closed().await, Some(close::PROTOCOL_ERROR));
+    assert_eq!(a.frame().await, wire::member(slot_b, false));
+    assert_eq!(c.frame().await, wire::member(slot_b, false));
+    let oversized = [&[wire::BULK, slot_c, wire::BROADCAST][..], &vec![0; wire::MAX_FRAME_LEN]].concat();
+    c.write(Class::Bulk, &[&(oversized.len() as u16).to_be_bytes()[..], &oversized].concat()).await;
+    assert_eq!(c.closed().await, Some(close::TOO_BIG));
+    assert_eq!(a.frame().await, wire::member(slot_c, false));
+    a.send(Class::Command, &[wire::WELCOME, 0, 0, 0, 0, 0]).await;
+    assert_eq!(a.closed().await, Some(close::PROTOCOL_ERROR));
 
     // A JOIN for another nonce, or for a two-peer room, is refused.
-    let mut d = raw(&group).await;
-    next_binary(&mut d).await;
-    d.send(Message::binary(join_frame(&group, &ia, &[&[wire::HELLO][..], &[0; 32]].concat()))).await.unwrap();
-    assert_eq!(close_code(&mut d).await, Some(close::UNAUTHORIZED));
+    let mut d = Wire::raw(&group.endpoint()).await;
+    d.frame().await;
+    d.send(Class::Command, &join_frame(&group, &ia, &[&[wire::HELLO][..], &[0; 32]].concat())).await;
+    assert_eq!(d.closed().await, Some(close::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -421,10 +312,32 @@ async fn a_full_group_refuses_the_next_member() {
     for _ in 0..wire::MAX_SLOTS {
         seated.push(raw_join(&group, &Identity::generate()).await);
     }
-    let mut extra = raw(&group).await;
-    let hello = next_binary(&mut extra).await;
-    extra.send(Message::binary(join_frame(&group, &Identity::generate(), &hello))).await.unwrap();
-    assert_eq!(close_code(&mut extra).await, Some(close::FULL));
+    let mut extra = Wire::raw(&group.endpoint()).await;
+    let hello = extra.frame().await;
+    extra.send(Class::Command, &join_frame(&group, &Identity::generate(), &hello)).await;
+    assert_eq!(extra.closed().await, Some(close::FULL));
+}
+
+#[tokio::test]
+async fn groups_are_not_served_over_websockets() {
+    let relay = Relay::start().await;
+    let Some(local) = &relay.local else {
+        return; // where an external relay serves TCP, if at all, is its own business
+    };
+    let group = Group::create(&relay.url).unwrap();
+    // A group path is refused before the upgrade.
+    let refused = tokio_tungstenite::connect_async(format!("{}/g1/{}", local.url("ws"), group.id())).await;
+    match refused {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status(), 404),
+        other => panic!("{:?}", other.map(|(_, response)| response)),
+    }
+    // A two-peer room on the same port still upgrades.
+    let room = peerconnect::Room::create(&local.url("ws")).unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/v1/{}", local.url("ws"), room.id())).await.unwrap();
+    match timeout(Duration::from_secs(10), ws.next()).await.unwrap() {
+        Some(Ok(Message::Binary(hello))) => assert_eq!(hello[0], peerconnect::wire::HELLO),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -438,8 +351,10 @@ async fn a_member_that_stops_reading_costs_the_others_nothing() {
     let mut b = join(&group, "b");
     admitted(&mut a, 1).await;
     admitted(&mut b, 1).await;
-    // A member that joins and then never reads again.
+    // A member that joins and then never reads again: QUIC flow control
+    // soon stops the relay sending to it.
     let (stuck, _, _) = raw_join(&group, &Identity::generate()).await;
+    stuck.read(false);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Lots of traffic: voice for the stuck one is dropped, then its
@@ -474,6 +389,7 @@ async fn commands_overtake_a_backlog_of_chat() {
     let group = Group::create(&relay.url).unwrap();
     let mut a = join(&group, "a");
     let (mut slow, slot, _) = raw_join(&group, &Identity::generate()).await;
+    slow.read(false);
     wait(&mut a, |e| matches!(e, Event::State(_))).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let filler = "c".repeat(15_000);
@@ -485,9 +401,10 @@ async fn commands_overtake_a_backlog_of_chat() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Now read: KEY retries and the like aside, count the chat frames that
     // come before the command.
+    slow.read(true);
     let mut chat_before = 0;
     loop {
-        let frame = next_binary(&mut slow).await;
+        let frame = slow.frame().await;
         match frame[0] {
             wire::CHAT => chat_before += 1,
             wire::COMMAND => break,
@@ -495,14 +412,15 @@ async fn commands_overtake_a_backlog_of_chat() {
         }
     }
     eprintln!("the command overtook {} of 60 chat messages (slot {slot})", 60 - chat_before);
-    // Some were already in the kernel's buffers; the rest it overtook.
+    // Some were already in the chat stream's window; the rest it overtook.
     assert!(chat_before < 60, "{chat_before}");
 }
 
 #[tokio::test]
 async fn keepalives_flow_and_measure_the_round_trip() {
-    // Longer than the 10 s ping interval: pings go out, pongs come back,
-    // and nobody is dropped for being quiet.
+    // Longer than the 10 s ping interval: pings (the empty message on the
+    // command stream) go out, pongs come back, and nobody is dropped for
+    // being quiet.
     let relay = Relay::start().await;
     let group = Group::create(&relay.url).unwrap();
     let mut a = join(&group, "a");
@@ -517,6 +435,7 @@ async fn keepalives_flow_and_measure_the_round_trip() {
         seen.push(e);
     }
     assert!(!seen.iter().any(|e| matches!(e, Event::Left { .. })), "{seen:?}");
+    assert!(a.connected() && b.connected());
 }
 
 #[tokio::test]
@@ -524,11 +443,12 @@ async fn a_connection_that_never_joins_is_closed() {
     let relay = Relay::start().await;
     let group = Group::create(&relay.url).unwrap();
     let started = Instant::now(); // the relay's clock starts later: at its end of the connection
-    let mut ws = raw(&group).await;
-    next_binary(&mut ws).await; // HELLO
-    ws.send(Message::text("ping")).await.unwrap();
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("pong"));
-    assert_eq!(close_code(&mut ws).await, Some(close::TIMEOUT));
+    let mut w = Wire::raw(&group.endpoint()).await;
+    assert_eq!(w.frame().await[0], wire::HELLO);
+    // The empty message is ping, answered with the empty message, pong.
+    w.send(Class::Command, &[]).await;
+    assert_eq!(w.next().await, common::Got::Pong);
+    assert_eq!(w.closed().await, Some(close::TIMEOUT));
     assert!(started.elapsed() >= wire::JOIN_TIMEOUT - Duration::from_millis(500));
 }
 
@@ -567,47 +487,28 @@ async fn a_sender_over_the_rate_limit_loses_voice_and_waits_for_the_rest() {
     assert!(voice < 300, "voice over the rate is dropped");
 }
 
-/// A TCP proxy whose connections can be cut without a goodbye.
-async fn cuttable_proxy(target: &str) -> (String, tokio::sync::watch::Sender<u32>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
-    let target = target.trim_start_matches("ws://").to_string();
-    let (cut, cuts) = tokio::sync::watch::channel(0u32);
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut client, _)) = listener.accept().await else { return };
-            let target = target.clone();
-            let mut cuts = cuts.clone();
-            cuts.mark_unchanged();
-            tokio::spawn(async move {
-                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else { return };
-                tokio::select! {
-                    _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
-                    _ = cuts.changed() => {} // dropped: an abrupt end, no close frame
-                }
-            });
-        }
-    });
-    (url, cut)
-}
-
 #[tokio::test]
 async fn an_abruptly_cut_connection_recovers() {
     let relay = Relay::start().await;
-    if relay.external() {
-        return;
-    }
-    let (proxy, cut) = cuttable_proxy(&relay.websocket()).await;
-    let group = Group::create(&proxy).unwrap();
+    let Some(local) = &relay.local else { return };
+    let (pa, pb) = (Path::new(local.addr, Duration::ZERO).await, Path::new(local.addr, Duration::ZERO).await);
+    let group = Group::create(&pa.url("quic")).unwrap();
     let mut a = join(&group, "a");
-    let mut b = join(&group, "b");
+    let mut b = join(&group.with_relay(&pb.url("quic")).unwrap(), "b");
     admitted(&mut a, 1).await;
     admitted(&mut b, 1).await;
-    cut.send_modify(|n| *n += 1);
+    // Both connections end without a goodbye: no close, no reset, nothing
+    // gets through. Each member notices only once the relay has been silent
+    // for too long, and connects again (from a new port, which gets through).
+    pa.cut();
+    pb.cut();
     for i in 0..5 {
         a.send(Channel::Command, format!("{i}")).await.unwrap();
     }
-    for i in 0..5 {
+    let limit = wire::RECEIVE_TIMEOUT + Duration::from_secs(20);
+    let first = wait_up_to(&mut b, limit, |e| matches!(e, Event::Message { .. })).await;
+    assert_eq!(first, Event::Message { from: a.id(), channel: Channel::Command, data: b"0".to_vec(), direct: false });
+    for i in 1..5 {
         assert_eq!(message(&mut b, a.id()).await, (Channel::Command, i.to_string()));
     }
 }

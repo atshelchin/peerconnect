@@ -1,5 +1,8 @@
 //! C ABI for PeerConnect groups: see `include/peerconnect.h`, whose comments
-//! are the documentation. It wraps [`peerconnect::group::Member`] one to one.
+//! are the documentation. `pc_client_*` wraps the Tokio client
+//! ([`peerconnect::client::group`]), which connects over QUIC on the
+//! library's own threads; `pc_member_*` wraps [`peerconnect::group::Member`]
+//! one to one, for applications that bring their own QUIC.
 //!
 //! Every function checks its pointers for NULL; beyond that, callers must
 //! pass valid pointers of the stated lengths.
@@ -7,9 +10,13 @@
 #![allow(clippy::missing_safety_doc)] // the header documents the contract
 
 use std::ffi::{CStr, CString, c_char};
+use std::future::Future;
 use std::slice;
+use std::sync::OnceLock;
 
+use peerconnect::client::group::{self as client, GroupConnection};
 use peerconnect::group::{Channel, Config, Event, Group, Identity, Member, MemberId, Output, SendError, State};
+use tokio::runtime::Runtime;
 
 pub const PC_OK: i32 = 0;
 pub const PC_TOO_LARGE: i32 = 1;
@@ -54,6 +61,25 @@ pub struct PcOutput {
     pub track: u8,
     pub keyframe: u8,
     pub timestamp: u32,
+}
+
+impl PcOutput {
+    const NONE: PcOutput = PcOutput {
+        kind: PC_NONE,
+        member: [0; 32],
+        channel: 0,
+        direct: 0,
+        class_: 0,
+        state: 0,
+        seq: 0,
+        transfer: 0,
+        count: 0,
+        data: std::ptr::null(),
+        len: 0,
+        track: 0,
+        keyframe: 0,
+        timestamp: 0,
+    };
 }
 
 pub struct PcMember {
@@ -218,22 +244,7 @@ pub unsafe extern "C" fn pc_member_poll_timeout(m: *const PcMember) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_member_poll(m: *mut PcMember, out: *mut PcOutput) -> i32 {
     let (Some(m), Some(out)) = (unsafe { m.as_mut() }, unsafe { out.as_mut() }) else { return PC_NONE };
-    *out = PcOutput {
-        kind: PC_NONE,
-        member: [0; 32],
-        channel: 0,
-        direct: 0,
-        class_: 0,
-        state: 0,
-        seq: 0,
-        transfer: 0,
-        count: 0,
-        data: std::ptr::null(),
-        len: 0,
-        track: 0,
-        keyframe: 0,
-        timestamp: 0,
-    };
+    *out = PcOutput::NONE;
     let Some(output) = m.member.poll_output() else { return PC_NONE };
     let (kind, held) = match output {
         Output::Connect(url) => {
@@ -248,72 +259,7 @@ pub unsafe extern "C" fn pc_member_poll(m: *mut PcMember, out: *mut PcOutput) ->
         }
         Output::Ping => (PC_PING, Vec::new()),
         Output::Disconnect => (PC_DISCONNECT, Vec::new()),
-        Output::Event(event) => match event {
-            Event::State(state) => {
-                out.state = match state {
-                    State::Offline => 0,
-                    State::Online => 1,
-                    State::Closed => 2,
-                };
-                (PC_STATE, Vec::new())
-            }
-            Event::Joined { member, profile } => {
-                out.member = member.0;
-                (PC_JOINED, profile)
-            }
-            Event::Left { member } => {
-                out.member = member.0;
-                (PC_LEFT, Vec::new())
-            }
-            Event::Message { from, channel, data, direct } => {
-                out.member = from.0;
-                out.channel = channel as u8;
-                out.direct = direct as u8;
-                (PC_MESSAGE, data)
-            }
-            Event::Voice { from, seq, data } => {
-                out.member = from.0;
-                out.seq = seq;
-                (PC_VOICE, data)
-            }
-            Event::Datagram { from, data } => {
-                out.member = from.0;
-                (PC_DATAGRAM, data)
-            }
-            Event::Missed { from, channel, count } => {
-                out.member = from.0;
-                out.channel = channel as u8;
-                out.count = count;
-                (PC_MISSED, Vec::new())
-            }
-            Event::SyncRequest { from, transfer } => {
-                out.member = from.0;
-                out.transfer = transfer;
-                (PC_SYNC_REQUEST, Vec::new())
-            }
-            Event::Snapshot { from, data } => {
-                out.member = from.0;
-                (PC_SNAPSHOT, data)
-            }
-            Event::SyncFailed { from } => {
-                out.member = from.0;
-                (PC_SYNC_FAILED, Vec::new())
-            }
-            Event::Video { from, track, keyframe, timestamp, data } => {
-                out.member = from.0;
-                out.track = track;
-                out.keyframe = keyframe as u8;
-                out.timestamp = timestamp;
-                (PC_VIDEO, data)
-            }
-            Event::KeyframeRequest { from, track } => {
-                out.member = from.0;
-                out.track = track;
-                (PC_KEYFRAME_REQUEST, Vec::new())
-            }
-            Event::Replaced => (PC_REPLACED, Vec::new()),
-            Event::Full => (PC_FULL, Vec::new()),
-        },
+        Output::Event(event) => fill(event, out),
     };
     m.held = held;
     out.kind = kind;
@@ -322,6 +268,76 @@ pub unsafe extern "C" fn pc_member_poll(m: *mut PcMember, out: *mut PcOutput) ->
         out.len = m.held.len();
     }
     kind
+}
+
+/// Writes an event's fields into `out`; returns its kind and the bytes `data` points at.
+fn fill(event: Event, out: &mut PcOutput) -> (i32, Vec<u8>) {
+    match event {
+        Event::State(state) => {
+            out.state = match state {
+                State::Offline => 0,
+                State::Online => 1,
+                State::Closed => 2,
+            };
+            (PC_STATE, Vec::new())
+        }
+        Event::Joined { member, profile } => {
+            out.member = member.0;
+            (PC_JOINED, profile)
+        }
+        Event::Left { member } => {
+            out.member = member.0;
+            (PC_LEFT, Vec::new())
+        }
+        Event::Message { from, channel, data, direct } => {
+            out.member = from.0;
+            out.channel = channel as u8;
+            out.direct = direct as u8;
+            (PC_MESSAGE, data)
+        }
+        Event::Voice { from, seq, data } => {
+            out.member = from.0;
+            out.seq = seq;
+            (PC_VOICE, data)
+        }
+        Event::Datagram { from, data } => {
+            out.member = from.0;
+            (PC_DATAGRAM, data)
+        }
+        Event::Missed { from, channel, count } => {
+            out.member = from.0;
+            out.channel = channel as u8;
+            out.count = count;
+            (PC_MISSED, Vec::new())
+        }
+        Event::SyncRequest { from, transfer } => {
+            out.member = from.0;
+            out.transfer = transfer;
+            (PC_SYNC_REQUEST, Vec::new())
+        }
+        Event::Snapshot { from, data } => {
+            out.member = from.0;
+            (PC_SNAPSHOT, data)
+        }
+        Event::SyncFailed { from } => {
+            out.member = from.0;
+            (PC_SYNC_FAILED, Vec::new())
+        }
+        Event::Video { from, track, keyframe, timestamp, data } => {
+            out.member = from.0;
+            out.track = track;
+            out.keyframe = keyframe as u8;
+            out.timestamp = timestamp;
+            (PC_VIDEO, data)
+        }
+        Event::KeyframeRequest { from, track } => {
+            out.member = from.0;
+            out.track = track;
+            (PC_KEYFRAME_REQUEST, Vec::new())
+        }
+        Event::Replaced => (PC_REPLACED, Vec::new()),
+        Event::Full => (PC_FULL, Vec::new()),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -409,4 +425,217 @@ pub unsafe extern "C" fn pc_member_decline_sync(m: *mut PcMember, to: *const u8,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_member_leave(m: *mut PcMember) {
     unsafe { with(m, (), |m| m.member.leave()) }
+}
+
+// A member that connects by itself: the Tokio client on the library's runtime.
+
+pub struct PcClient {
+    conn: GroupConnection,
+    /// The admitted members, as the events polled so far tell.
+    members: Vec<MemberId>,
+    /// The bytes the last event points at.
+    held: Vec<u8>,
+}
+
+/// The runtime every client runs on: two threads, started with the first client.
+fn runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("peerconnect")
+            .enable_all()
+            .build()
+            .expect("a Tokio runtime")
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_join(
+    invite: *const c_char,
+    seed: *const u8,
+    profile: *const u8,
+    profile_len: usize,
+) -> *mut PcClient {
+    if invite.is_null() || seed.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(Ok(group)) = unsafe { CStr::from_ptr(invite) }.to_str().map(str::parse::<Group>) else {
+        return std::ptr::null_mut();
+    };
+    let identity = Identity::from_seed(unsafe { *(seed as *const [u8; 32]) });
+    let config = Config { profile: unsafe { bytes(profile, profile_len) }.to_vec(), ..Config::default() };
+    let _runtime = runtime().enter();
+    match client::join(group, identity, config) {
+        Ok(conn) => Box::into_raw(Box::new(PcClient { conn, members: Vec::new(), held: Vec::new() })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Leaves the group (what was sent is still delivered) and frees the client.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_free(c: *mut PcClient) {
+    if !c.is_null() {
+        let _runtime = runtime().enter();
+        drop(unsafe { Box::from_raw(c) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_id(c: *const PcClient, out: *mut u8) {
+    if let (Some(c), false) = (unsafe { c.as_ref() }, out.is_null()) {
+        unsafe { *(out as *mut [u8; 32]) = c.conn.id().0 };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_connected(c: *const PcClient) -> i32 {
+    unsafe { c.as_ref() }.is_some_and(|c| c.conn.connected()) as i32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_members(c: *const PcClient, ids: *mut [u8; 32], max: usize) -> usize {
+    let Some(c) = (unsafe { c.as_ref() }) else { return 0 };
+    if !ids.is_null() {
+        for (i, id) in c.members.iter().take(max).enumerate() {
+            unsafe { *ids.add(i) = id.0 };
+        }
+    }
+    c.members.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_poll(c: *mut PcClient, out: *mut PcOutput) -> i32 {
+    let (Some(c), Some(out)) = (unsafe { c.as_mut() }, unsafe { out.as_mut() }) else { return PC_NONE };
+    *out = PcOutput::NONE;
+    let Some(event) = c.conn.try_next() else { return PC_NONE };
+    match &event {
+        Event::Joined { member, .. } if !c.members.contains(member) => c.members.push(*member),
+        Event::Left { member } => c.members.retain(|m| m != member),
+        _ => {}
+    }
+    let (kind, held) = fill(event, out);
+    c.held = held;
+    out.kind = kind;
+    out.data = c.held.as_ptr();
+    out.len = c.held.len();
+    kind
+}
+
+/// Runs `task` on the library's runtime and waits for it: from any thread,
+/// including one that runs a Tokio runtime of its own.
+fn wait<T: Send + 'static>(task: impl Future<Output = T> + Send + 'static) -> T {
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    runtime().spawn(async move {
+        let _ = done.send(task.await);
+    });
+    result.recv().expect("the runtime outlives every task")
+}
+
+/// Runs `f` on the client behind `c`, or returns `default` for NULL.
+unsafe fn with_client<T>(c: *mut PcClient, default: T, f: impl FnOnce(&mut PcClient) -> T) -> T {
+    match unsafe { c.as_mut() } {
+        Some(c) => f(c),
+        None => default,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_send(c: *mut PcClient, ch: u8, data: *const u8, len: usize, id: *mut u64) -> i32 {
+    let Some(ch) = channel(ch) else { return PC_INVALID };
+    let data = unsafe { bytes(data, len) }.to_vec();
+    unsafe {
+        with_client(c, PC_INVALID, |c| {
+            let sender = c.conn.sender();
+            match wait(async move { sender.send(ch, data).await }) {
+                Ok(sent) => {
+                    if let Some(id) = id.as_mut() {
+                        *id = sent;
+                    }
+                    PC_OK
+                }
+                Err(e) => code(Err(e)),
+            }
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_send_to(
+    c: *mut PcClient,
+    to: *const u8,
+    ch: u8,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let (Some(to), Some(ch)) = (unsafe { id(to) }, channel(ch)) else { return PC_INVALID };
+    let data = unsafe { bytes(data, len) }.to_vec();
+    unsafe {
+        with_client(c, PC_INVALID, |c| {
+            let sender = c.conn.sender();
+            code(wait(async move { sender.send_to(to, ch, data).await }))
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_send_voice(c: *mut PcClient, seq: u16, data: *const u8, len: usize) {
+    let data = unsafe { bytes(data, len) }.to_vec();
+    unsafe { with_client(c, (), |c| c.conn.send_voice(seq, data)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_send_datagram(c: *mut PcClient, to: *const u8, data: *const u8, len: usize) {
+    let to = unsafe { id(to) };
+    let data = unsafe { bytes(data, len) }.to_vec();
+    unsafe { with_client(c, (), |c| c.conn.send_datagram(to, data)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_send_video(
+    c: *mut PcClient,
+    track: u8,
+    keyframe: u8,
+    timestamp: u32,
+    data: *const u8,
+    len: usize,
+) {
+    let data = unsafe { bytes(data, len) }.to_vec();
+    unsafe { with_client(c, (), |c| c.conn.send_video(track, keyframe != 0, timestamp, data)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_request_sync(c: *mut PcClient, from: *const u8) -> i32 {
+    let Some(from) = (unsafe { id(from) }) else { return PC_INVALID };
+    unsafe {
+        with_client(c, PC_INVALID, |c| {
+            let sender = c.conn.sender();
+            code(wait(async move { sender.request_sync(from).await }))
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_provide_sync(
+    c: *mut PcClient,
+    to: *const u8,
+    transfer: u32,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let Some(to) = (unsafe { id(to) }) else { return PC_INVALID };
+    let data = unsafe { bytes(data, len) }.to_vec();
+    unsafe {
+        with_client(c, PC_INVALID, |c| {
+            c.conn.provide_sync(to, transfer, data);
+            PC_OK
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_client_decline_sync(c: *mut PcClient, to: *const u8, transfer: u32) {
+    if let Some(to) = unsafe { id(to) } {
+        unsafe { with_client(c, (), |c| c.conn.decline_sync(to, transfer)) }
+    }
 }

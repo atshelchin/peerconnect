@@ -55,7 +55,10 @@ async fn main() -> ExitCode {
     }
     let slots = peerconnect::group::wire::MAX_SLOTS;
     if !(1..=slots).contains(&config.max_group_members) {
-        eprintln!("PEERCONNECT_MAX_GROUP_MEMBERS must be 1 to {slots} (GROUP.md §3.2), got {}", config.max_group_members);
+        eprintln!(
+            "PEERCONNECT_MAX_GROUP_MEMBERS must be 1 to {slots} (GROUP.md §3.2), got {}",
+            config.max_group_members
+        );
         return ExitCode::FAILURE;
     }
     config.trust_proxy = env::var("PEERCONNECT_TRUST_PROXY").is_ok_and(|v| v == "1" || v == "true");

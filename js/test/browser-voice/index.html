@@ -5,12 +5,16 @@
   import { Group, joinGroup } from "../../index.js";
   import { startVoice } from "../../voice.js";
 
+  /** WebTransport options pinning the relay's certificate by `hash` (bytes), if given. */
+  const pinning = (hash) => hash && { serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(hash) }] };
+
   // Two members in one page; measures, per frame of a's voice, the time from
   // the end of its capture to the start of its playout at b.
-  window.run = async ({ relay, seconds, vad, minDelay, maxDelay, webTransport }) => {
+  window.run = async ({ relay, hash, seconds, vad, minDelay, maxDelay }) => {
     // Frames with sound in them (over -55 dBFS), and how many of those went out.
     const sender = { sound: 0, soundSent: 0, sent: 0 };
     const group = Group.create(relay);
+    const webTransport = pinning(hash);
     const a = joinGroup(group, { profile: "a", webTransport });
     const b = joinGroup(group, { profile: "b", webTransport });
     await new Promise((resolve) => {
@@ -63,7 +67,7 @@
     const context = new AudioContext();
     const output = { base: context.baseLatency, output: context.outputLatency };
     await context.close();
-    const via = [a.via, b.via];
+    const connected = [a.connected, b.connected];
     await va.stop();
     await vb.stop();
     a.leave();
@@ -85,11 +89,11 @@
       sender,
       lostSound: [...soundSeqs].filter((s) => !playedSeqs.has(s)).length,
       soundSent: soundSeqs.size,
-      via,
+      connected,
     };
   };
   // Listening only until the microphone is turned on, and released again when it is turned off.
-  window.microphone = async ({ relay }) => {
+  window.microphone = async ({ relay, hash }) => {
     const calls = [];
     const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia = async (c) => {
@@ -98,7 +102,7 @@
       return stream;
     };
     const group = Group.create(relay);
-    const a = joinGroup(group, { profile: "a" });
+    const a = joinGroup(group, { profile: "a", webTransport: pinning(hash) });
     let sent = 0;
     const send = a.sendVoice.bind(a);
     a.sendVoice = (seq, data) => (sent++, send(seq, data));

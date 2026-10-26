@@ -16,7 +16,7 @@ use super::*;
 use crate::group::seal::{open, open_key, seal_key_salted};
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-vectors/g1.json");
-const RELAY: &str = "wss://relay.example.com";
+const RELAY: &str = "https://relay.example.com";
 
 fn bytes<const N: usize>(seed: u8) -> [u8; N] {
     std::array::from_fn(|i| seed.wrapping_add(i as u8))

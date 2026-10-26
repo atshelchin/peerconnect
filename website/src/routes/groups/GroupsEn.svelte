@@ -3,6 +3,7 @@
 		{ id: 'overview', label: 'What groups are for' },
 		{ id: 'guarantees', label: 'Guarantees' },
 		{ id: 'classes', label: 'Traffic classes' },
+		{ id: 'transport', label: 'QUIC only' },
 		{ id: 'identities', label: 'Identities and roles' },
 		{ id: 'state-transfer', label: 'State transfer' },
 		{ id: 'consistency', label: 'Consistency' },
@@ -18,9 +19,10 @@
 
 <script lang="ts">
 	import CodeBlock from '#lib/components/CodeBlock.svelte';
+	import { GROUP_RELAY_URL, REPO_URL } from '#lib/site.ts';
 	import {
 		cBuild,
-		cMember,
+		cClient,
 		installJs,
 		jsGroup,
 		jsRealtime,
@@ -36,7 +38,7 @@
 <p class="lead">
 	A room joins exactly two peers. A group joins up to four: a squad in a game, the players of a
 	shared world, a small team. Members send each other commands, chat, voice and state, end-to-end
-	encrypted, through the same untrusted, stateless relays.
+	encrypted, over QUIC, through an untrusted, stateless relay.
 </p>
 
 <p class="try"><a href="/demo/voice">Try it: a group voice and video chat in your browser →</a></p>
@@ -58,8 +60,8 @@
 </ul>
 <p>
 	Groups are a protocol of their own, <a href="/spec/groups">PeerConnect Groups</a>, on their own
-	relay endpoint (<code>/g1/&lt;group id&gt;</code>). The reference relays serve groups and rooms
-	side by side.
+	relay endpoint (<code>/g1/&lt;group id&gt;</code>). They travel over QUIC only, and the Linux
+	relay serves them next to rooms (<a href="#relays">Relays</a>).
 </p>
 <dl>
 	<dt>Group</dt>
@@ -69,7 +71,7 @@
 	</dd>
 	<dt>Invite</dt>
 	<dd>
-		The relay URL and the secret, as one string: <code>wss://relay…#…</code>. It is the whole
+		The relay URL and the secret, as one string: <code>https://relay…#…</code>. It is the whole
 		credential — no pairing, nothing else to store. Whoever holds it can join, read everything sent
 		to the group and send under their own identity, so give it only to members, over a private
 		channel. A game server that forms a squad would typically create the group and hand the invite
@@ -102,7 +104,7 @@
 	</li>
 	<li>
 		<strong>Voice and datagrams are real-time.</strong> They are dropped rather than delayed, wherever
-		they would wait: by the sender when its socket backs up, by the relay when a recipient is behind.
+		they would wait: by the sender when its connection backs up, by the relay when a recipient is behind.
 		Late audio is worse than lost audio.
 	</li>
 	<li>
@@ -122,8 +124,8 @@
 <h2 id="classes">Traffic classes</h2>
 <p>
 	A frame’s type decides its class, and that is all the relay knows about it. Each class has its own
-	queue at the sender and, for every recipient, in the relay, and its own counters in the
-	encryption. From most to least urgent:
+	queue at the sender and, for every recipient, in the relay, its own QUIC stream, and its own
+	counters in the encryption. From most to least urgent:
 </p>
 <div class="table">
 	<table>
@@ -166,6 +168,48 @@
 	video never starves chat. In the browser, <code>startVideo</code> from
 	<code>peerconnect/video</code> sends the camera through WebCodecs and draws each member into a canvas.
 	Each message on the command and chat streams carries up to 16,352 bytes.
+</p>
+
+<h2 id="transport">QUIC only</h2>
+<p>
+	Groups travel over QUIC and nothing else: WebTransport (HTTP/3) in browsers, raw QUIC (ALPN
+	<code>peerconnect-g1</code>) in Rust and the C library. Each class has a stream of its own, and
+	voice and video travel as datagrams, so a lost packet holds up only its own class and voice never
+	waits for a retransmission. Over TCP, one lost packet holds up voice, video and commands alike
+	until it is resent.
+</p>
+<p>
+	The difference is large. With 3% of packets lost on each hop, voice p99 was 138 ms over a
+	WebSocket and 53 ms over QUIC. In a browser with 2% lost each way, speech reached the other side
+	at p99 460–1170 ms over a WebSocket and 105–120 ms over WebTransport. So there is no WebSocket
+	fallback: a member that cannot reach the relay over UDP does not join, rather than join with voice
+	and video that stutter.
+</p>
+<h3 id="who-can-join">Who cannot join</h3>
+<ul>
+	<li>
+		<strong>Browsers without WebTransport.</strong> <code>groupsSupported()</code> is
+		<code>false</code> there, and <code>joinGroup</code> throws a <code>"NotSupportedError"</code>
+		<code>DOMException</code>. Check before you offer a group, and suggest a recent Chrome, Edge or
+		Firefox. The same holds for runtimes without WebTransport, such as Node.js: use the Rust client
+		there.
+	</li>
+	<li>
+		<strong>Networks that block UDP.</strong> Some company, school and hotel networks let only TCP out.
+		The member needs another network.
+	</li>
+	<li>
+		<strong>Browsers behind an HTTP or SOCKS proxy</strong> — a system proxy, Clash and the like. QUIC
+		cannot go through such a proxy. Add the relay’s host to the proxy’s exceptions (its bypass list),
+		so that the browser reaches the relay directly.
+	</li>
+</ul>
+<p>
+	A member that cannot connect stays offline and keeps trying, so it joins as soon as the way is
+	open.
+	<code>conn.connected</code> (JavaScript), <code>conn.connected()</code> (Rust) and
+	<code>pc_client_connected</code> (C) say whether a connection to the relay is open: when it stays false,
+	tell the user what may be in the way.
 </p>
 
 <h2 id="identities">Identities and roles</h2>
@@ -278,9 +322,11 @@
 
 <h2 id="javascript">JavaScript</h2>
 <p>
-	Groups are in the same package as rooms, for browsers, Node.js 22+, Deno and Bun. Browser voice is
-	a separate entry point, <code>peerconnect/voice</code>. A group connection reconnects on its own
-	until you call <code>leave()</code>.
+	Groups are in the same package as rooms. They travel over WebTransport, so they need a runtime
+	that has it: check <code>groupsSupported()</code> first (<a href="#who-can-join"
+		>Who cannot join</a
+	>). Browser voice is a separate entry point, <code>peerconnect/voice</code>. A group connection
+	reconnects on its own until you call <code>leave()</code>.
 </p>
 <CodeBlock code={installJs('en')} lang="sh" title="shell" />
 <h3>Join and send</h3>
@@ -395,10 +441,16 @@
 		<tbody>
 			<tr
 				><td><code>Group.create(relay)</code></td><td
-					>Creates a group. <code>group.toString()</code> is its invite.</td
+					>Creates a group on an <code>https://</code> or <code>quic://</code> relay; it throws for
+					<code>ws://</code> and <code>wss://</code>. <code>group.toString()</code> is its invite.</td
 				></tr
 			>
 			<tr><td><code>Group.parse(invite)</code></td><td>Reads an invite.</td></tr>
+			<tr
+				><td><code>groupsSupported()</code></td><td
+					>Whether this runtime can join groups, that is, has WebTransport.</td
+				></tr
+			>
 			<tr
 				><td><code>Identity.generate()</code>, <code>Identity.fromSeed(seed)</code></td><td
 					>A member identity; persist <code>seed</code>. <code>id</code> is the member ID.</td
@@ -406,8 +458,9 @@
 			>
 			<tr
 				><td><code>joinGroup(group, options)</code></td><td
-					>Joins with <code>identity</code> and <code>profile</code>, and stays in the group until
-					left.</td
+					>Joins over WebTransport with <code>identity</code> and <code>profile</code>, and stays in
+					the group until left; <code>webTransport</code> is passed to the <code>WebTransport</code>
+					constructor. Throws a <code>"NotSupportedError"</code> where there is no WebTransport.</td
 				></tr
 			>
 			<tr
@@ -432,8 +485,12 @@
 				><td>Answers a <code>syncrequest</code>.</td></tr
 			>
 			<tr
-				><td><code>conn.members</code>, <code>conn.id</code>, <code>conn.rtt</code></td><td
-					>The admitted members (ID → profile), our member ID, the latest round trip to the relay.</td
+				><td
+					><code>conn.members</code>, <code>conn.id</code>, <code>conn.rtt</code>,
+					<code>conn.connected</code></td
+				><td
+					>The admitted members (ID → profile), our member ID, the latest round trip to the relay,
+					and whether a WebTransport session to it is open.</td
 				></tr
 			>
 			<tr><td><code>conn.leave()</code></td><td>Leaves the group.</td></tr>
@@ -444,69 +501,72 @@
 <h2 id="rust">Rust</h2>
 <p>
 	The <code>client</code> feature adds <code>client::group</code>, a Tokio driver. The connection
-	dereferences to a <code>GroupSender</code>, and <code>conn.sender()</code> gives you a clone of it to
-	send from other tasks.
+	connects over raw QUIC and dereferences to a <code>GroupSender</code>;
+	<code>conn.sender()</code> gives you a clone of it to send from other tasks, and
+	<code>conn.connected()</code> says whether a connection to the relay is open.
 </p>
 <CodeBlock code={rustDependency} lang="toml" title="Cargo.toml" />
 <CodeBlock code={rustGroup('en')} lang="rust" title="main.rs" />
 <h3>Your own event loop</h3>
 <p>
 	Without the <code>client</code> feature the crate does no I/O. <code>group::Member</code> is the
-	whole member as a state machine: you feed it what happens on one WebSocket at a time and carry out
-	what it asks for. Engines with their own loop poll it once per frame — Godot’s
-	<code>WebSocketPeer</code> from a GDExtension, for example — and the same machine runs in the browser
-	through the JavaScript SDK. Times are milliseconds on any monotonic clock.
+	whole member as a state machine, for an application with a QUIC stack of its own: you feed it what
+	happens on one connection at a time and carry out what it asks for. It frames nothing itself: each
+	class goes on a stream of its own as length-prefixed messages, voice and video as datagrams where
+	they fit, and <code>ping</code> and <code>pong</code> are the empty message (<a
+		href="/spec/groups#sec-3-6">§3.6</a
+	>). <code>group::transport::target(url)</code> gives the host, port and path to connect to, and whether
+	to verify the certificate. Times are milliseconds on any monotonic clock.
 </p>
 <CodeBlock code={rustMember('en')} lang="rust" title="engine.rs" />
 <p>
 	A terminal group chat to try it with:
-	<code>cargo run -p peerconnect --features client --example group -- new &lt;relay&gt; alice</code
+	<code
+		>cargo run -p peerconnect --features client --example group -- new quic://localhost:8080 alice</code
 	>, then <code>… -- join '&lt;invite&gt;' bob</code> in a second terminal.
 </p>
 
 <h2 id="engines">Game engines (C)</h2>
 <p>
-	<code>peerconnect-ffi</code> is the same state machine as a C library, for Unity, Unreal, Godot (through
-	GDExtension or GDNative) and any language with a C FFI. It has no I/O and no threads: your engine owns
-	the WebSocket, and once per frame you feed the member what happened and carry out what it asks for.
+	<code>peerconnect-ffi</code> is the C library, for Godot (through GDExtension), Unity, Unreal and
+	any language with a C FFI. <code>pc_client_join</code> joins the group and connects over QUIC by
+	itself, on two threads of the library’s own, reconnecting as needed. Your game loop calls
+	<code>pc_client_poll</code> once per frame for events, which never blocks, and the
+	<code>pc_client_send</code> functions whenever it likes.
 </p>
 <CodeBlock code={cBuild('en')} lang="sh" title="shell" />
-<CodeBlock code={cMember('en')} lang="c" title="game.c" />
+<CodeBlock code={cClient('en')} lang="c" title="game.c" />
 <p>
-	When the socket closes, call <code>pc_member_handle_close</code> with its close code (or -1); the
-	member reconnects on its own by asking for <code>PC_CONNECT</code> again. Pointers in a
-	<code>pc_output</code> are valid until the next call on that member, so copy what you keep. Voice
-	frames interoperate with browsers when they use the SDK’s format,
+	Use a client from one thread at a time. Pointers in a <code>pc_output</code> are valid until the
+	next call on that client, so copy what you keep. <code>pc_client_connected</code> is 1 while a
+	QUIC connection to the relay is open; where UDP does not get through, the client stays offline and
+	keeps trying. Voice frames interoperate with browsers when they use the SDK’s format,
 	<code>hold[1] ‖ Opus packet</code>.
+</p>
+<p>
+	For an application with a QUIC stack of its own, <code>pc_member_*</code> is the state machine
+	alone, without I/O or threads: <code>PC_CONNECT</code> gives an <code>https://</code> or
+	<code>quic://</code> URL to open, <code>PC_SEND</code> a message for a class’s stream, and
+	<code>PC_PING</code> means send the empty message; pass <code>"pong"</code> to
+	<code>pc_member_handle_text</code> when the relay’s empty message arrives. Frame messages as
+	<a href="/spec/groups#sec-3-6">§3.6</a>
+	says. Engines should use <code>pc_client</code>.
 </p>
 
 <h2 id="relays">Relays</h2>
 <p>
-	The Linux relay, its Docker image and the Cloudflare Worker serve groups next to rooms, with
-	nothing extra to set up (see <a href="/docs#relay">Run a relay</a>). They admit four members per
-	group, the protocol’s limit; on the Linux relay, <code>PEERCONNECT_MAX_GROUP_MEMBERS</code> can lower
-	it.
+	Groups are served by the Linux relay — the binary, its Docker image or a systemd service — next to
+	rooms: rooms over WebSockets on its TCP port, groups over QUIC on the UDP port of the same number.
+	That UDP port must be open, in the firewall and in Docker (<code>-p 8080:8080/udp</code>). See
+	<a href="/docs#relay">Run a relay</a>{#if REPO_URL}, and the
+		<a href="{REPO_URL}/blob/main/deploy/README.md" rel="external">deployment guide</a>, which has a
+		setup for each case{/if}.
 </p>
-<p>
-	The Linux relay keeps a queue per class for every recipient. It drops voice for a recipient that
-	has fallen behind, holds back for at most 5 s a sender whose commands or chat a recipient cannot
-	keep up with (then closes the stuck recipient), and caps what each connection sends at 2 MiB/s, in
-	bursts of up to 4 MiB. The Cloudflare Worker cannot see what it has buffered, so it forwards every
-	frame at once: it can neither drop late voice nor put commands first, and every voice frame is a
-	billed Durable Object message. For voice at scale, use the Linux relay.
-</p>
-<p>
-	The Linux relay also serves groups over QUIC, on the UDP port of the same number: each class gets
-	a stream of its own and voice travels as datagrams, so a lost packet holds up only its own class
-	and voice never waits for a retransmission. The relay URL in the invite says what to use:
-</p>
+<p>The relay URL in the invite says how members reach the relay:</p>
 <ul>
 	<li>
-		<code>wss://relay.example.com</code>: the WebSocket, on any relay.
-	</li>
-	<li>
-		<code>https://relay.example.com</code>: WebTransport in browsers and raw QUIC in Rust, on UDP
-		443, falling back to <code>wss://</code>. The relay needs a certificate browsers trust (<code
+		<code>https://relay.example.com</code>: WebTransport in browsers and raw QUIC elsewhere, on UDP
+		443, with the relay’s certificate verified. The relay needs a certificate browsers trust (<code
 			>PEERCONNECT_TLS_CERT</code
 		>
 		and <code>PEERCONNECT_TLS_KEY</code>).
@@ -516,21 +576,34 @@
 		raw QUIC without checking the relay’s certificate; browsers use WebTransport, pinning the weekly
 		certificate such a relay serves, which anyone can compute (<a href="/spec/groups#sec-3-7"
 			>§3.7</a
-		>); both fall back to <code>ws://</code>.
+		>). Members do not rely on the relay for secrecy either way.
 	</li>
 </ul>
 <p>
-	QUIC gets a 1.5 s head start; where UDP does not get through, members use the WebSocket, and one
-	group can mix both. With 3% of packets lost on each hop, voice p99 was 138 ms over a WebSocket and
-	53 ms over QUIC (<a href="/spec/groups#sec-3-6">specification</a>).
+	<code>ws://</code> and <code>wss://</code> are not group relay URLs:
+	<code>Group.create("wss://…")</code> throws. The Cloudflare Worker serves rooms only: Workers
+	cannot accept QUIC, and could neither drop late voice nor put commands first. A domain behind
+	Cloudflare must not be proxied (the orange cloud), since Cloudflare’s proxy does not carry QUIC to
+	your server. The public group relay <code>{GROUP_RELAY_URL}</code>, which the
+	<a href="/demo/voice">live demo</a>
+	uses, is there for testing.
+</p>
+<p>
+	The relay admits four members per group, the protocol’s limit;
+	<code>PEERCONNECT_MAX_GROUP_MEMBERS</code> can lower it. It keeps a queue per class for every recipient.
+	It drops voice for a recipient that has fallen behind, holds back for at most 5 s a sender whose commands
+	or chat a recipient cannot keep up with (then closes the stuck recipient), and caps what each connection
+	sends at 2 MiB/s, in bursts of up to 4 MiB.
 </p>
 
 <h2 id="latency">Latency and load</h2>
 <p>
-	Measured on one Apple M2 Pro with the game load test: every player is a real end-to-end encrypted
-	WebSocket client sending its position 20 times a second, a command twice a second and a chat line
-	every 10 s, three players per group talking at once, and a newcomer in every group loading a 2 MB
-	snapshot halfway through. Latency is from the sender’s <code>send</code> to the receiver’s event.
+	Measured on one Apple M2 Pro with the game load test, over WebSockets before groups became
+	QUIC-only (the relay’s queues and fan-out are the same; on Linux, QUIC costs the relay about 1.8
+	times the CPU): every player is a real end-to-end encrypted client, in groups of three, sending
+	its position 20 times a second, a command twice a second and a chat line every 10 s, two players
+	per group talking at once, and a newcomer in every group loading a 2 MB snapshot halfway through.
+	Latency is from the sender’s <code>send</code> to the receiver’s event.
 </p>
 <div class="table">
 	<table>
@@ -543,24 +616,23 @@
 		>
 		<tbody>
 			<tr
-				><td>10 groups, 100 players</td><td>0.95 / 2.6 ms</td><td>0.80 / 2.4 ms</td><td>6.0 ms</td
-				><td>0.4 cores, 6 MB</td></tr
+				><td>34 groups, 102 players</td><td>0.38 / 0.91 ms</td><td>0.31 / 0.84 ms</td><td>6.5 ms</td
+				><td>0.23 cores, 13 MB</td></tr
 			>
 			<tr
-				><td>50 groups, 500 players</td><td>0.92 / 3.5 ms</td><td>0.77 / 3.3 ms</td><td>2.7 ms</td
-				><td>1.7 cores, 19 MB</td></tr
+				><td>167 groups, 501 players</td><td>0.67 / 2.6 ms</td><td>0.56 / 2.4 ms</td><td>1.1 ms</td
+				><td>1.0 cores, 29 MB</td></tr
 			>
 			<tr
-				><td>100 groups, 1,000 players</td><td>1.6 / 17 ms</td><td>1.4 / 15 ms</td><td>19 ms</td><td
-					>4.1 cores, 35 MB</td
-				></tr
+				><td>334 groups, 1,002 players</td><td>1.1 / 38 ms</td><td>0.87 / 30 ms</td><td>58 ms</td
+				><td>2.3 cores, 50 MB</td></tr
 			>
 		</tbody>
 	</table>
 </div>
 <p>
-	Everything reliable arrived exactly once. At 100 groups the machine is saturated: the load
-	generator itself uses five to six of its cores.
+	Everything reliable arrived exactly once, and so did the voice, the positions and every snapshot.
+	At 334 groups the machine is saturated, with the load generator running on it too.
 </p>
 <p>
 	Real networks, emulated: each player behind its own access link with a deep buffer, three players
@@ -657,10 +729,11 @@
 <h2 id="limitations">Limitations</h2>
 <ul>
 	<li>
-		<strong>Over WebSockets, voice runs over TCP.</strong> On the Cloudflare relay, and wherever UDP
-		does not get through, a lost packet holds up what follows it until it is resent. The jitter
-		buffer and the dropping of late frames keep that to a glitch, but it shows on lossy links. Over
-		QUIC (the Linux relay) it does not (<a href="#relays">Relays</a>).
+		<strong>Some members cannot join.</strong> Groups need UDP to the relay and, in browsers,
+		WebTransport, with no fallback: networks that block UDP, browsers behind an HTTP or SOCKS proxy
+		(unless the relay’s host is in its exceptions) and browsers without WebTransport stay out (<a
+			href="#who-can-join">Who cannot join</a
+		>).
 	</li>
 	<li>
 		<strong>No order between members.</strong> The relay does not order one member’s commands
@@ -682,8 +755,9 @@
 		messages, and a receiver that restarts starts afresh: ask for a snapshot.
 	</li>
 	<li>
-		<strong>The Cloudflare relay</strong> forwards every frame at once: no dropping of late voice, no
-		commands first, and a billed Durable Object message per voice frame.
+		<strong>A <code>quic://</code> relay is not authenticated.</strong> Anyone on the path can pose
+		as it and learn what a relay learns, though not read or forge anything members send. Use an
+		<code>https://</code> relay where that matters.
 	</li>
 	<li>
 		<strong>Browser voice</strong> needs WebCodecs audio with Opus, and is tested in Chromium. Echo cancellation

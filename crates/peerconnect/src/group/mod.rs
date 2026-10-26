@@ -43,8 +43,8 @@ pub struct Group {
 }
 
 impl Group {
-    /// Creates a new group on `relay`: a `ws://` or `wss://` URL, or
-    /// `https://` or `quic://` for a relay that also offers QUIC (see [`transport`]).
+    /// Creates a new group on `relay`: an `https://` or `quic://` URL. Groups
+    /// travel over QUIC only (see [`transport`]); a WebSocket URL is refused.
     pub fn create(relay: &str) -> Result<Group, Error> {
         Ok(Group::new(relay_url(relay)?, crate::random()))
     }
@@ -73,8 +73,8 @@ impl Group {
         Ok(Group::new(relay_url(relay)?, *self.secret))
     }
 
-    /// The URL of the group on its relay: the WebSocket to open, or, for
-    /// `https://` and `quic://` relays, what [`transport::transports`] takes.
+    /// The URL of the group on its relay, which [`transport::target`] turns
+    /// into the QUIC endpoint to connect to.
     pub fn endpoint(&self) -> String {
         format!("{}/g1/{}", self.relay, self.id())
     }
@@ -213,23 +213,27 @@ mod tests {
 
     #[test]
     fn invite_round_trip() {
-        let group = Group::create("wss://relay.example.com/").unwrap();
+        let group = Group::create("https://relay.example.com/").unwrap();
         let invite = group.to_string();
-        assert!(invite.starts_with("wss://relay.example.com#"));
-        assert_eq!(invite.len(), "wss://relay.example.com#".len() + 43);
+        assert!(invite.starts_with("https://relay.example.com#"));
+        assert_eq!(invite.len(), "https://relay.example.com#".len() + 43);
         let back: Group = invite.parse().unwrap();
         assert_eq!(back.id(), group.id());
         assert_eq!(back.key_secret(), group.key_secret());
-        assert_eq!(back.endpoint(), format!("wss://relay.example.com/g1/{}", group.id()));
+        assert_eq!(back.endpoint(), format!("https://relay.example.com/g1/{}", group.id()));
         // A two-peer invite is not a group invite, and vice versa.
         let room = crate::Room::create("wss://r.example").unwrap().invite().unwrap().to_string();
         assert!(room.parse::<Group>().is_err());
         assert!(invite.parse::<crate::Invite>().is_err());
+        // Groups have no WebSocket transport.
+        assert!(Group::create("wss://relay.example.com").is_err());
+        let secret = invite.split_once('#').unwrap().1;
+        assert!(format!("wss://relay.example.com#{secret}").parse::<Group>().is_err());
     }
 
     #[test]
     fn join_verifies_only_for_its_nonce_and_token() {
-        let group = Group::create("wss://r.example").unwrap();
+        let group = Group::create("https://r.example").unwrap();
         let id = group.id();
         let frame = group.join_frame(&[1; 32], &[7; 16]);
         assert_eq!(id.verify_group_join(&[1; 32], &frame), Ok([7; 16]));
@@ -237,20 +241,20 @@ mod tests {
         let mut other = frame;
         other[1] ^= 1;
         assert!(id.verify_group_join(&[1; 32], &other).is_err());
-        assert!(Group::create("wss://r.example").unwrap().id().verify_group_join(&[1; 32], &frame).is_err());
+        assert!(Group::create("https://r.example").unwrap().id().verify_group_join(&[1; 32], &frame).is_err());
         assert!(id.verify_group_join(&[1; 32], &frame[..80]).is_err());
     }
 
     #[test]
     fn moving_relays_keeps_the_group_and_ids_print_and_parse() {
-        let group = Group::create("wss://a.example").unwrap();
-        let moved = group.with_relay("ws://b.example/sub/").unwrap();
-        assert_eq!((moved.id(), moved.relay()), (group.id(), "ws://b.example/sub"));
+        let group = Group::create("https://a.example").unwrap();
+        let moved = group.with_relay("quic://b.example/sub/").unwrap();
+        assert_eq!((moved.id(), moved.relay()), (group.id(), "quic://b.example/sub"));
         assert!(group.with_relay("http://nope").is_err());
         let quic = group.with_relay("quic://203.0.113.9:4433").unwrap();
         assert_eq!(quic.endpoint(), format!("quic://203.0.113.9:4433/g1/{}", group.id()));
         assert_eq!(quic.to_string().parse::<Group>().unwrap().relay(), "quic://203.0.113.9:4433");
-        assert!(format!("{group:?}").starts_with("Group(wss://a.example, "));
+        assert!(format!("{group:?}").starts_with("Group(https://a.example, "));
         let identity = Identity::generate();
         let id = identity.id();
         assert_eq!(id.to_string().parse::<MemberId>(), Ok(id));
@@ -262,7 +266,7 @@ mod tests {
     #[test]
     fn tokens_are_per_identity_and_group() {
         let (a, b) = (Identity::generate(), Identity::generate());
-        let (g, h) = (Group::create("wss://r").unwrap().id(), Group::create("wss://r").unwrap().id());
+        let (g, h) = (Group::create("https://r").unwrap().id(), Group::create("https://r").unwrap().id());
         assert_eq!(a.token(&g), Identity::from_seed(*a.seed()).token(&g));
         assert_ne!(a.token(&g), a.token(&h));
         assert_ne!(a.token(&g), b.token(&g));

@@ -1,6 +1,6 @@
 # PeerConnect Groups, version 1
 
-Up to 32 members, one group, end-to-end encryption over an untrusted, stateless relay, reached over WebSockets or QUIC: commands, chat, voice, video and state transfer, each with its own priority.
+Up to four members, one group, end-to-end encryption over an untrusted, stateless relay, reached over QUIC (raw, or WebTransport from browsers): commands, chat, voice, video and state transfer, each with its own priority.
 
 Status: draft for review. It extends [SPEC.md](SPEC.md) (two-peer rooms) without changing it: groups use their own endpoint, frames and keys, and a relay may serve both. Sections of SPEC.md referenced here (base64url, primitives, keepalive) apply unchanged.
 
@@ -58,7 +58,7 @@ The text form of a group ID is its base64url encoding.
 invite = relay_url "#" base64url(S)
 ```
 
-`relay_url` is as in SPEC.md §3.3, or, for a relay that also offers QUIC, an `https://` or `quic://` URL (§3.6). The fragment MUST decode to exactly 32 bytes, which a version 1 two-peer implementation rejects (it expects 64), and vice versa.
+`relay_url` is an `https://` or `quic://` URL (§3.6): groups have no WebSocket transport, and a `ws://` or `wss://` relay URL is not a group's. The fragment MUST decode to exactly 32 bytes, which a version 1 two-peer implementation rejects (it expects 64), and vice versa.
 
 The invite is the whole credential: there is nothing else to store, and no pairing. Whoever holds it can enter the group, read everything sent there and send under its own identity. Give it only to members, over a confidential channel; a game server that forms a squad would typically generate `S` and hand it to each player. To exclude someone, move the group to a new secret.
 
@@ -78,13 +78,13 @@ It lets the relay recognise a member's new connection as a replacement for its o
 
 ### 3.1 Endpoint and joining
 
-A member opens a WebSocket (or a QUIC connection, §3.6) to
+A member opens a QUIC connection (§3.6) to
 
 ```
 relay_url "/g1/" group_id
 ```
 
-under the same rules as SPEC.md §4.1 (any prefix; HTTP 404 if the last segment is not a canonical Ed25519 public key).
+under the same rules as SPEC.md §4.1 (any prefix; the path is refused if the last segment is not a canonical Ed25519 public key, §3.6). The messages below travel as §3.6 describes.
 
 1. The relay sends HELLO (`0x80`, `nonce[32]`) as its first frame.
 2. The member answers with JOIN: `0x81 ‖ token[16] ‖ signature[64]`, where
@@ -116,13 +116,13 @@ Ordering: a connection receives nothing before its WELCOME, and receives MEMBER 
 
 ### 3.3 Peer frames and classes
 
-Every other binary message is a **peer frame**:
+Every other non-empty message is a **peer frame**:
 
 ```
 type[1] ‖ from[1] ‖ to[1] ‖ body
 ```
 
-- `from` MUST be the sender's slot, and `to` either a slot other than the sender's, or `0xFF` for every other member. A relay closes a connection that breaks this, sends a frame shorter than 3 bytes, a relay frame, or a text message other than `ping`, with 1002, and one that sends a frame over **16,384 bytes**, with 1009. A frame to an unoccupied slot is dropped.
+- `from` MUST be the sender's slot, and `to` either a slot other than the sender's, or `0xFF` for every other member. A relay closes a connection that breaks this, or sends a non-empty frame shorter than 3 bytes or a relay frame, with 1002, and one that sends a frame over **16,384 bytes**, with 1009. A frame to an unoccupied slot is dropped.
 - The relay forwards the frame unchanged to its recipients. It never echoes a frame to its sender.
 
 The type determines the frame's **class**. The relay knows nothing else about it:
@@ -143,13 +143,11 @@ Real-time frames: a relay SHOULD drop a voice frame, instead of queueing it, whe
 
 Reliable frames are never dropped. When a recipient falls behind on commands and chat (the reference relay: 256 KiB queued), the relay stops reading from the sender of the frame until that recipient catches up, but for **5 s** at most: a recipient that has not caught up by then is not reading, and the relay closes it with 4408. A recipient whose reliable queue overflows outright (the reference relay: 2 MiB) is closed at once. So a burst of commands slows its sender to the pace of the slowest member for a moment, while one stuck member cannot hold the group up for longer than that. Bulk does not count towards falling behind: its window (§6) bounds it. A relay SHOULD also bound each connection's sending rate (the reference relay: 2 MiB/s, bursts of 4 MiB), by dropping voice and delaying the rest.
 
-Relays that cannot see what they have buffered (Cloudflare Workers, for one) can neither drop late voice nor hold senders back; they forward everything at once. Members cope, but such a relay gives up most of what the classes are for.
-
 ### 3.4 Keepalive and timeouts
 
 As SPEC.md §4.6, with shorter times, since a game notices a dead voice connection in seconds:
 
-- members send `ping` every **10 s**; the relay answers `pong`;
+- members send `ping`, the empty message on the command stream, every **10 s**; the relay answers `pong`, the empty message too;
 - a member treats a connection on which it received nothing for **25 s** as dead;
 - a relay MAY close a seated connection it received nothing from for **40 s**, with 4408.
 
@@ -157,21 +155,20 @@ As SPEC.md §4.6, with shorter times, since a game notices a dead voice connecti
 
 As SPEC.md §4.7, with 4409 meaning a newer connection of the same identity took the slot, and **4429**: the group is full on this relay.
 
-### 3.6 QUIC
+### 3.6 Transport: QUIC
 
-A relay MAY also accept groups over QUIC (RFC 9000), where each class travels on a stream of its own and voice in datagrams (RFC 9221), so that a packet lost on the way holds up only its own class and voice waits for nothing. The relay URL says what a relay offers, and members try its transports in this order:
+Groups travel over QUIC (RFC 9000) only, where each class travels on a stream of its own and voice and video in datagrams (RFC 9221), so that a packet lost on the way holds up only its own class and voice waits for nothing. There is no WebSocket transport: over TCP one lost packet holds up voice, video and commands alike until it is resent, a fraction of a second on a long path, which real-time voice, video and game state cannot afford. A member that cannot reach the relay over UDP (a network that blocks it, a browser behind an HTTP proxy) does not join; it stays offline and keeps trying (§7.1). The relay URL says how to reach the relay:
 
-| Relay URL | Transports, in order |
+| Relay URL | Transport |
 |---|---|
-| `ws://…`, `wss://…` | that WebSocket |
-| `https://host[:port]…` | QUIC on UDP `host:port` (443 by default): WebTransport over HTTP/3 for browsers, raw QUIC for others; then the WebSocket `wss://host[:port]…` |
-| `quic://host[:port]…` | raw QUIC on UDP `host:port` (443 by default), or, for browsers, WebTransport to `https://host[:port]…` with the weekly certificate pinned (§3.7); then the WebSocket `ws://host[:port]…` |
+| `https://host[:port]…` | QUIC on UDP `host:port` (443 by default): WebTransport over HTTP/3 for browsers, raw QUIC for others; the certificate is verified for `host` |
+| `quic://host[:port]…` | raw QUIC on UDP `host:port` (443 by default), certificate not verified, or, for browsers, WebTransport to `https://host[:port]…` with the weekly certificate pinned (§3.7) |
 
-Paths are as in §3.1. A member SHOULD give QUIC a head start (the reference implementations: **1.5 s**) before trying the WebSocket as well, and keep whichever opens first; one that cannot use QUIC (a WebSocket-only runtime) goes to the WebSocket at once. Members on different transports share one group.
+Paths are as in §3.1. Members on raw QUIC and on WebTransport share one group.
 
 **Connecting.** WebTransport uses ALPN `h3` and an extended CONNECT to the path; a relay rejects a path that is not a group with HTTP 404. Its certificate MUST be one browsers accept: for the host's name or address, or one they are given the hash of (`serverCertificateHashes`). Raw QUIC uses ALPN `peerconnect-g1`; the member's first message, on its command stream, is the path (UTF-8). A relay closes a raw connection whose path is not a group with **4404**, and one whose first stream is not the command stream with 1002. A member verifies the certificate of an `https://` relay for its host. A member of a `quic://` relay does not verify its certificate (raw QUIC), or pins the hashes of the weekly certificates (WebTransport, §3.7): groups do not rely on the relay for confidentiality or authenticity (§9), so such a relay needs neither a domain nor a certificate anyone signed.
 
-**Streams.** Each side opens, when it first needs one, a unidirectional stream per class, which starts with one byte, the class: `0x00` command, `0x01` voice, `0x02` chat, `0x03` bulk, `0x04` video. Then come messages, `length[2] ‖ message` (big-endian, at most 16,384): the WebSocket messages of §3.1–§3.3, with the empty message standing for the text messages, `ping` from a member and `pong` from the relay. Relay frames go on the command stream. Each stream SHOULD have its class's priority.
+**Streams.** Each side opens, when it first needs one, a unidirectional stream per class, which starts with one byte, the class: `0x00` command, `0x01` voice, `0x02` chat, `0x03` bulk, `0x04` video. Then come messages, `length[2] ‖ message` (big-endian, at most 16,384): the frames of §3.1–§3.3, and the empty message, which is `ping` from a member and `pong` from the relay (§3.4). Relay frames go on the command stream. Each stream SHOULD have its class's priority.
 
 **Datagrams.** A voice or video frame that fits in a datagram is sent as one, the frame alone; one that does not goes on its class's stream. The relay forwards each in a datagram where it fits the recipient's path, whatever the sender used. Datagrams leave in the order they are queued, so a sender SHOULD hand video to its datagram queue only while that leaves room for voice (the reference implementations: 4 KiB, of an 8 KiB queue), keeping the rest of its video in a queue of its own that drops its oldest.
 
@@ -182,7 +179,7 @@ Paths are as in §3.1. A member SHOULD give QUIC a head start (the reference imp
 - BULK data may arrive before its SYNC_BEGIN, which receivers allow for (§6);
 - a stream message may arrive before or after the KEY, CONFIRM or HEADS that announces its stream's position; §5 covers both.
 
-**Closing, keepalive and limits** are as over WebSockets: the close codes of §3.5 are the QUIC application close codes (raw QUIC) or the WebTransport session close codes; members `ping` as in §3.4; and a relay holds a sender back through QUIC flow control as through TCP, and drops voice for a recipient that is behind (§3.3).
+**Closing, keepalive and limits**: the close codes of §3.5 are the QUIC application close codes (raw QUIC) or the WebTransport session close codes; members `ping` as in §3.4; and a relay holds a sender back through QUIC flow control, and drops voice for a recipient that is behind (§3.3).
 
 ### 3.7 The weekly certificate
 
@@ -328,7 +325,7 @@ As SPEC.md §6.1: one connection at a time; reconnect with exponential backoff a
 
 ### 7.2 Sending without delay
 
-A member SHOULD keep its own queue per class in front of its WebSocket and hand the socket frames from the most urgent class first (over QUIC, a stream per class does this, §3.6). It SHOULD hand over chat and bulk frames only while the socket has little unsent (a browser's `bufferedAmount`, say under 16 KiB), and drop a voice frame when that is already over a few kilobytes. Then a command is never stuck behind more than one bulk frame, and a stalled link loses audio instead of building up delay.
+A member sends each class on its own stream (§3.6), with its class's priority, so that a command never waits behind chat or a state transfer. It SHOULD drop a voice frame rather than queue it when a few kilobytes are already waiting to be sent, and keep video in a queue of its own that drops its oldest frames: a stalled link then loses audio and old pictures instead of building up delay.
 
 Voice frames carry `seq`, the sender's count of audio frames of fixed duration (wrapping at 2¹⁶). A sender MAY skip silent frames, still counting them. Receivers use `seq` to place frames in time, and SHOULD play them out through an adaptive jitter buffer that discards frames to catch up after a stall rather than playing late.
 
@@ -383,7 +380,6 @@ The codec is the application's. Implementations that want to interoperate with t
 | Join timeout | 10 s | relay (4408) |
 | Voice replay window | 64 counters | receivers |
 | Snapshot data ahead of its SYNC_BEGIN | ≤ 2 MiB | receivers (over QUIC) |
-| QUIC head start | 1.5 s, then the WebSocket too | members |
 | Weekly certificate | changes every 604,800 s; valid 13 days | relays without certificate files |
 | KEY retry | 5 s without admission | members |
 | RESEND retry / give up | 3 s / 15 s | receivers |
@@ -402,7 +398,7 @@ The codec is the application's. Implementations that want to interoperate with t
 
 **Invites** are bearer credentials for as long as the group lives (§2.2). A relay cannot tell members apart beyond their join tokens, so it cannot exclude anyone; exclusion means a new secret.
 
-**Transports**: TLS, where used (`wss://`, WebTransport, raw QUIC to an `https://` relay), protects what the network sees, not what the relay sees. A member of a `quic://` relay does not verify the relay's certificate, or pins one whose key is public (§3.7), so anyone on the path can pose as the relay and learn what a relay learns; nothing members send is exposed or forgeable that way.
+**Transports**: TLS (WebTransport, raw QUIC to an `https://` relay) protects what the network sees, not what the relay sees. A member of a `quic://` relay does not verify the relay's certificate, or pins one whose key is public (§3.7), so anyone on the path can pose as the relay and learn what a relay learns; nothing members send is exposed or forgeable that way.
 
 **Denial of service**: relays bound frame size, unauthenticated time, queues and per-connection rate (§3.3), and SHOULD limit connections per address as for rooms. A member can waste others' bandwidth up to the relay's rate limit, and no further.
 

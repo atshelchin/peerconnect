@@ -1,12 +1,18 @@
 /*
  * PeerConnect groups (GROUP.md) for C, C++, C# and anything else with a C
- * FFI. The library has no I/O and no threads: the application owns one
- * WebSocket at a time and feeds the member what happens to it, then carries
- * out what pc_member_poll asks for. That fits a game loop: call
- * pc_member_handle_timeout and pc_member_poll once per frame.
+ * FFI. Groups travel over QUIC only (GROUP.md §3.6), in one of two ways:
+ *
+ * - pc_client: the library connects over QUIC by itself, on two threads of
+ *   its own, and reconnects as needed. Call pc_client_poll once per frame for
+ *   events, and the pc_client_send functions whenever you like. Most
+ *   applications want this.
+ * - pc_member: the group state machine alone, without I/O or threads, for an
+ *   application that has its own QUIC stack: it opens the connection, frames
+ *   messages as GROUP.md §3.6 says, feeds the member what happens and carries
+ *   out what pc_member_poll asks for.
  *
  * Times are milliseconds on any monotonic clock. Member IDs are 32 bytes.
- * Nothing here is thread-safe: use a pc_member from one thread at a time.
+ * Use a pc_client or pc_member from one thread at a time.
  */
 #ifndef PEERCONNECT_H
 #define PEERCONNECT_H
@@ -18,6 +24,7 @@
 extern "C" {
 #endif
 
+typedef struct pc_client pc_client;
 typedef struct pc_member pc_member;
 
 /* Results of the functions that can fail. */
@@ -30,23 +37,22 @@ enum {
   PC_INVALID = -1,      /* a malformed argument */
 };
 
-/* What pc_member_poll returns. */
+/* What pc_client_poll and pc_member_poll return. */
 typedef enum {
   PC_NONE = 0,
-  /* Open a WebSocket to `data` (a NUL-terminated URL, `len` without the NUL).
-   * For an https:// or quic:// URL, open the WebSocket it falls back to:
-   * wss:// or ws:// with the rest unchanged, unless you speak QUIC. */
+  /* pc_member only. Open a QUIC connection to `data`, the group's https:// or
+   * quic:// URL (NUL-terminated, `len` without the NUL), as GROUP.md §3.6 says. */
   PC_CONNECT = 1,
-  /* Send `data` as a binary message. `class_`: 0 command, 1 voice, 2 chat,
-   * 3 bulk, 4 video. Send the most urgent first, in the order command,
-   * voice, chat, video, bulk; voice and video may be dropped when the socket
-   * is backed up (video oldest first). */
+  /* pc_member only. Send `data` as one message on the stream of `class_`: 0
+   * command, 1 voice, 2 chat, 3 bulk, 4 video (voice and video as a datagram
+   * where it fits). Voice and video may be dropped when the connection is
+   * backed up (video oldest first). */
   PC_SEND = 2,
-  /* Send the text message "ping". */
+  /* pc_member only. Send the empty message (ping) on the command stream. */
   PC_PING = 3,
-  /* Close the WebSocket (code 1000) and forget it. */
+  /* pc_member only. Close the connection (code 1000) and forget it. */
   PC_DISCONNECT = 4,
-  /* Events. */
+  /* Events, from both. */
   PC_STATE = 10,        /* `state`: 0 offline, 1 online, 2 closed */
   PC_JOINED = 11,       /* `member` admitted; `data` is its profile */
   PC_LEFT = 12,         /* `member` left */
@@ -73,7 +79,7 @@ typedef struct {
   uint16_t seq;
   uint32_t transfer;
   uint64_t count;
-  /* Valid until the next call on this member. */
+  /* Valid until the next call on this client or member. */
   const uint8_t *data;
   size_t len;
   /* PC_VIDEO and PC_KEYFRAME_REQUEST. */
@@ -82,8 +88,8 @@ typedef struct {
   uint32_t timestamp;
 } pc_output;
 
-/* Creates a group on `relay` (a ws://, wss://, https:// or quic:// URL) and returns its invite,
- * or NULL. Free it with pc_string_free. The invite is a secret. */
+/* Creates a group on `relay` (an https:// or quic:// URL; a quic:// relay needs no domain or
+ * certificate) and returns its invite, or NULL. Free it with pc_string_free. The invite is a secret. */
 char *pc_group_create(const char *relay);
 void pc_string_free(char *s);
 
@@ -92,8 +98,33 @@ void pc_identity_generate(uint8_t seed[32]);
 /* The member ID of an identity. */
 void pc_identity_id(const uint8_t seed[32], uint8_t id[32]);
 
-/* Starts a member of the group with this invite; NULL if the invite or
- * profile (at most 1,024 bytes) is invalid. Its first output asks to connect. */
+/* Joins the group with this invite over QUIC and stays in it, reconnecting as needed;
+ * NULL if the invite or profile (at most 1,024 bytes) is invalid. Where UDP does not get
+ * through, it stays offline and keeps trying: there is no other transport. */
+pc_client *pc_client_join(const char *invite, const uint8_t seed[32], const uint8_t *profile, size_t profile_len);
+/* Leaves the group (what was sent is still delivered) and frees the client. */
+void pc_client_free(pc_client *c);
+void pc_client_id(const pc_client *c, uint8_t id[32]);
+/* 1 while a QUIC connection to the relay is open, else 0. */
+int32_t pc_client_connected(const pc_client *c);
+/* The admitted members' IDs, at most `max`, as of the events polled so far; returns how many there are. */
+size_t pc_client_members(const pc_client *c, uint8_t (*ids)[32], size_t max);
+/* The next event into `out`; returns its kind, PC_NONE when there is none. Never blocks. */
+int32_t pc_client_poll(pc_client *c, pc_output *out);
+/* As the pc_member functions of the same names. Voice, datagrams and video are dropped
+ * rather than delayed when the connection backs up. */
+int32_t pc_client_send(pc_client *c, uint8_t channel, const uint8_t *data, size_t len, uint64_t *id);
+int32_t pc_client_send_to(pc_client *c, const uint8_t member[32], uint8_t channel, const uint8_t *data, size_t len);
+void pc_client_send_voice(pc_client *c, uint16_t seq, const uint8_t *data, size_t len);
+void pc_client_send_datagram(pc_client *c, const uint8_t *member, const uint8_t *data, size_t len);
+void pc_client_send_video(pc_client *c, uint8_t track, uint8_t keyframe, uint32_t timestamp, const uint8_t *data,
+                          size_t len);
+int32_t pc_client_request_sync(pc_client *c, const uint8_t from[32]);
+int32_t pc_client_provide_sync(pc_client *c, const uint8_t to[32], uint32_t transfer, const uint8_t *data, size_t len);
+void pc_client_decline_sync(pc_client *c, const uint8_t to[32], uint32_t transfer);
+
+/* Starts a member of the group with this invite, for an application with its own QUIC;
+ * NULL if the invite or profile (at most 1,024 bytes) is invalid. Its first output asks to connect. */
 pc_member *pc_member_new(const char *invite, const uint8_t seed[32], const uint8_t *profile, size_t profile_len,
                          uint64_t now);
 void pc_member_free(pc_member *m);
@@ -103,7 +134,8 @@ size_t pc_member_members(const pc_member *m, uint8_t (*ids)[32], size_t max);
 /* The latest round trip to the relay in ms, or -1. */
 int64_t pc_member_rtt(const pc_member *m);
 
-/* What happened to the socket. `code` is the close code, or -1 for none. */
+/* What happened to the connection. `code` is the close code, or -1 for none. pc_member_handle_text
+ * takes "pong" for the empty message from the relay. */
 void pc_member_handle_open(pc_member *m, uint64_t now);
 void pc_member_handle_binary(pc_member *m, uint64_t now, const uint8_t *data, size_t len);
 void pc_member_handle_text(pc_member *m, uint64_t now, const char *text, size_t len);

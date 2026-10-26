@@ -1,0 +1,28 @@
+# The relay as a systemd service, with a certificate from certbot (see
+# README.md in this directory). Groups need UDP 443 open; rooms use TCP 443.
+[Unit]
+Description=PeerConnect relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=peerconnect
+Group=peerconnect
+ExecStart=/usr/local/bin/peerconnect-relay
+Environment=PEERCONNECT_LISTEN=0.0.0.0:443
+Environment=PEERCONNECT_TLS_CERT=/etc/peerconnect/tls/fullchain.pem
+Environment=PEERCONNECT_TLS_KEY=/etc/peerconnect/tls/privkey.pem
+# Port 443 without root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+LimitNOFILE=65536
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

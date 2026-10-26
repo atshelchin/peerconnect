@@ -5,8 +5,9 @@
 #include "peerconnect.h"
 
 int main(void) {
-  char *invite = pc_group_create("wss://relay.example.com");
-  if (!invite || strncmp(invite, "wss://relay.example.com#", 24) != 0) return 1;
+  if (pc_group_create("wss://relay.example.com") != NULL) return 1; /* groups have no WebSocket relays */
+  char *invite = pc_group_create("https://relay.example.com");
+  if (!invite || strncmp(invite, "https://relay.example.com#", 26) != 0) return 1;
 
   uint8_t seed[32], id[32], again[32];
   pc_identity_generate(seed);
@@ -15,6 +16,18 @@ int main(void) {
   pc_member *m = pc_member_new(invite, seed, (const uint8_t *)name, strlen(name), 0);
   pc_string_free(invite);
   if (!m) return 2;
+
+  /* A client of a relay nobody answers stays offline, and keeps trying. */
+  char *nowhere = pc_group_create("quic://127.0.0.1:9");
+  pc_client *c = pc_client_join(nowhere, seed, (const uint8_t *)name, strlen(name));
+  pc_string_free(nowhere);
+  if (!c || pc_client_connected(c) != 0) return 12;
+  pc_output event;
+  while (pc_client_poll(c, &event) != PC_NONE) {
+    if (event.kind == PC_JOINED) return 13;
+  }
+  pc_client_free(c);
+
   pc_member_id(m, again);
   if (memcmp(id, again, 32) != 0) return 3;
 

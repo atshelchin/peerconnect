@@ -11,9 +11,9 @@
 //! disconnected, so one stuck member cannot hold the others up for long.
 //! A frame is shared, not copied, between its recipients.
 //!
-//! None of this depends on the transport: a connection is a [`Link`] to
-//! read from and a writer that drains its [`Outbox`], over a WebSocket here
-//! or over QUIC ([`crate::quic`]), and one group can mix both.
+//! Groups travel over QUIC only (GROUP.md §3.6): raw QUIC or WebTransport,
+//! both in [`crate::quic`]. A connection is a [`Link`] to read from and a
+//! writer that drains its [`Outbox`].
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -22,8 +22,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
 use peerconnect::RoomId;
 use peerconnect::group::{Class, wire as gwire};
 use peerconnect::relay::{GroupAction, GroupConn, Incoming};
@@ -31,12 +29,11 @@ use peerconnect::wire::close;
 use tokio::sync::{Notify, OwnedSemaphorePermit, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use crate::{Relay, Ws, close_message};
+use crate::Relay;
 
-/// Bytes written before each flush, at most: small, so that an urgent
-/// frame queued meanwhile goes next.
+/// Bytes a writer takes from an outbox at a time, at most: small, so that
+/// an urgent frame queued meanwhile goes next.
 const BATCH: usize = 16 << 10;
 /// Command and chat bytes queued towards a recipient beyond which its
 /// senders wait for it.
@@ -175,6 +172,7 @@ impl Outbox {
     }
 
     /// Takes up to [`BATCH`] bytes of frames, most urgent class first.
+    #[cfg(test)]
     fn take(&self) -> Vec<Bytes> {
         self.take_from(&Class::PRIORITY.map(Class::index))
     }
@@ -251,20 +249,6 @@ pub(crate) enum Received {
 /// Where a group connection's messages come from.
 pub(crate) trait Link: Send {
     fn recv(&mut self) -> impl Future<Output = Received> + Send;
-}
-
-impl Link for SplitStream<Ws> {
-    async fn recv(&mut self) -> Received {
-        loop {
-            return match self.next().await {
-                Some(Ok(Message::Binary(frame))) => Received::Binary(frame),
-                Some(Ok(Message::Text(text))) => Received::Text(text.as_str().to_owned()),
-                Some(Ok(_)) => continue, // control frames are handled by the WebSocket layer
-                Some(Err(WsError::Capacity(_))) => Received::TooBig,
-                Some(Err(_)) | None => Received::Closed,
-            };
-        }
-    }
 }
 
 impl GroupRoom {
@@ -367,13 +351,6 @@ impl Bucket {
 }
 
 impl Relay {
-    pub(crate) async fn group_websocket(self: Arc<Self>, group_id: RoomId, ws: Ws, slot: OwnedSemaphorePermit) {
-        let (sink, stream) = ws.split();
-        let outbox = self.group_outbox();
-        let writer = tokio::spawn(write(sink, outbox.clone(), self.stop.subscribe()));
-        self.group_connection(group_id, stream, outbox, writer, slot).await;
-    }
-
     pub(crate) fn group_outbox(&self) -> Arc<Outbox> {
         let config = &self.config;
         Outbox::new(config.group_queue_bytes, config.voice_queue_bytes, config.video_queue_bytes)
@@ -476,42 +453,6 @@ impl Relay {
             groups.remove(group_id);
         }
     }
-}
-
-/// Drains the outbox into the socket, most urgent class first, until told
-/// to close. A write that cannot complete does not hold up a close.
-async fn write(mut sink: SplitSink<Ws, Message>, outbox: Arc<Outbox>, mut stop: watch::Receiver<bool>) {
-    let mut close = outbox.close.subscribe();
-    let code = loop {
-        let batch = outbox.take();
-        if batch.is_empty() {
-            tokio::select! {
-                biased;
-                _ = close.changed() => break close.borrow().unwrap_or(close::NORMAL),
-                _ = stop.wait_for(|stop| *stop) => break close::GOING_AWAY,
-                () = outbox.ready.notified() => {}
-            }
-            // Let frames that are arriving at the same moment, from the
-            // other members, join this write: far fewer system calls, for a
-            // few microseconds.
-            tokio::task::yield_now().await;
-            continue;
-        }
-        let write = async {
-            for frame in batch {
-                let msg = if frame.is_empty() { Message::text(gwire::PONG) } else { Message::Binary(frame) };
-                sink.feed(msg).await?;
-            }
-            sink.flush().await
-        };
-        tokio::select! {
-            biased;
-            _ = close.changed() => break close.borrow().unwrap_or(close::NORMAL),
-            _ = stop.wait_for(|stop| *stop) => break close::GOING_AWAY,
-            result = write => if result.is_err() { return },
-        }
-    };
-    let _ = timeout(Duration::from_secs(1), sink.send(close_message(code))).await;
 }
 
 fn member(slot: u8, present: bool) -> Bytes {

@@ -18,7 +18,7 @@ export const en = {
 		groups: {
 			title: 'Groups: multiplayer, voice and state sync — PeerConnect',
 			description:
-				'End-to-end encrypted groups of up to four members: commands, chat, voice and state transfer over an untrusted relay. Built for games and teams: JavaScript, Rust and C.'
+				'End-to-end encrypted groups of up to four: commands, chat, voice, video and state sync over QUIC, through an untrusted relay. For games and teams: JavaScript, Rust and C.'
 		},
 		demo: {
 			title: 'Live demo: pair two browsers — PeerConnect',
@@ -218,15 +218,15 @@ export const en = {
 			eyebrow: 'Groups',
 			title: 'More than two? Make it a group.',
 			intro:
-				'Squads, shared worlds, teams: up to four members in one end-to-end encrypted group, on the same relays. Built for games, where a command must never wait behind a chat message.',
+				'Squads, shared worlds, teams: up to four members in one end-to-end encrypted group, over QUIC through the Linux relay. Built for games, where a command must never wait behind a chat message, nor voice behind a lost packet.',
 			items: [
 				{
 					title: 'Members are keys',
 					text: 'Each member is an Ed25519 identity that the app keeps, one per player say. The others see it, proven, so the app decides who owns what and who is only visiting.'
 				},
 				{
-					title: 'Four classes of traffic',
-					text: 'Commands, voice, chat and bulk, most urgent first, each with its own queue at the sender and in the relay. A chat flood or a snapshot never holds up a command.'
+					title: 'Five classes of traffic',
+					text: 'Commands, voice, chat, video and bulk, most urgent first, each with its own queue at the sender and in the relay, and its own QUIC stream. A chat flood or a snapshot never holds up a command.'
 				},
 				{
 					title: 'Newcomers catch up exactly',
@@ -266,7 +266,7 @@ export const en = {
 				},
 				{
 					q: 'Can more than two apps share a room?',
-					a: 'A room is for exactly two. For more, use a group: up to four members, with commands, chat, voice and state transfer, through the same relays. The groups guide explains how.'
+					a: 'A room is for exactly two. For more, use a group: up to four members, with commands, chat, voice, video and state transfer, over QUIC through the Linux relay. The groups guide explains how.'
 				},
 				{
 					q: 'Is it ready for production?',
@@ -294,7 +294,7 @@ export const en = {
 			'Everyone who opens it enters a name, checks their microphone, camera and speakers if they like, and joins.',
 			'Turn your microphone on from your card and speak, and your camera if you like. Use headphones if you are in the same room, or the microphones hear each other.'
 		],
-		note: 'The real thing: the Rust core in WebAssembly, Opus and VP8 through WebCodecs, an adaptive jitter buffer per speaker, video put back together whole from its fragments, all through the public relay <code>{relay}</code>, which forwards only ciphertext. The room key is in the link after <code>#</code>, which browsers never send to a server.',
+		note: 'The real thing: the Rust core in WebAssembly, Opus and VP8 through WebCodecs, an adaptive jitter buffer per speaker, video put back together whole from its fragments, all through the public relay <code>{relay}</code> over WebTransport (QUIC), where a lost packet holds up only itself and voice and video wait for nothing; the relay sees only ciphertext. The room key is in the link after <code>#</code>, which browsers never send to a server.',
 		noscript: 'The demo needs JavaScript and WebAssembly.',
 		loading: 'Loading…',
 		start: {
@@ -331,6 +331,10 @@ export const en = {
 			camera: 'The camera is not available (permission denied, or none found).',
 			codecs:
 				'This browser cannot encode Opus audio (WebCodecs). Text chat works; for voice, use a recent Chrome, Edge or Firefox.',
+			webtransport:
+				'This browser has no WebTransport, so it cannot join. Use a recent Chrome, Edge or Firefox.',
+			unreachable:
+				'The relay cannot be reached. Rooms travel over UDP (QUIC) only, which browsers cannot use through a proxy: if you use one (a system proxy, Clash and the like), add {host} to its exceptions. Or the network blocks UDP. The page keeps trying.',
 			full: 'The room is full (four people). The page keeps trying.',
 			replaced: 'This room was opened with the same identity elsewhere.',
 			link: 'That link is not a valid room link.',

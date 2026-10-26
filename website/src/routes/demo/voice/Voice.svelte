@@ -5,7 +5,7 @@
 	import type { Video } from 'peerconnect/video';
 	import { encode } from 'uqr';
 	import { i18n } from '#lib/i18n/current.svelte.ts';
-	import { RELAY_URL } from '#lib/site.ts';
+	import { GROUP_RELAY_URL } from '#lib/site.ts';
 
 	// Each browser tab is one member. Its identity lives in sessionStorage,
 	// which is per tab and survives reloads: two tabs are two members, and a
@@ -27,15 +27,32 @@
 	/** A member's video is shown while frames keep coming: at least one in this long. */
 	const VIDEO_FRESH = 2000;
 	/**
-	 * Small video: the public relay is a Cloudflare Worker, where every
-	 * fragment is a billed message (and nothing is dropped or put last).
+	 * 720p at 30 frames a second, as meeting apps send; the encoder steps
+	 * down towards `minBitrate` while receivers keep losing frames.
 	 */
-	const VIDEO = { width: 480, height: 270, framerate: 15, bitrate: 300_000, minBitrate: 100_000 };
+	const VIDEO = {
+		width: 1280,
+		height: 720,
+		framerate: 30,
+		bitrate: 1_500_000,
+		minBitrate: 200_000
+	};
+	/** Offline this long after joining, the network is probably what stops it (UDP blocked). */
+	const UNREACHABLE = 10_000;
 
 	type Sdk = typeof import('peerconnect');
 	type VoiceSdk = typeof import('peerconnect/voice');
 	type VideoSdk = typeof import('peerconnect/video');
-	type Problem = 'mic' | 'camera' | 'codecs' | 'full' | 'replaced' | 'link' | 'failed';
+	type Problem =
+		| 'mic'
+		| 'camera'
+		| 'codecs'
+		| 'webtransport'
+		| 'unreachable'
+		| 'full'
+		| 'replaced'
+		| 'link'
+		| 'failed';
 	interface Member {
 		id: string;
 		name: string;
@@ -251,7 +268,7 @@
 
 	/** A shareable link: the room key after `#`, short for the public relay. */
 	function linkFor(groupInvite: string): string {
-		const prefix = `${RELAY_URL}#`;
+		const prefix = `${GROUP_RELAY_URL}#`;
 		const fragment = groupInvite.startsWith(prefix)
 			? groupInvite.slice(prefix.length)
 			: encodeURIComponent(groupInvite);
@@ -260,7 +277,7 @@
 
 	function inviteFrom(hash: string): string {
 		const value = decodeURIComponent(hash.replace(/^#/, ''));
-		return value.includes('://') ? value : `${RELAY_URL}#${value}`;
+		return value.includes('://') ? value : `${GROUP_RELAY_URL}#${value}`;
 	}
 
 	function identity() {
@@ -418,7 +435,7 @@
 	}
 
 	function create() {
-		const group = sdk!.Group.create(RELAY_URL);
+		const group = sdk!.Group.create(GROUP_RELAY_URL);
 		invite = group.toString();
 		history.replaceState(history.state, '', linkFor(invite));
 		phase = 'join';
@@ -434,18 +451,32 @@
 		stopMicTest();
 		stopCameraTest();
 
-		const c = sdk!.joinGroup(invite, {
-			identity: identity(),
-			profile: JSON.stringify({ name: chosen })
-		});
+		let c: GroupConnection;
+		try {
+			c = sdk!.joinGroup(invite, {
+				identity: identity(),
+				profile: JSON.stringify({ name: chosen })
+			});
+		} catch {
+			raise('webtransport');
+			phase = 'join';
+			return;
+		}
 		conn = c;
+		// Groups go over UDP only: if it does not get through, say so.
+		const unreachable = setTimeout(() => {
+			if (conn === c && c.state === 'offline') raise('unreachable');
+		}, UNREACHABLE);
 		me = c.id;
 		members = [{ id: c.id, name: chosen }];
 		const current = () => conn === c;
 		c.addEventListener('state', () => {
 			if (!current()) return;
 			status = c.state;
-			if (c.state === 'online') problems = problems.filter((p) => p !== 'full' && p !== 'replaced');
+			if (c.state === 'online') {
+				clearTimeout(unreachable);
+				problems = problems.filter((p) => p !== 'full' && p !== 'replaced' && p !== 'unreachable');
+			}
 		});
 		c.addEventListener('joined', (e) => {
 			if (!current()) return;
@@ -772,6 +803,7 @@
 			if (disposed) return;
 			name = read(NAME_KEY) ?? '';
 			if (typeof AudioEncoder === 'undefined') raise('codecs');
+			if (!sdk.groupsSupported()) raise('webtransport');
 			if (location.hash.length > 1) {
 				try {
 					invite = sdk.Group.parse(inviteFrom(location.hash)).toString();
@@ -894,7 +926,9 @@
 {#if problems.length}
 	<div class="problems" role="status">
 		{#each problems as problem (problem)}
-			<p class="card problem">{t.problems[problem]}</p>
+			<p class="card problem">
+				{t.problems[problem].replace('{host}', new URL(GROUP_RELAY_URL).host)}
+			</p>
 		{/each}
 	</div>
 {/if}

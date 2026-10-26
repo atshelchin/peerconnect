@@ -104,7 +104,8 @@ export function docker(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
 	return `git clone ${REPO} && cd peerconnect
 docker build -t peerconnect-relay .
-docker run -p 8080:8080 peerconnect-relay      # ws://localhost:8080
+docker run -p 8080:8080 -p 8080:8080/udp peerconnect-relay
+# ${c('rooms: ws://localhost:8080 (TCP); groups: quic://localhost:8080 (UDP)', '房间：ws://localhost:8080（TCP）；群组：quic://localhost:8080（UDP）')}
 
 # ${c('With automatic HTTPS (Caddy), on a host that DOMAIN points to:', '自动 HTTPS（Caddy），DOMAIN 需指向本机：')}
 DOMAIN=relay.example.com docker compose -f deploy/docker-compose.yml up -d`;
@@ -116,22 +117,26 @@ export function binary(lang: Lang): string {
 peerconnect-relay              # ${c('listens on 0.0.0.0:8080', '监听 0.0.0.0:8080')}`;
 }
 
-// Groups. The relay in these is a placeholder: groups need a relay that serves
-// `/g1/`, such as one of your own.
-const GROUP_RELAY = 'wss://relay.example.com';
+// Groups. The relay in these is a placeholder: groups need a relay that
+// serves them over QUIC (`https://` or `quic://`), such as one of your own.
+const GROUP_RELAY = 'https://relay.example.com';
 
 export function jsGroup(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `import { Group, Identity, joinGroup } from "peerconnect";
+	return `import { Group, Identity, groupsSupported, joinGroup } from "peerconnect";
 
 // ${c('Whoever forms the group (a player, or your game server) creates it once.', '组建群组的一方（某位玩家，或你的游戏服务器）只需创建一次。')}
-const group = Group.create("${GROUP_RELAY}");
+const group = Group.create("${GROUP_RELAY}"); // ${c('or quic://203.0.113.9:8080: no domain needed', '或 quic://203.0.113.9:8080：无需域名')}
 const invite = group.toString(); // ${c('the whole credential: hand it to members only', '这就是全部凭证：只交给成员')}
+
+// ${c('Groups travel over WebTransport only: without it, joinGroup throws.', '群组只走 WebTransport：没有它时 joinGroup 会抛出异常。')}
+if (!groupsSupported()) throw new Error("${c('this browser cannot join groups', '这个浏览器无法加入群组')}");
 
 // ${c('Every member: a lasting identity, then join.', '每个成员：一个长期身份，然后加入。')}
 const me = savedSeed ? Identity.fromSeed(savedSeed) : Identity.generate();
 save(me.seed);                   // ${c('so that the others recognise me next time', '下次其他成员才能认出我')}
 const conn = joinGroup(invite, { identity: me, profile: "alice" });
+conn.addEventListener("state", () => showOnline(conn.state === "online")); // ${c('offline until the relay answers over UDP', '经 UDP 连上中继之前一直是 offline')}
 
 conn.addEventListener("joined", (e) => console.log("joined", e.detail.member));
 conn.addEventListener("left", (e) => console.log("left", e.detail.member));
@@ -220,7 +225,7 @@ while let Some(event) = conn.next().await {
 
 export function rustMember(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `use peerconnect::group::{Config, Member, Output};
+	return `use peerconnect::group::{transport, Class, Config, Member, Output};
 
 let mut member = Member::new(invite.parse()?, identity, Config::default(), now_ms())?;
 
@@ -228,20 +233,24 @@ let mut member = Member::new(invite.parse()?, identity, Config::default(), now_m
 fn process(&mut self) {
     let now = now_ms();
     self.member.handle_timeout(now);
-    for packet in self.socket.received() {
-        self.member.handle_binary(now, &packet);
+    for message in self.quic.received() { // ${c('stream messages and datagrams (GROUP.md §3.6)', '各条流上的消息和数据报（GROUP.md §3.6）')}
+        if message.is_empty() {
+            self.member.handle_text(now, "pong"); // ${c('the relay’s empty message', '中继发来的空消息')}
+        } else {
+            self.member.handle_binary(now, &message);
+        }
     }
     while let Some(output) = self.member.poll_output() {
         match output {
-            Output::Connect(url) => self.socket.open(&url), // ${c('then member.handle_open(now)', '随后调用 member.handle_open(now)')}
-            Output::Send(frame, class) => self.socket.queue(frame, class), // ${c('most urgent class first', '最紧急的类别先发')}
-            Output::Ping => self.socket.send_text("ping"),
-            Output::Disconnect => self.socket.close(),
+            Output::Connect(url) => self.quic.open(transport::target(&url).unwrap()), // ${c('then member.handle_open(now)', '随后调用 member.handle_open(now)')}
+            Output::Send(frame, class) => self.quic.send(class, frame), // ${c('a stream per class; voice and video as datagrams', '每个类别一条流；语音和视频走数据报')}
+            Output::Ping => self.quic.send(Class::Command, Vec::new()), // ${c('the empty message', '空消息')}
+            Output::Disconnect => self.quic.close(),
             Output::Event(event) => self.on_event(event),
         }
     }
 }
-// ${c('Socket closed: member.handle_close(now, Some(code)); it asks to connect again.', '连接关闭时：member.handle_close(now, Some(code))，它会再次要求连接。')}`;
+// ${c('Connection closed: member.handle_close(now, Some(code)); it asks to connect again.', '连接关闭时：member.handle_close(now, Some(code))，它会再次要求连接。')}`;
 }
 
 export function cBuild(lang: Lang): string {
@@ -252,27 +261,33 @@ cargo build --release -p peerconnect-ffi
 # ${c('header: crates/peerconnect-ffi/include/peerconnect.h', '头文件：crates/peerconnect-ffi/include/peerconnect.h')}`;
 }
 
-export function cMember(lang: Lang): string {
+export function cClient(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `pc_member *m = pc_member_new(invite, seed, (const uint8_t *)"alice", 5, now_ms());
+	return `/* ${c('Connects over QUIC on two threads of its own, and reconnects as needed.', '在库自己的两个线程上经 QUIC 连接，需要时自动重连。')} */
+pc_client *c = pc_client_join(invite, seed, (const uint8_t *)"alice", 5);
 
 void every_frame(void) {
-  pc_member_handle_timeout(m, now_ms());       /* ${c('harmless when nothing is due', '没有到期的事情时调用也无妨')} */
-  for (/* ${c('each message the socket received', '套接字收到的每条消息')} */) pc_member_handle_binary(m, now_ms(), data, len);
-
   pc_output out;
-  while (pc_member_poll(m, &out) != PC_NONE) {
+  while (pc_client_poll(c, &out) != PC_NONE) {   /* ${c('never blocks', '从不阻塞')} */
     switch (out.kind) {
-      case PC_CONNECT: open_websocket((const char *)out.data); break;   /* ${c('then pc_member_handle_open', '随后调用 pc_member_handle_open')} */
-      case PC_SEND: send_binary(out.data, out.len, out.class_); break;  /* ${c('most urgent class first', '最紧急的类别先发')} */
-      case PC_PING: send_text("ping"); break;
-      case PC_DISCONNECT: close_websocket(); break;
+      case PC_STATE: show_online(out.state == 1); break;   /* ${c('0 offline, 1 online, 2 closed', '0 离线，1 在线，2 已关闭')} */
+      case PC_JOINED: roster_add(out.member, out.data, out.len); break;   /* ${c('data: its profile', 'data 是它的资料')} */
+      case PC_LEFT: roster_remove(out.member); break;
       case PC_MESSAGE: on_message(out.member, out.channel, out.data, out.len); break;
       case PC_VOICE: jitter_buffer_push(out.member, out.seq, out.data, out.len); break;
-      /* PC_JOINED, PC_LEFT, PC_SYNC_REQUEST, PC_SNAPSHOT, … */
+      case PC_SYNC_REQUEST: {   /* ${c('take the snapshot right here', '就在这里拍下快照')} */
+        size_t len;
+        const uint8_t *world = save_world(&len);
+        pc_client_provide_sync(c, out.member, out.transfer, world, len);
+        break;
+      }
+      case PC_SNAPSHOT: load_world(out.data, out.len); break;
+      /* PC_DATAGRAM, PC_VIDEO, PC_KEYFRAME_REQUEST, PC_MISSED, … */
     }
   }
 }
 
-pc_member_send(m, 0 /* command */, (const uint8_t *)"place 7", 7, NULL);`;
+pc_client_send(c, 0 /* command */, (const uint8_t *)"place 7", 7, NULL);
+pc_client_send_voice(c, seq++, opus_packet, opus_len);   /* ${c('dropped rather than delayed', '宁可丢弃也不延迟')} */
+pc_client_free(c);   /* ${c('leaves the group', '离开群组')} */`;
 }

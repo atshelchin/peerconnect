@@ -53,6 +53,21 @@ Persist the room when you create or join it, and again after `"paired"` (inviter
 
 Messages are delivered in order, exactly once, as long as both sides keep running; unacknowledged messages live in memory, so a page reload loses those not yet delivered.
 
+## Groups
+
+Up to four members with commands, chat, voice, video and state transfer ([GROUP.md](https://github.com/atshelchin/peerconnect/blob/main/GROUP.md)), over WebTransport only: a lost packet holds up only its own class, and voice and video wait for nothing. There is no WebSocket fallback, so groups need a runtime with WebTransport (not Node.js; check `groupsSupported()`), UDP that gets through, and no HTTP proxy in the way. Group relays are the Linux relay, at an `https://` URL, or `quic://` for one without a domain.
+
+```js
+import { Group, groupsSupported, Identity, joinGroup } from "peerconnect";
+
+const group = Group.create("https://group-relay.peerconnect.dev"); // group.toString() is the invite
+const conn = joinGroup(group, { identity: Identity.generate(), profile: "alice" }); // throws without WebTransport
+conn.addEventListener("message", (e) => console.log(e.detail.from, new TextDecoder().decode(e.detail.data)));
+conn.send("chat", "hello");
+```
+
+`peerconnect/voice` (`startVoice`) and `peerconnect/video` (`startVideo`) add speech and camera video through WebCodecs.
+
 ## Building
 
 From a clone of [the repository](https://github.com/atshelchin/peerconnect):

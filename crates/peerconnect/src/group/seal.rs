@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn key_frames_open_only_in_their_group_and_position() {
-        let group = Group::create("wss://r").unwrap();
+        let group = Group::create("https://r").unwrap();
         let identity = Identity::generate();
         let frame = seal_key(&group, &identity, 2, wire::BROADCAST, &announce(&identity));
         let back = open_key(&group, &frame).unwrap();
@@ -169,7 +169,7 @@ mod tests {
         );
         assert_eq!(back.key[..], [5; 32]);
 
-        assert!(open_key(&Group::create("wss://r").unwrap(), &frame).is_none());
+        assert!(open_key(&Group::create("https://r").unwrap(), &frame).is_none());
         // Moving it to another slot or recipient breaks it.
         for i in [1, 2] {
             let mut moved = frame.clone();

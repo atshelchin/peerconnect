@@ -55,5 +55,5 @@ fast = ["ed25519-dalek/fast", "x25519-dalek/precomputed-tables"]
 # The weekly certificate a relay without certificate files serves over QUIC,
 # and whose hashes browsers pin for a `quic://` relay (`group::certificate`).
 certificate = ["dep:p256"]
-# A Tokio driver (`peerconnect::client`): WebSocket, and QUIC for groups.
+# A Tokio driver (`peerconnect::client`): WebSocket for rooms, QUIC for groups.
 client = ["dep:bytes", "dep:futures-util", "dep:quinn", "dep:rustls", "dep:tokio", "dep:tokio-tungstenite", "dep:webpki-roots"]

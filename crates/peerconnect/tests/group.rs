@@ -224,7 +224,7 @@ struct Sim {
 
 impl Sim {
     fn new() -> Sim {
-        let group = Group::create("wss://relay.test").unwrap();
+        let group = Group::create("https://relay.test").unwrap();
         let relay = Relay {
             group: group.id(),
             limit: wire::MAX_SLOTS,
@@ -980,7 +980,7 @@ fn hanging_connection_attempts_time_out_and_are_retried() {
 
 #[test]
 fn a_relay_that_never_says_hello_or_welcome_is_left() {
-    let group = Group::create("wss://relay.test").unwrap();
+    let group = Group::create("https://relay.test").unwrap();
     let mut m = Member::new(group, Identity::generate(), Config::default(), 0).unwrap();
     let drain = |m: &mut Member| std::iter::from_fn(|| m.poll_output()).collect::<Vec<_>>();
     assert!(matches!(drain(&mut m)[..], [Output::Connect(_)]));

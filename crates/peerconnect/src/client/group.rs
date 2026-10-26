@@ -3,10 +3,10 @@
 //! state transfer, and voice is dropped rather than delayed when the
 //! connection backs up.
 //!
-//! For an `https://` or `quic://` relay it connects over raw QUIC, where a
-//! lost packet holds up only its own class, and falls back to the relay's
-//! WebSocket if QUIC does not connect within [`QUIC_HEAD_START`] (UDP
-//! blocked, say), as [`group::transport`] describes.
+//! It connects over raw QUIC, where a lost packet holds up only its own
+//! class, to the `https://` or `quic://` relay of the invite, as
+//! [`group::transport`] describes. Groups have no WebSocket transport: where
+//! UDP does not get through, the member stays offline and keeps trying.
 //!
 //! ```no_run
 //! # async fn demo(invite: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -27,41 +27,23 @@
 //! # Ok(()) }
 //! ```
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::time::{Instant, sleep_until, timeout};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Instant, sleep_until};
 
 use super::quic::{self, QuicSocket};
-use super::{Ws, open_with};
 use crate::Error;
-use crate::group::transport::{self, Transport};
-use crate::group::{self, Channel, Class, Config, Event, Group, Identity, Member, MemberId, Output, SendError, State};
+use crate::group::transport;
+use crate::group::{Channel, Config, Event, Group, Identity, Member, MemberId, Output, SendError, State};
 
-type Connecting = Pin<Box<dyn Future<Output = Option<Socket>> + Send>>;
+type Connecting = Pin<Box<dyn Future<Output = Option<QuicSocket>> + Send>>;
 
-/// How long QUIC has to connect before the WebSocket is tried as well.
-pub const QUIC_HEAD_START: Duration = Duration::from_millis(1500);
-
-/// Bytes written before each flush, at most: small, so that an urgent
-/// frame queued meanwhile goes next.
-const BATCH: usize = 16 << 10;
-/// Command and voice bytes waiting to be written beyond which voice frames
-/// are dropped.
-const VOICE_BACKLOG: usize = 4 << 10;
-/// Video bytes waiting beyond which the oldest video is dropped.
-const VIDEO_BACKLOG: usize = 64 << 10;
-/// How long a closing socket may take to flush what is queued.
+/// How long a closing connection may take to flush what is queued.
 const FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 /// Joins the group and stays in it, reconnecting as needed, until left or
@@ -71,9 +53,9 @@ pub fn join(group: Group, identity: Identity, config: Config) -> Result<GroupCon
     let id = member.id();
     let (commands, rx) = mpsc::unbounded_channel();
     let (tx, events) = mpsc::unbounded_channel();
-    let via = Arc::new(AtomicU8::new(0));
-    tokio::spawn(drive(member, rx, tx, via.clone()));
-    Ok(GroupConnection { sender: GroupSender { commands, id, via }, events })
+    let connected = Arc::new(AtomicBool::new(false));
+    tokio::spawn(drive(member, rx, tx, connected.clone()));
+    Ok(GroupConnection { sender: GroupSender { commands, id, connected }, events })
 }
 
 /// A live group membership. Dropping it leaves the group.
@@ -86,6 +68,12 @@ impl GroupConnection {
     /// The next event; `None` once the connection has stopped.
     pub async fn next(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    /// The next event if there is one now, for callers that poll (a game
+    /// loop, say) instead of awaiting.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.events.try_recv().ok()
     }
 
     /// A handle for sending from other tasks.
@@ -117,24 +105,13 @@ impl std::ops::Deref for GroupConnection {
 pub struct GroupSender {
     commands: mpsc::UnboundedSender<Command>,
     id: MemberId,
-    via: Arc<AtomicU8>,
-}
-
-/// What a connection runs over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Via {
-    WebSocket = 1,
-    Quic = 2,
+    connected: Arc<AtomicBool>,
 }
 
 impl GroupSender {
-    /// What the connection to the relay runs over; `None` while there is none.
-    pub fn via(&self) -> Option<Via> {
-        match self.via.load(Ordering::Relaxed) {
-            1 => Some(Via::WebSocket),
-            2 => Some(Via::Quic),
-            _ => None,
-        }
+    /// Whether a QUIC connection to the relay is open now.
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     /// Broadcasts a message on `channel`; returns its id.
@@ -202,11 +179,11 @@ async fn drive(
     mut member: Member,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
-    via: Arc<AtomicU8>,
+    connected: Arc<AtomicBool>,
 ) {
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
-    let mut socket: Option<Socket> = None;
+    let mut socket: Option<QuicSocket> = None;
     let mut connecting: Option<Connecting> = None;
     let mut controlled = true;
 
@@ -226,9 +203,9 @@ async fn drive(
                 }
                 Output::Disconnect => {
                     connecting = None;
-                    via.store(0, Ordering::Relaxed);
+                    connected.store(false, Ordering::Relaxed);
                     if let Some(socket) = socket.take() {
-                        socket.close();
+                        socket.close(FLUSH_GRACE);
                     }
                 }
                 Output::Event(event) => {
@@ -280,7 +257,7 @@ async fn drive(
                 connecting = None;
                 match opened {
                     Some(opened) => {
-                        via.store(opened.via() as u8, Ordering::Relaxed);
+                        connected.store(true, Ordering::Relaxed);
                         socket = Some(opened);
                         member.handle_open(now());
                     }
@@ -288,210 +265,19 @@ async fn drive(
                 }
             }
             received = async { socket.as_mut().unwrap().recv().await }, if socket.is_some() => match received {
-                Received::Binary(frame) => member.handle_binary(now(), &frame),
-                Received::Text(text) => member.handle_text(now(), &text),
-                Received::Closed(code) => {
-                    socket.take().unwrap().close();
-                    via.store(0, Ordering::Relaxed);
+                quic::Incoming::Binary(frame) => member.handle_binary(now(), &frame),
+                quic::Incoming::Text(text) => member.handle_text(now(), text),
+                quic::Incoming::Closed(code) => {
+                    socket.take().unwrap().close(FLUSH_GRACE);
+                    connected.store(false, Ordering::Relaxed);
                     member.handle_close(now(), code);
                 }
-                Received::Nothing => {}
             },
         }
     }
 }
 
-/// Opens the first transport to work (see [`QUIC_HEAD_START`]).
-async fn open(url: String) -> Option<Socket> {
-    let mut quic = None;
-    let mut websocket = None;
-    for way in transport::transports(&url) {
-        match way {
-            Transport::Quic(target) => quic = Some(target),
-            Transport::WebSocket(url) => websocket = Some(url),
-        }
-    }
-    let websocket = async move { Some(Socket::websocket(open_with(websocket?, group::wire::MAX_FRAME_LEN).await?)) };
-    let Some(target) = quic else { return websocket.await };
-    let quic = async move { QuicSocket::connect(&target).await.map(Socket::Quic) };
-    tokio::pin!(quic, websocket);
-    tokio::select! {
-        biased;
-        opened = &mut quic => return match opened {
-            Some(opened) => Some(opened),
-            None => websocket.await,
-        },
-        () = tokio::time::sleep(QUIC_HEAD_START) => {}
-    }
-    // Both, now; the first to open wins.
-    let (mut quic_failed, mut websocket_failed) = (false, false);
-    while !(quic_failed && websocket_failed) {
-        tokio::select! {
-            biased;
-            opened = &mut quic, if !quic_failed => match opened {
-                Some(opened) => return Some(opened),
-                None => quic_failed = true,
-            },
-            opened = &mut websocket, if !websocket_failed => match opened {
-                Some(opened) => return Some(opened),
-                None => websocket_failed = true,
-            },
-        }
-    }
-    None
-}
-
-enum Received {
-    Binary(bytes::Bytes),
-    Text(String),
-    Closed(Option<u16>),
-    /// Nothing for the member (a WebSocket control frame).
-    Nothing,
-}
-
-/// An open connection: the driver reads it, writer tasks drain its queues.
-enum Socket {
-    WebSocket { stream: SplitStream<Ws>, queue: Arc<Queue>, writer: tokio::task::JoinHandle<()> },
-    Quic(QuicSocket),
-}
-
-impl Socket {
-    fn via(&self) -> Via {
-        match self {
-            Socket::WebSocket { .. } => Via::WebSocket,
-            Socket::Quic(_) => Via::Quic,
-        }
-    }
-
-    fn websocket(ws: Ws) -> Socket {
-        let (sink, stream) = ws.split();
-        let queue = Arc::new(Queue::default());
-        let writer = tokio::spawn(write(sink, queue.clone()));
-        Socket::WebSocket { stream, queue, writer }
-    }
-
-    fn send(&self, class: Class, frame: Vec<u8>) {
-        match self {
-            Socket::WebSocket { queue, .. } => queue.push(Some(class), Message::binary(frame)),
-            Socket::Quic(quic) => quic.send(class, frame),
-        }
-    }
-
-    fn ping(&self) {
-        match self {
-            Socket::WebSocket { queue, .. } => queue.push(None, Message::text(group::wire::PING)),
-            Socket::Quic(quic) => quic.ping(),
-        }
-    }
-
-    async fn recv(&mut self) -> Received {
-        match self {
-            Socket::WebSocket { stream, .. } => match stream.next().await {
-                Some(Ok(Message::Binary(frame))) => Received::Binary(frame),
-                Some(Ok(Message::Text(text))) => Received::Text(text.as_str().to_owned()),
-                Some(Ok(Message::Close(frame))) => Received::Closed(frame.map(|f| f.code.into())),
-                Some(Ok(_)) => Received::Nothing,
-                Some(Err(_)) | None => Received::Closed(None),
-            },
-            Socket::Quic(quic) => match quic.recv().await {
-                quic::Incoming::Binary(frame) => Received::Binary(frame),
-                quic::Incoming::Text(text) => Received::Text(text.to_owned()),
-                quic::Incoming::Closed(code) => Received::Closed(code),
-            },
-        }
-    }
-
-    /// Closes with 1000 once what is queued is written, abandoning a socket
-    /// that does not drain in time.
-    fn close(self) {
-        match self {
-            Socket::WebSocket { stream, queue, mut writer } => {
-                queue.inner.lock().unwrap().closing = true;
-                queue.ready.notify_one();
-                tokio::spawn(async move {
-                    if timeout(FLUSH_GRACE, &mut writer).await.is_err() {
-                        writer.abort();
-                    }
-                    drop(stream);
-                });
-            }
-            Socket::Quic(quic) => quic.close(FLUSH_GRACE),
-        }
-    }
-}
-
-/// What the writer will send: keepalives first, then frames by class.
-#[derive(Default)]
-struct Queue {
-    inner: Mutex<Pending>,
-    ready: Notify,
-}
-
-#[derive(Default)]
-struct Pending {
-    pings: VecDeque<Message>,
-    classes: [VecDeque<Message>; Class::COUNT],
-    bytes: [usize; Class::COUNT],
-    closing: bool,
-}
-
-impl Queue {
-    /// Queues a frame of `class`, or a keepalive (`None`). Voice behind
-    /// too much is dropped (late audio is worse than lost audio), and the
-    /// oldest video past its budget.
-    fn push(&self, class: Option<Class>, msg: Message) {
-        let mut q = self.inner.lock().unwrap();
-        match class {
-            None => q.pings.push_back(msg),
-            Some(class) => {
-                let (command, voice, video) = (Class::Command.index(), Class::Voice.index(), Class::Video.index());
-                if class == Class::Voice && q.bytes[command] + q.bytes[voice] > VOICE_BACKLOG {
-                    return;
-                }
-                while class == Class::Video && q.bytes[video] + msg.len() > VIDEO_BACKLOG {
-                    let Some(old) = q.classes[video].pop_front() else { break };
-                    q.bytes[video] -= old.len();
-                }
-                q.bytes[class.index()] += msg.len();
-                q.classes[class.index()].push_back(msg);
-            }
-        }
-        drop(q);
-        self.ready.notify_one();
-    }
-
-    /// Up to [`BATCH`] bytes, most urgent first; `None` once closing and empty.
-    fn take(&self) -> Option<Vec<Message>> {
-        let mut q = self.inner.lock().unwrap();
-        let mut batch: Vec<Message> = q.pings.drain(..).collect();
-        let mut taken = 0;
-        while taken < BATCH {
-            let Some(class) = Class::PRIORITY.iter().map(|c| c.index()).find(|&c| !q.classes[c].is_empty()) else {
-                break;
-            };
-            let msg = q.classes[class].pop_front().unwrap();
-            q.bytes[class] -= msg.len();
-            taken += msg.len();
-            batch.push(msg);
-        }
-        (!batch.is_empty() || !q.closing).then_some(batch)
-    }
-}
-
-async fn write(mut sink: SplitSink<Ws, Message>, queue: Arc<Queue>) {
-    while let Some(batch) = queue.take() {
-        if batch.is_empty() {
-            queue.ready.notified().await;
-            continue;
-        }
-        for msg in batch {
-            if sink.feed(msg).await.is_err() {
-                return;
-            }
-        }
-        if sink.flush().await.is_err() {
-            return;
-        }
-    }
-    let _ = sink.send(Message::Close(Some(CloseFrame { code: CloseCode::Normal, reason: "".into() }))).await;
+/// Opens a QUIC connection to the group's endpoint.
+async fn open(url: String) -> Option<QuicSocket> {
+    QuicSocket::connect(&transport::target(&url)?).await
 }

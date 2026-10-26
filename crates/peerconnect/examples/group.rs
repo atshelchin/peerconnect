@@ -7,7 +7,7 @@
 //!
 //! Lines typed are sent as chat; lines starting with `!` as commands; the
 //! others' messages are printed as `<name> <channel>: <text>`. `/quit` leaves.
-//! A `quic://` or `https://` relay is reached over QUIC where UDP gets through.
+//! The relay is a `quic://` or `https://` URL: groups travel over QUIC (UDP).
 //!
 //! Run with `cargo run -p peerconnect --features client --example group -- …`.
 
@@ -54,10 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     };
                     println!("{name} {channel}: {}", String::from_utf8_lossy(&data));
                 }
-                Some(Event::State(state)) => match conn.via() {
-                    Some(via) => eprintln!("* {state:?} over {via:?}"),
-                    None => eprintln!("* {state:?}"),
-                },
+                Some(Event::State(state)) => eprintln!("* {state:?}"),
                 Some(_) => {}
                 None => return Ok(()),
             },

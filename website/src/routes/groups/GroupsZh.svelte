@@ -3,6 +3,7 @@
 		{ id: 'overview', label: '群组能做什么' },
 		{ id: 'guarantees', label: '保证' },
 		{ id: 'classes', label: '流量类别' },
+		{ id: 'transport', label: '只走 QUIC' },
 		{ id: 'identities', label: '身份与角色' },
 		{ id: 'state-transfer', label: '状态同步' },
 		{ id: 'consistency', label: '一致性' },
@@ -18,9 +19,10 @@
 
 <script lang="ts">
 	import CodeBlock from '#lib/components/CodeBlock.svelte';
+	import { GROUP_RELAY_URL, REPO_URL } from '#lib/site.ts';
 	import {
 		cBuild,
-		cMember,
+		cClient,
 		installJs,
 		jsGroup,
 		jsRealtime,
@@ -35,7 +37,8 @@
 <h1>群组</h1>
 <p class="lead">
 	房间只连接两个端，群组则最多可以容纳 4
-	名成员：一支游戏小队、一个共享世界里的玩家、一个小团队。成员之间互发指令、聊天、语音和状态，全程端到端加密，经过的仍是那套不受信任、不存状态的中继。
+	名成员：一支游戏小队、一个共享世界里的玩家、一个小团队。成员之间互发指令、聊天、语音和状态，全程端到端加密，经
+	QUIC 通过一个不受信任、不存状态的中继传输。
 </p>
 
 <p class="try"><a href="/zh/demo/voice">体验一下：在浏览器里进行多人语音视频聊天 →</a></p>
@@ -58,7 +61,7 @@
 <p>
 	群组有一套独立的协议——<a href="/spec/groups">PeerConnect 群组协议</a>——使用单独的中继端点（<code
 		>/g1/&lt;id&gt;</code
-	>）。参考实现的中继同时支持房间和群组。
+	>）。群组只走 QUIC，由 Linux 中继与房间一并提供（见<a href="#relays">中继</a>）。
 </p>
 <dl>
 	<dt>群组（Group）</dt>
@@ -68,7 +71,7 @@
 	</dd>
 	<dt>邀请（Invite）</dt>
 	<dd>
-		中继地址加上群组密钥组成的一个字符串，形如 <code>wss://relay…#…</code
+		中继地址加上群组密钥组成的一个字符串，形如 <code>https://relay…#…</code
 		>。它就是全部凭证：没有配对步骤，也没有别的东西需要保存。拿到它的人就能加入群组、读到群里的所有内容，并以自己的身份发言，所以只把它交给成员，并通过私密渠道传递。组建小队的游戏服务器通常会自己创建群组，再把邀请分发给每位玩家。
 	</dd>
 	<dt>成员（Member）</dt>
@@ -93,7 +96,7 @@
 	</li>
 	<li>
 		<strong>语音和数据报是实时的。</strong
-		>无论卡在哪里，它们都宁可被丢弃也不会被延迟：发送方套接字积压时由发送方丢弃，接收方跟不上时由中继丢弃。迟到的声音比丢失的声音更糟。
+		>无论卡在哪里，它们都宁可被丢弃也不会被延迟：发送方连接积压时由发送方丢弃，接收方跟不上时由中继丢弃。迟到的声音比丢失的声音更糟。
 	</li>
 	<li>
 		<strong>紧急的流量优先。</strong
@@ -111,7 +114,8 @@
 
 <h2 id="classes">流量类别</h2>
 <p>
-	帧的类型决定了它属于哪个类别，这也是中继对它唯一了解的信息。每个类别在发送方有自己的队列，在中继里也为每个接收方单独排队，在加密层还有各自的计数器。按紧急程度从高到低：
+	帧的类型决定了它属于哪个类别，这也是中继对它唯一了解的信息。每个类别在发送方有自己的队列，在中继里也为每个接收方单独排队，有自己的
+	QUIC 流，在加密层还有各自的计数器。按紧急程度从高到低：
 </p>
 <div class="table">
 	<table>
@@ -149,6 +153,43 @@
 	>
 	的 <code>startVideo</code> 通过 WebCodecs 发送摄像头画面，并把每位成员画进一个 canvas。指令流和聊天流中的每条消息最多
 	16,352 字节。
+</p>
+
+<h2 id="transport">只走 QUIC</h2>
+<p>
+	群组只走 QUIC，没有别的传输方式：浏览器里是 WebTransport（HTTP/3），Rust 和 C 库里是原生
+	QUIC（ALPN
+	<code>peerconnect-g1</code
+	>）。每个类别各走一条流，语音和视频走数据报，所以丢一个包只会挡住它所在的类别，语音也从不等待重传。换成
+	TCP，丢一个包就会让语音、视频和指令一起停下来，直到它被重传。
+</p>
+<p>
+	差别很大。每一跳丢包 3% 时，语音 p99 在 WebSocket 上是 138 ms，在 QUIC 上是 53
+	ms。浏览器里每个方向丢包 2% 时，语音到达对方的 p99 在 WebSocket 上是 460–1170 ms，在 WebTransport
+	上是 105–120 ms。所以群组没有 WebSocket 兜底：经 UDP
+	连不上中继的成员不会加入，而不是带着卡顿的语音和视频勉强加入。
+</p>
+<h3 id="who-can-join">哪些成员加入不了</h3>
+<ul>
+	<li>
+		<strong>不支持 WebTransport 的浏览器。</strong>这时 <code>groupsSupported()</code> 返回
+		<code>false</code>，<code>joinGroup</code> 会抛出 <code>"NotSupportedError"</code>
+		<code>DOMException</code>。提供群组功能之前先检查一下，并建议用户换用最新版的 Chrome、Edge 或
+		Firefox。没有 WebTransport 的运行时（比如 Node.js）也一样：在那里请用 Rust 客户端。
+	</li>
+	<li>
+		<strong>屏蔽 UDP 的网络。</strong>有些公司、学校和酒店的网络只放行 TCP。这时只能换一个网络。
+	</li>
+	<li>
+		<strong>走 HTTP 或 SOCKS 代理的浏览器</strong>——系统代理、Clash 之类。QUIC
+		穿不过这类代理。请把中继的主机名加到代理的例外（绕过）列表里，让浏览器直连中继。
+	</li>
+</ul>
+<p>
+	连不上的成员会保持离线并不断重试，路一通就会加入。<code>conn.connected</code>（JavaScript）、<code
+		>conn.connected()</code
+	>（Rust）和 <code>pc_client_connected</code>（C）表示当前是否有一条到中继的连接：如果它一直是
+	false，请告诉用户可能是什么挡住了连接。
 </p>
 
 <h2 id="identities">身份与角色</h2>
@@ -237,7 +278,9 @@
 
 <h2 id="javascript">JavaScript</h2>
 <p>
-	群组和房间在同一个包里，支持浏览器、Node.js 22+、Deno 和 Bun。浏览器语音是单独的入口
+	群组和房间在同一个包里。群组走 WebTransport，所以运行时必须支持它：请先检查
+	<code>groupsSupported()</code>（见<a href="#who-can-join">哪些成员加入不了</a
+	>）。浏览器语音是单独的入口
 	<code>peerconnect/voice</code>。群组连接会自动重连，直到你调用 <code>leave()</code>。
 </p>
 <CodeBlock code={installJs('zh')} lang="sh" title="shell" />
@@ -349,10 +392,17 @@
 		<tbody>
 			<tr
 				><td><code>Group.create(relay)</code></td><td
-					>创建群组。<code>group.toString()</code> 就是它的邀请。</td
+					>在 <code>https://</code> 或 <code>quic://</code> 中继上创建群组；传入 <code>ws://</code>
+					或
+					<code>wss://</code> 会抛出异常。<code>group.toString()</code> 就是它的邀请。</td
 				></tr
 			>
 			<tr><td><code>Group.parse(invite)</code></td><td>解析邀请。</td></tr>
+			<tr
+				><td><code>groupsSupported()</code></td><td
+					>当前运行时能否加入群组，也就是是否支持 WebTransport。</td
+				></tr
+			>
 			<tr
 				><td><code>Identity.generate()</code>、<code>Identity.fromSeed(seed)</code></td><td
 					>成员身份；请持久保存 <code>seed</code>。<code>id</code> 即成员 ID。</td
@@ -360,7 +410,10 @@
 			>
 			<tr
 				><td><code>joinGroup(group, options)</code></td><td
-					>以 <code>identity</code> 和 <code>profile</code> 加入，直到离开前一直留在群组中。</td
+					>以 <code>identity</code> 和 <code>profile</code> 经 WebTransport
+					加入，直到离开前一直留在群组中；<code>webTransport</code>
+					会原样传给 <code>WebTransport</code> 构造函数。不支持 WebTransport 时抛出
+					<code>"NotSupportedError"</code>。</td
 				></tr
 			>
 			<tr
@@ -386,8 +439,13 @@
 				><td>回应 <code>syncrequest</code>。</td></tr
 			>
 			<tr
-				><td><code>conn.members</code>、<code>conn.id</code>、<code>conn.rtt</code></td><td
-					>已接纳的成员（成员 ID → 资料）、我们的成员 ID、最近一次到中继的往返时间。</td
+				><td
+					><code>conn.members</code>、<code>conn.id</code>、<code>conn.rtt</code>、<code
+						>conn.connected</code
+					></td
+				><td
+					>已接纳的成员（成员 ID → 资料）、我们的成员
+					ID、最近一次到中继的往返时间，以及当前是否有一条到中继的 WebTransport 会话。</td
 				></tr
 			>
 			<tr><td><code>conn.leave()</code></td><td>离开群组。</td></tr>
@@ -397,88 +455,104 @@
 
 <h2 id="rust">Rust</h2>
 <p>
-	<code>client</code> 特性提供了 <code>client::group</code>，一个基于 Tokio 的驱动。连接可以解引用为
-	<code>GroupSender</code>，<code>conn.sender()</code> 会给你一份克隆，用于在其他任务中发送。
+	<code>client</code> 特性提供了 <code>client::group</code>，一个基于 Tokio 的驱动，经原生 QUIC
+	连接。连接可以解引用为 <code>GroupSender</code>，<code>conn.sender()</code>
+	会给你一份克隆，用于在其他任务中发送；<code>conn.connected()</code> 表示当前是否有一条到中继的连接。
 </p>
 <CodeBlock code={rustDependency} lang="toml" title="Cargo.toml" />
 <CodeBlock code={rustGroup('zh')} lang="rust" title="main.rs" />
 <h3>使用你自己的事件循环</h3>
 <p>
 	不启用 <code>client</code> 特性时，这个 crate 不做任何 I/O。<code>group::Member</code>
-	就是以状态机形式呈现的完整成员：你把一个 WebSocket 上发生的事情告诉它，再执行它要求的操作。自带主循环的引擎每帧轮询一次即可——比如在
-	GDExtension 里配合 Godot 的 <code>WebSocketPeer</code>——同一个状态机在浏览器里则通过 JavaScript
-	SDK 运行。时间单位是毫秒，任何单调时钟都可以。
+	就是以状态机形式呈现的完整成员，供自带 QUIC 协议栈的应用使用：你把一条连接上发生的事情告诉它，再执行它要求的操作。它自己不负责分帧：每个类别走自己的一条流，消息带长度前缀；语音和视频装得下时走数据报；<code
+		>ping</code
+	>
+	和 <code>pong</code> 都是空消息（<a href="/spec/groups#sec-3-6">§3.6</a>）。<code
+		>group::transport::target(url)</code
+	>
+	给出要连接的主机、端口和路径，以及是否校验证书。时间单位是毫秒，任何单调时钟都可以。
 </p>
 <CodeBlock code={rustMember('zh')} lang="rust" title="engine.rs" />
 <p>
 	可以用终端群聊示例体验：
-	<code>cargo run -p peerconnect --features client --example group -- new &lt;relay&gt; alice</code
+	<code
+		>cargo run -p peerconnect --features client --example group -- new quic://localhost:8080 alice</code
 	>，然后在另一个终端运行 <code>… -- join '&lt;invite&gt;' bob</code>。
 </p>
 
 <h2 id="engines">游戏引擎（C）</h2>
 <p>
-	<code>peerconnect-ffi</code> 把同一个状态机封装成 C 库，供 Unity、Unreal、Godot（通过 GDExtension 或
-	GDNative）以及任何支持 C FFI 的语言使用。它不含 I/O，也不开线程：WebSocket 归你的引擎管，你每帧把发生的事情告诉成员对象，再执行它要求的操作。
+	<code>peerconnect-ffi</code> 是 C 库，供 Godot（通过 GDExtension）、Unity、Unreal 以及任何支持 C
+	FFI 的语言使用。<code>pc_client_join</code>
+	加入群组，并在库自己的两个线程上经 QUIC 连接，需要时自动重连。游戏循环每帧调用一次
+	<code>pc_client_poll</code> 取事件，它从不阻塞；<code>pc_client_send</code> 系列函数随时都可以调用。
 </p>
 <CodeBlock code={cBuild('zh')} lang="sh" title="shell" />
-<CodeBlock code={cMember('zh')} lang="c" title="game.c" />
+<CodeBlock code={cClient('zh')} lang="c" title="game.c" />
 <p>
-	套接字关闭时，用关闭码（或 -1）调用 <code>pc_member_handle_close</code
-	>；成员对象会自行重连，再次给出
-	<code>PC_CONNECT</code>。<code>pc_output</code>
-	中的指针在对该成员的下一次调用之前有效，需要保留的内容请自行复制。只要使用 SDK 的格式
+	同一时间只在一个线程里使用同一个客户端。<code>pc_output</code>
+	中的指针在对该客户端的下一次调用之前有效，需要保留的内容请自行复制。有一条到中继的 QUIC 连接时，<code
+		>pc_client_connected</code
+	>
+	返回 1；UDP 不通的地方，客户端会保持离线并不断重试。只要使用 SDK 的格式
 	<code>hold[1] ‖ Opus 包</code>，语音帧就能与浏览器互通。
+</p>
+<p>
+	自带 QUIC 协议栈的应用可以改用 <code>pc_member_*</code>，即不含 I/O、不开线程的状态机本身：<code
+		>PC_CONNECT</code
+	>
+	给出要打开的 <code>https://</code> 或 <code>quic://</code> 地址，<code>PC_SEND</code>
+	给出要发到某个类别流上的消息，<code>PC_PING</code> 表示发送空消息；收到中继的空消息时，把
+	<code>"pong"</code> 传给 <code>pc_member_handle_text</code>。消息按
+	<a href="/spec/groups#sec-3-6">§3.6</a>
+	分帧。游戏引擎请使用 <code>pc_client</code>。
 </p>
 
 <h2 id="relays">中继</h2>
 <p>
-	Linux 中继、它的 Docker 镜像以及 Cloudflare Worker 都同时支持群组和房间，无需额外配置（见<a
-		href="/zh/docs#relay">运行中继</a
-	>）。它们每个群组允许 4 名成员，这是协议的上限；在 Linux 中继上，可以用
-	<code>PEERCONNECT_MAX_GROUP_MEMBERS</code> 把它调低。
+	群组由 Linux 中继提供——二进制文件、Docker 镜像或 systemd 服务都可以——与房间并存：房间走 TCP
+	端口上的 WebSocket，群组走同号 UDP 端口上的 QUIC。这个 UDP 端口必须放行，防火墙和 Docker 里都要（<code
+		>-p 8080:8080/udp</code
+	>）。见<a href="/zh/docs#relay">运行中继</a>{#if REPO_URL}和<a
+			href="{REPO_URL}/blob/main/deploy/README.md"
+			rel="external">部署指南</a
+		>（英文）{/if}。
 </p>
-<p>
-	Linux
-	中继为每个接收方的每个类别分别排队。对于已经落后的接收方，它会丢弃发往它的语音；如果某个接收方跟不上指令或聊天，它会暂缓读取发送方的数据，但最多
-	5 秒，之后关闭卡住的接收方；它还把每个连接的发送速率限制在 2 MiB/s，突发最多 4 MiB。Cloudflare
-	Worker
-	看不到自己缓冲了多少数据，只能把每一帧立即转发：它既不能丢弃迟到的语音，也不能让指令优先，而且每个语音帧都是一条计费的
-	Durable Object 消息。大规模使用语音时，请用 Linux 中继。
-</p>
-<p>
-	Linux 中继还在同号的 UDP 端口上通过 QUIC
-	提供群组：每个类别各走一条流，语音走数据报，所以丢一个包只会挡住它所在的类别，语音也从不等待重传。邀请里的中继
-	URL 决定用什么：
-</p>
+<p>邀请里的中继 URL 决定成员怎样连接中继：</p>
 <ul>
-	<li><code>wss://relay.example.com</code>：WebSocket，任何中继都支持。</li>
 	<li>
-		<code>https://relay.example.com</code>：浏览器用 WebTransport，Rust 用原生 QUIC，走 UDP
-		443，不通时回退到 <code>wss://</code>。中继需要浏览器信任的证书（<code
-			>PEERCONNECT_TLS_CERT</code
-		>
-		和 <code>PEERCONNECT_TLS_KEY</code>）。
+		<code>https://relay.example.com</code>：浏览器用 WebTransport，其他客户端用原生 QUIC，走 UDP
+		443，校验中继的证书。中继需要浏览器信任的证书（<code>PEERCONNECT_TLS_CERT</code> 和
+		<code>PEERCONNECT_TLS_KEY</code>）。
 	</li>
 	<li>
 		<code>quic://203.0.113.9:8080</code>：不需要域名也不需要证书。原生客户端用原生
 		QUIC，不校验中继的证书；浏览器用
 		WebTransport，固定这类中继提供的“每周证书”的哈希，这张证书任何人都能算出来（<a
 			href="/spec/groups#sec-3-7">§3.7</a
-		>）；两者在 UDP 不通时都回退到 <code>ws://</code>。
+		>）。无论哪种，成员的保密都不依赖中继。
 	</li>
 </ul>
 <p>
-	QUIC 有 1.5 秒的先手；UDP 不通的地方，成员自动改用
-	WebSocket，同一个群组里两种可以混用。在每一跳丢包 3% 的情况下，语音 p99 在 WebSocket 上是 138
-	ms，在 QUIC 上是 53 ms（<a href="/spec/groups#sec-3-6">规范</a>）。
+	<code>ws://</code> 和 <code>wss://</code> 不是群组的中继地址：<code>Group.create("wss://…")</code>
+	会抛出异常。Cloudflare Worker 只提供房间：Workers 无法接受 QUIC，也做不到丢弃迟到的语音或让指令优先。放在
+	Cloudflare 后面的域名不能开启代理（橙色云朵），因为 Cloudflare 的代理不会把 QUIC 转给你的服务器。公共群组中继
+	<code>{GROUP_RELAY_URL}</code> 就是<a href="/zh/demo/voice">在线演示</a>所用的那个，可供测试。
+</p>
+<p>
+	中继每个群组允许 4 名成员，这是协议的上限；可以用 <code>PEERCONNECT_MAX_GROUP_MEMBERS</code>
+	把它调低。中继为每个接收方的每个类别分别排队。对于已经落后的接收方，它会丢弃发往它的语音；如果某个接收方跟不上指令或聊天，它会暂缓读取发送方的数据，但最多
+	5 秒，之后关闭卡住的接收方；它还把每个连接的发送速率限制在 2 MiB/s，突发最多 4 MiB。
 </p>
 
 <h2 id="latency">延迟与负载</h2>
 <p>
-	在一台 Apple M2 Pro 上用游戏负载测试测得：每个玩家都是一个真实的、端到端加密的 WebSocket
-	客户端，每秒发送 20 次位置、2 条指令，每 10 秒一条聊天；每组 3
-	人同时说话；测试中途每组再加入一名新成员，加载 2 MB 快照。延迟从发送方调用 <code>send</code> 算到接收方收到事件。
+	在一台 Apple M2 Pro 上用游戏负载测试测得（测于群组改为只走 QUIC 之前，走的是
+	WebSocket；中继的队列和分发方式没变，在 Linux 上 QUIC 让中继多花约 0.8 倍
+	CPU）：每个玩家都是一个真实的、端到端加密的客户端，每组 3 人，每人每秒发送 20 次位置、2 条指令，每
+	10 秒一条聊天；每组 2 人同时说话；测试中途每组再加入一名新成员，加载 2 MB 快照。延迟从发送方调用 <code
+		>send</code
+	> 算到接收方收到事件。
 </p>
 <div class="table">
 	<table>
@@ -491,24 +565,27 @@
 		>
 		<tbody>
 			<tr
-				><td>10 组，100 名玩家</td><td>0.95 / 2.6 ms</td><td>0.80 / 2.4 ms</td><td>6.0 ms</td><td
-					>0.4 核，6 MB</td
+				><td>34 组，102 名玩家</td><td>0.38 / 0.91 ms</td><td>0.31 / 0.84 ms</td><td>6.5 ms</td><td
+					>0.23 核，13 MB</td
 				></tr
 			>
 			<tr
-				><td>50 组，500 名玩家</td><td>0.92 / 3.5 ms</td><td>0.77 / 3.3 ms</td><td>2.7 ms</td><td
-					>1.7 核，19 MB</td
+				><td>167 组，501 名玩家</td><td>0.67 / 2.6 ms</td><td>0.56 / 2.4 ms</td><td>1.1 ms</td><td
+					>1.0 核，29 MB</td
 				></tr
 			>
 			<tr
-				><td>100 组，1,000 名玩家</td><td>1.6 / 17 ms</td><td>1.4 / 15 ms</td><td>19 ms</td><td
-					>4.1 核，35 MB</td
+				><td>334 组，1,002 名玩家</td><td>1.1 / 38 ms</td><td>0.87 / 30 ms</td><td>58 ms</td><td
+					>2.3 核，50 MB</td
 				></tr
 			>
 		</tbody>
 	</table>
 </div>
-<p>所有可靠消息都恰好送达一次。100 组时整台机器已满负荷：负载生成器自己就占用了五到六个核。</p>
+<p>
+	所有可靠消息都恰好送达一次，语音、位置和每一份快照也都全部送达。334
+	组时整台机器已满负荷，负载生成器也跑在这台机器上。
+</p>
 <p>
 	模拟真实网络：每个玩家各自处在一条带深缓冲的接入链路之后，3 名玩家，外加一名正在加载 2 MB
 	快照的新成员。
@@ -580,9 +657,10 @@
 <h2 id="limitations">已知限制</h2>
 <ul>
 	<li>
-		<strong>走 WebSocket 时，语音跑在 TCP 上。</strong>在 Cloudflare 中继上，以及 UDP
-		不通的地方，一个丢失的包会挡住后面的数据，直到它被重传。抖动缓冲和丢弃迟到帧能把影响控制在一次卡顿之内，但在丢包的链路上仍然明显。走
-		QUIC（Linux 中继）时不会这样（见<a href="#relays">中继</a>）。
+		<strong>有些成员加入不了。</strong>群组需要经 UDP 连到中继，浏览器还需要
+		WebTransport，而且没有兜底：屏蔽 UDP 的网络、走 HTTP 或 SOCKS
+		代理的浏览器（除非中继的主机名在代理的例外列表里），以及不支持 WebTransport
+		的浏览器，都进不来（见<a href="#who-can-join">哪些成员加入不了</a>）。
 	</li>
 	<li>
 		<strong>成员之间没有统一顺序。</strong
@@ -603,9 +681,9 @@
 		>发送方重启后会开启一条新的消息流，旧消息不复存在；接收方重启后则从头开始——这时请请求一份快照。
 	</li>
 	<li>
-		<strong>Cloudflare 中继</strong
-		>会立即转发每一帧：不会丢弃迟到的语音，不会让指令优先，而且每个语音帧都是一条计费的 Durable
-		Object 消息。
+		<strong><code>quic://</code> 中继不经认证。</strong
+		>路径上的任何人都能冒充它，看到中继能看到的东西，但读不到也伪造不了成员发送的任何内容。在意这一点时，请使用
+		<code>https://</code> 中继。
 	</li>
 	<li>
 		<strong>浏览器语音</strong>需要支持 Opus 的 WebCodecs 音频，目前在 Chromium

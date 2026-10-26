@@ -3,7 +3,7 @@
 	import Seo from '#lib/components/Seo.svelte';
 	import { LOCALE } from '#lib/i18n/index.ts';
 	import { i18n } from '#lib/i18n/current.svelte.ts';
-	import { RELAY_URL, SITE_URL } from '#lib/site.ts';
+	import { GROUP_RELAY_URL, SITE_URL } from '#lib/site.ts';
 	import Voice from './Voice.svelte';
 
 	const t = $derived(i18n.t);
@@ -45,7 +45,7 @@
 	<noscript><p class="card noscript">{t.voice.noscript}</p></noscript>
 	<Voice />
 
-	<p class="note">{@html t.voice.note.replace('{relay}', RELAY_URL)}</p>
+	<p class="note">{@html t.voice.note.replace('{relay}', GROUP_RELAY_URL)}</p>
 </section>
 
 <style>

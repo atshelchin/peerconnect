@@ -151,8 +151,8 @@ export class GroupConnection extends EventTarget {
   readonly members: Map<string, Uint8Array>;
   /** The latest round trip to the relay in milliseconds. */
   readonly rtt: number | undefined;
-  /** What the connection to the relay runs over, or null while there is none. */
-  readonly via: "webtransport" | "websocket" | null;
+  /** Whether a WebTransport session to the relay is open now. */
+  readonly connected: boolean;
   /** Broadcasts a message (up to 16,352 bytes) and returns its id. */
   send(channel: Channel, data: Data): number;
   /** Sends to one member only; not resent if the connection drops. */
@@ -180,10 +180,14 @@ export class GroupConnection extends EventTarget {
   addEventListener(type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void;
 }
 
+/** Whether this runtime can join groups: they travel over WebTransport only. */
+export function groupsSupported(): boolean;
+
 /**
- * Joins a group (a `Group` or its invite). For an `https://` relay, over
- * WebTransport where the runtime has it, else over its `wss://` WebSocket;
- * for a `quic://` relay, over its `ws://` WebSocket.
+ * Joins a group (a `Group` or its invite: an `https://` or `quic://` relay)
+ * over WebTransport, pinning the weekly certificate for a `quic://` relay.
+ * There is no WebSocket fallback. Throws a "NotSupportedError" DOMException
+ * where the runtime has no WebTransport (see `groupsSupported`).
  */
 export function joinGroup(
   group: Group | string,
@@ -195,8 +199,8 @@ export function joinGroup(
   },
 ): GroupConnection;
 
-/** The ways to reach a group endpoint, in the order they are tried (GROUP.md §3.6, §3.7). */
-export function transportsFor(url: string): { type: "webtransport" | "websocket"; url: string; weekly?: boolean }[];
+/** The WebTransport session for a group endpoint (GROUP.md §3.6, §3.7); null for anything but `https://` and `quic://`. */
+export function webTransportFor(url: string): { url: string; weekly: boolean } | null;
 
 /** The hashes of the weekly certificates a relay without certificate files may be serving (GROUP.md §3.7). */
 export function weeklyHashes(now?: number): { algorithm: "sha-256"; value: Uint8Array }[];

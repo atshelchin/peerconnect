@@ -14,7 +14,7 @@
 
 <script lang="ts">
 	import CodeBlock from '#lib/components/CodeBlock.svelte';
-	import { RELAY_URL, REPO_URL } from '#lib/site.ts';
+	import { GROUP_RELAY_URL, RELAY_URL, REPO_URL } from '#lib/site.ts';
 	import {
 		binary,
 		installJs,
@@ -198,29 +198,36 @@
 <p>
 	A room is for exactly two peers. For more — a squad in a game, a shared world, a team — use a
 	<strong>group</strong>: up to four members, each known by an Ed25519 identity, with commands,
-	chat, voice and state transfer that never get in each other’s way. Groups are in the same
-	JavaScript package and Rust crate, come with a C library for game engines, and are served by the
-	same relays.
+	chat, voice, video and state transfer that never get in each other’s way. Groups are in the same
+	JavaScript package and Rust crate, and come with a C library for game engines. They travel over
+	QUIC only (WebTransport in browsers), so they need the Linux relay with its UDP port open, and
+	members that can reach it over UDP (<a href="/groups#who-can-join">who cannot join</a>).
 </p>
 <p><a href="/groups">Read the groups guide →</a></p>
 
 <h2 id="relay">Run a relay</h2>
 <p>
 	A relay forwards frames between the two seats of a room and stores nothing. It checks that each
-	connection holds the room’s key without learning it, so it needs no accounts or configuration.
-	Anyone may use the public relay <code>{RELAY_URL}</code> for testing; for anything else, run your own.
+	connection holds the room’s key without learning it, so it needs no accounts or configuration. The
+	Linux relay (Docker or binary) also serves <a href="/groups">groups</a>, over QUIC on its UDP
+	port; the Cloudflare Worker serves rooms only. Anyone may use the public relays for testing,
+	<code>{RELAY_URL}</code> for rooms and <code>{GROUP_RELAY_URL}</code> for groups; for anything else,
+	run your own.
 </p>
 <h3 id="cloudflare">Cloudflare Workers</h3>
 <p>
 	Each room ID gets its own Durable Object, using the WebSocket Hibernation API, so idle rooms cost
 	nothing and a misbehaving room can only exhaust itself. Add a custom domain in the Cloudflare
-	dashboard to serve it as <code>wss://relay.your-domain</code>.
+	dashboard to serve it as <code>wss://relay.your-domain</code>. It serves rooms only: Workers
+	cannot accept QUIC, which groups need.
 </p>
 <CodeBlock code={cloudflare('en')} lang="sh" title="shell" />
 <h3 id="docker">Docker</h3>
 <p>
 	The image holds a single static binary. Run it behind any proxy that terminates TLS, or use the
-	bundled Compose file, which adds Caddy for automatic HTTPS.
+	bundled Compose file, which adds Caddy for automatic HTTPS. Publish the UDP port as well as the
+	TCP one: rooms use TCP, groups QUIC on UDP. With the Compose file, open TCP 80 and 443 and UDP
+	443.
 </p>
 <CodeBlock code={docker('en')} lang="sh" title="shell" />
 <h3 id="binary">Binary</h3>
@@ -255,10 +262,35 @@
 					<code>X-Forwarded-For</code>.</td
 				></tr
 			>
+			<tr
+				><td><code>PEERCONNECT_QUIC_LISTEN</code></td><td>as <code>PEERCONNECT_LISTEN</code></td><td
+					>UDP address for groups over QUIC; <code>off</code> turns groups off.</td
+				></tr
+			>
+			<tr
+				><td><code>PEERCONNECT_TLS_CERT</code>, <code>PEERCONNECT_TLS_KEY</code></td><td>none</td
+				><td
+					>PEM certificate chain and key, re-read when they change: <code>wss://</code> on the TCP
+					port, and WebTransport for <code>https://</code> group relay URLs. Without them, groups
+					use
+					<code>quic://</code> URLs and the weekly certificate.</td
+				></tr
+			>
 		</tbody>
 	</table>
 </div>
 <p>Every relay answers <code>GET /healthz</code> for health checks.</p>
+<h3 id="relay-groups">Serving groups</h3>
+<p>
+	Groups have no WebSocket transport, so the relay’s UDP port must be open, in the firewall and in
+	Docker. With a domain and a certificate, invites use <code>https://relay.example.com</code> (UDP
+	443); without either, <code>quic://203.0.113.9:8080</code>, on any port. A domain behind
+	Cloudflare must not be proxied: Cloudflare’s proxy does not carry QUIC. The
+	<a href="/groups#relays">groups guide</a>
+	explains the relay URLs{#if REPO_URL}, and the
+		<a href="{REPO_URL}/blob/main/deploy/README.md" rel="external">deployment guide</a> has a setup for
+		each case (Caddy, certbot, systemd, no domain){/if}.
+</p>
 
 <h2 id="limits">Limits</h2>
 <div class="table">

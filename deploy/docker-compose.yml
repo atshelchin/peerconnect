@@ -1,8 +1,8 @@
 # A relay with automatic HTTPS: set DOMAIN to a name pointing at this host,
 #   DOMAIN=relay.example.com docker compose up -d
-# and use wss://relay.example.com as the relay URL, or, for groups,
-# https://relay.example.com: WebTransport and QUIC on UDP 443, falling back
-# to wss:// where UDP does not get through. Open TCP 80 and 443, and UDP 443.
+# and use wss://relay.example.com as the relay URL for rooms, and
+# https://relay.example.com for groups: WebTransport and QUIC on UDP 443,
+# with no fallback. Open TCP 80 and 443, and UDP 443.
 #
 # Caddy terminates TLS on TCP; UDP 443 goes straight to the relay, which
 # uses the certificate Caddy obtains and renews. On the very first start the

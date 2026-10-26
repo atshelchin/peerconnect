@@ -1,26 +1,20 @@
-//! The C ABI end to end: two members driven only through `pc_*` functions,
-//! each with its own WebSocket, through a real relay. Also compiles a C
-//! program against the header and the static library, where a C compiler
-//! is available.
+//! The C ABI end to end: members driven only through `pc_client_*`
+//! functions, each connecting over QUIC by itself, through a real relay.
+//! Also compiles a C program against the header and the static library,
+//! where a C compiler is available; it exercises `pc_member_*` offline.
 
 use std::ffi::{CStr, CString};
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
 use peerconnect_ffi::*;
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message;
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// What a game loop would do each frame: drive the member, and collect events.
+/// What a game loop would do each frame: poll the client, and collect events.
 struct Driver {
-    m: *mut PcMember,
+    c: *mut PcClient,
     seed: [u8; 32],
     /// The transfer id of the latest PC_SYNC_REQUEST.
     transfer: Option<u32>,
-    ws: Option<Ws>,
-    start: Instant,
     events: Vec<(i32, [u8; 32], Vec<u8>)>,
     /// PC_VIDEO: track, keyframe, timestamp, data.
     videos: Vec<(u8, u8, u32, Vec<u8>)>,
@@ -35,77 +29,34 @@ impl Driver {
 
     fn with_seed(invite: &str, name: &str, seed: [u8; 32]) -> Driver {
         let invite = CString::new(invite).unwrap();
-        let m = unsafe { pc_member_new(invite.as_ptr(), seed.as_ptr(), name.as_ptr(), name.len(), 0) };
-        assert!(!m.is_null());
-        Driver { m, seed, transfer: None, ws: None, start: Instant::now(), events: Vec::new(), videos: Vec::new() }
-    }
-
-    fn now(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+        let c = unsafe { pc_client_join(invite.as_ptr(), seed.as_ptr(), name.as_ptr(), name.len()) };
+        assert!(!c.is_null());
+        Driver { c, seed, transfer: None, events: Vec::new(), videos: Vec::new() }
     }
 
     fn id(&self) -> [u8; 32] {
         let mut id = [0u8; 32];
-        unsafe { pc_member_id(self.m, id.as_mut_ptr()) };
+        unsafe { pc_client_id(self.c, id.as_mut_ptr()) };
         id
     }
 
-    async fn tick(&mut self) {
-        let now = self.now();
-        let due = unsafe { pc_member_poll_timeout(self.m) };
-        if due >= 0 && due as u64 <= now {
-            unsafe { pc_member_handle_timeout(self.m, now) };
-        }
+    fn tick(&mut self) {
         loop {
             let mut out = std::mem::MaybeUninit::<PcOutput>::uninit();
-            let kind = unsafe { pc_member_poll(self.m, out.as_mut_ptr()) };
+            let kind = unsafe { pc_client_poll(self.c, out.as_mut_ptr()) };
             if kind == PC_NONE {
                 break;
             }
             let out = unsafe { out.assume_init() };
             let data = unsafe { std::slice::from_raw_parts(out.data, out.len) }.to_vec();
-            match kind {
-                PC_CONNECT => {
-                    let url = unsafe { CStr::from_ptr(out.data as *const _) }.to_str().unwrap().to_owned();
-                    assert_eq!(url.len(), out.len);
-                    let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-                    self.ws = Some(ws);
-                    unsafe { pc_member_handle_open(self.m, self.now()) };
-                }
-                PC_SEND => self.ws.as_mut().unwrap().send(Message::binary(data)).await.unwrap(),
-                PC_PING => self.ws.as_mut().unwrap().send(Message::text("ping")).await.unwrap(),
-                PC_DISCONNECT => self.ws = None,
-                _ => {
-                    if kind == PC_SYNC_REQUEST {
-                        self.transfer = Some(out.transfer);
-                    }
-                    if kind == PC_VIDEO {
-                        self.videos.push((out.track, out.keyframe, out.timestamp, data.clone()));
-                    }
-                    self.events.push((kind, out.member, data))
-                }
+            assert!(!matches!(kind, PC_CONNECT | PC_SEND | PC_PING | PC_DISCONNECT), "a client gives events only");
+            if kind == PC_SYNC_REQUEST {
+                self.transfer = Some(out.transfer);
             }
-        }
-        if let Some(ws) = &mut self.ws
-            && let Ok(msg) = tokio::time::timeout(Duration::from_millis(5), ws.next()).await
-        {
-            let now = self.now();
-            match msg {
-                Some(Ok(Message::Binary(b))) => unsafe { pc_member_handle_binary(self.m, now, b.as_ptr(), b.len()) },
-                Some(Ok(Message::Text(t))) => unsafe {
-                    pc_member_handle_text(self.m, now, t.as_ptr() as *const _, t.len())
-                },
-                Some(Ok(Message::Close(frame))) => {
-                    self.ws = None;
-                    let code = frame.map_or(-1, |f| u16::from(f.code) as i32);
-                    unsafe { pc_member_handle_close(self.m, now, code) };
-                }
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => {
-                    self.ws = None;
-                    unsafe { pc_member_handle_close(self.m, now, -1) };
-                }
+            if kind == PC_VIDEO {
+                self.videos.push((out.track, out.keyframe, out.timestamp, data.clone()));
             }
+            self.events.push((kind, out.member, data))
         }
     }
 
@@ -120,68 +71,80 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        unsafe { pc_member_free(self.m) };
+        unsafe { pc_client_free(self.c) };
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn two_members_through_the_c_abi() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay = format!("ws://{}", listener.local_addr().unwrap());
-    tokio::spawn(peerconnect_relay::serve(listener, Default::default(), std::future::pending()));
-
+/// A relay serving groups over QUIC, and the invite of a new group on it.
+async fn relay_with(config: peerconnect_relay::Config) -> String {
+    // QUIC on the UDP port of the same number.
+    let (listener, udp) = loop {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(udp) = std::net::UdpSocket::bind(listener.local_addr().unwrap()) {
+            break (listener, udp);
+        }
+    };
+    let relay = format!("quic://{}", listener.local_addr().unwrap());
+    tokio::spawn(peerconnect_relay::serve_all(listener, Some(udp), config, std::future::pending()));
     let relay_c = CString::new(relay).unwrap();
     let invite = unsafe { pc_group_create(relay_c.as_ptr()) };
     assert!(!invite.is_null());
     let text = unsafe { CStr::from_ptr(invite) }.to_str().unwrap().to_owned();
     unsafe { pc_string_free(invite) };
+    text
+}
 
-    let mut a = Driver::new(&text, "alice");
-    let mut b = Driver::new(&text, "bob");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !(a.has(PC_JOINED, b"bob") && b.has(PC_JOINED, b"alice")) {
-        assert!(Instant::now() < deadline, "not admitted");
-        a.tick().await;
-        b.tick().await;
+/// Polls every driver, as a game loop would once per frame, until `done`.
+async fn until(drivers: &mut [&mut Driver], done: impl Fn(&[&mut Driver]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !done(drivers) {
+        assert!(Instant::now() < deadline, "timed out: {:?}", drivers.iter().map(|d| d.kinds()).collect::<Vec<_>>());
+        for d in drivers.iter_mut() {
+            d.tick();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_members_through_the_c_abi() {
+    let invite = relay_with(Default::default()).await;
+    let mut a = Driver::new(&invite, "alice");
+    let mut b = Driver::new(&invite, "bob");
+    until(&mut [&mut a, &mut b], |d| d[0].has(PC_JOINED, b"bob") && d[1].has(PC_JOINED, b"alice")).await;
+    assert_eq!(unsafe { pc_client_connected(a.c) }, 1);
     let mut members = [[0u8; 32]; 4];
-    assert_eq!(unsafe { pc_member_members(a.m, members.as_mut_ptr(), 4) }, 1);
+    assert_eq!(unsafe { pc_client_members(a.c, members.as_mut_ptr(), 4) }, 1);
     assert_eq!(members[0], b.id());
 
     let mut id = 99;
-    assert_eq!(unsafe { pc_member_send(a.m, 0, b"place block".as_ptr(), 11, &mut id) }, PC_OK);
+    assert_eq!(unsafe { pc_client_send(a.c, 0, b"place block".as_ptr(), 11, &mut id) }, PC_OK);
     assert_eq!(id, 0);
-    assert_eq!(unsafe { pc_member_send_voice(a.m, 3, b"opus".as_ptr(), 4) }, 1);
+    unsafe { pc_client_send_voice(a.c, 3, b"opus".as_ptr(), 4) };
     let picture: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
-    assert_eq!(unsafe { pc_member_send_video(a.m, 2, 1, 4321, picture.as_ptr(), picture.len()) }, 1);
-    let too_big = vec![0u8; 300_000];
-    assert_eq!(unsafe { pc_member_send_video(a.m, 2, 0, 0, too_big.as_ptr(), too_big.len()) }, 0);
+    unsafe { pc_client_send_video(a.c, 2, 1, 4321, picture.as_ptr(), picture.len()) };
     let b_id = b.id();
-    assert_eq!(unsafe { pc_member_send_to(a.m, b_id.as_ptr(), 1, b"psst".as_ptr(), 4) }, PC_OK);
-    assert_eq!(unsafe { pc_member_send(a.m, 7, b"x".as_ptr(), 1, std::ptr::null_mut()) }, PC_INVALID);
+    assert_eq!(unsafe { pc_client_send_to(a.c, b_id.as_ptr(), 1, b"psst".as_ptr(), 4) }, PC_OK);
+    assert_eq!(unsafe { pc_client_send(a.c, 7, b"x".as_ptr(), 1, std::ptr::null_mut()) }, PC_INVALID);
     let big = vec![0u8; 20_000];
-    assert_eq!(unsafe { pc_member_send(a.m, 0, big.as_ptr(), big.len(), std::ptr::null_mut()) }, PC_TOO_LARGE);
+    assert_eq!(unsafe { pc_client_send(a.c, 0, big.as_ptr(), big.len(), std::ptr::null_mut()) }, PC_TOO_LARGE);
     let stranger = [7u8; 32];
-    assert_eq!(unsafe { pc_member_send_to(a.m, stranger.as_ptr(), 0, b"x".as_ptr(), 1) }, PC_NOT_PRESENT);
+    assert_eq!(unsafe { pc_client_send_to(a.c, stranger.as_ptr(), 0, b"x".as_ptr(), 1) }, PC_NOT_PRESENT);
 
-    while !(b.has(PC_MESSAGE, b"place block")
-        && b.has(PC_VOICE, b"opus")
-        && b.has(PC_MESSAGE, b"psst")
-        && !b.videos.is_empty())
-    {
-        assert!(Instant::now() < deadline, "not delivered: {:?}", b.events);
-        a.tick().await;
-        b.tick().await;
-    }
+    until(&mut [&mut a, &mut b], |d| {
+        let b = &d[1];
+        b.has(PC_MESSAGE, b"place block")
+            && b.has(PC_VOICE, b"opus")
+            && b.has(PC_MESSAGE, b"psst")
+            && !b.videos.is_empty()
+    })
+    .await;
     assert!(a.has(PC_MESSAGE, b"place block"), "own messages are delivered too");
     assert_eq!(b.videos, [(2, 1, 4321, picture)], "a video frame, whole");
 
-    unsafe { pc_member_leave(b.m) };
-    while !a.events.iter().any(|(k, m, _)| *k == PC_LEFT && *m == b_id) {
-        assert!(Instant::now() < deadline, "no PC_LEFT");
-        a.tick().await;
-        b.tick().await;
-    }
+    drop(b);
+    until(&mut [&mut a], |d| d[0].events.iter().any(|(k, m, _)| *k == PC_LEFT && *m == b_id)).await;
+    assert_eq!(unsafe { pc_client_members(a.c, std::ptr::null_mut(), 0) }, 0);
 }
 
 #[test]
@@ -189,14 +152,26 @@ fn null_pointers_are_refused_not_followed() {
     unsafe {
         assert!(pc_group_create(std::ptr::null()).is_null());
         assert!(pc_member_new(std::ptr::null(), std::ptr::null(), std::ptr::null(), 0, 0).is_null());
+        assert!(pc_client_join(std::ptr::null(), std::ptr::null(), std::ptr::null(), 0).is_null());
         let bad = CString::new("not an invite").unwrap();
         assert!(pc_member_new(bad.as_ptr(), [0u8; 32].as_ptr(), std::ptr::null(), 0, 0).is_null());
+        assert!(pc_client_join(bad.as_ptr(), [0u8; 32].as_ptr(), std::ptr::null(), 0).is_null());
         assert_eq!(pc_member_send(std::ptr::null_mut(), 0, std::ptr::null(), 0, std::ptr::null_mut()), PC_INVALID);
+        assert_eq!(pc_client_send(std::ptr::null_mut(), 0, std::ptr::null(), 0, std::ptr::null_mut()), PC_INVALID);
         assert_eq!(pc_member_poll(std::ptr::null_mut(), std::ptr::null_mut()), PC_NONE);
+        assert_eq!(pc_client_poll(std::ptr::null_mut(), std::ptr::null_mut()), PC_NONE);
         assert_eq!(pc_member_poll_timeout(std::ptr::null()), -1);
+        assert_eq!(pc_client_connected(std::ptr::null()), 0);
         pc_member_free(std::ptr::null_mut());
+        pc_client_free(std::ptr::null_mut());
         pc_string_free(std::ptr::null_mut());
     }
+}
+
+#[test]
+fn groups_have_no_websocket_relays() {
+    let ws = CString::new("wss://relay.example.com").unwrap();
+    assert!(unsafe { pc_group_create(ws.as_ptr()) }.is_null());
 }
 
 #[test]
@@ -232,27 +207,6 @@ fn the_header_compiles_and_links_from_c() {
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
 }
 
-async fn relay_with(config: peerconnect_relay::Config) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay = format!("ws://{}", listener.local_addr().unwrap());
-    tokio::spawn(peerconnect_relay::serve(listener, config, std::future::pending()));
-    let relay_c = CString::new(relay).unwrap();
-    let invite = unsafe { pc_group_create(relay_c.as_ptr()) };
-    let text = unsafe { CStr::from_ptr(invite) }.to_str().unwrap().to_owned();
-    unsafe { pc_string_free(invite) };
-    text
-}
-
-async fn until(drivers: &mut [&mut Driver], done: impl Fn(&[&mut Driver]) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !done(drivers) {
-        assert!(Instant::now() < deadline, "timed out: {:?}", drivers.iter().map(|d| d.kinds()).collect::<Vec<_>>());
-        for d in drivers.iter_mut() {
-            d.tick().await;
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn state_transfer_datagrams_replacement_and_a_full_group_through_the_c_abi() {
     let config = peerconnect_relay::Config { max_group_members: 2, ..Default::default() };
@@ -268,27 +222,26 @@ async fn state_transfer_datagrams_replacement_and_a_full_group_through_the_c_abi
     assert_ne!(id, [0; 32]);
 
     // A datagram, and a state transfer from a to b.
-    assert_eq!(unsafe { pc_member_send_datagram(a.m, ib.as_ptr(), b"pose".as_ptr(), 4) }, 1);
-    assert_eq!(unsafe { pc_member_send_datagram(a.m, std::ptr::null(), b"all".as_ptr(), 3) }, 1);
-    assert_eq!(unsafe { pc_member_request_sync(b.m, ia.as_ptr()) }, PC_OK);
-    assert_eq!(unsafe { pc_member_request_sync(b.m, ia.as_ptr()) }, PC_BUSY);
-    assert_eq!(unsafe { pc_member_request_sync(b.m, std::ptr::null()) }, PC_INVALID);
+    unsafe { pc_client_send_datagram(a.c, ib.as_ptr(), b"pose".as_ptr(), 4) };
+    unsafe { pc_client_send_datagram(a.c, std::ptr::null(), b"all".as_ptr(), 3) };
+    assert_eq!(unsafe { pc_client_request_sync(b.c, ia.as_ptr()) }, PC_OK);
+    assert_eq!(unsafe { pc_client_request_sync(b.c, ia.as_ptr()) }, PC_BUSY);
+    assert_eq!(unsafe { pc_client_request_sync(b.c, std::ptr::null()) }, PC_INVALID);
     until(&mut [&mut a, &mut b], |d| d[0].kinds().contains(&PC_SYNC_REQUEST)).await;
     let transfer = a.transfer.unwrap();
     let world = b"the whole world";
-    assert_eq!(unsafe { pc_member_provide_sync(a.m, ib.as_ptr(), transfer, world.as_ptr(), world.len()) }, PC_OK);
-    assert_eq!(unsafe { pc_member_provide_sync(a.m, ib.as_ptr(), transfer, world.as_ptr(), 1) }, PC_BUSY);
+    assert_eq!(unsafe { pc_client_provide_sync(a.c, ib.as_ptr(), transfer, world.as_ptr(), world.len()) }, PC_OK);
     until(&mut [&mut a, &mut b], |d| d[1].has(PC_SNAPSHOT, world)).await;
-    assert!(b.has(PC_DATAGRAM, b"pose") && b.has(PC_DATAGRAM, b"all"));
+    until(&mut [&mut a, &mut b], |d| d[1].has(PC_DATAGRAM, b"pose") && d[1].has(PC_DATAGRAM, b"all")).await;
 
     // A declined transfer.
-    assert_eq!(unsafe { pc_member_request_sync(b.m, ia.as_ptr()) }, PC_OK);
+    assert_eq!(unsafe { pc_client_request_sync(b.c, ia.as_ptr()) }, PC_OK);
     a.transfer = None;
     until(&mut [&mut a, &mut b], |d| d[0].transfer.is_some()).await;
-    unsafe { pc_member_decline_sync(a.m, ib.as_ptr(), a.transfer.unwrap()) };
+    unsafe { pc_client_decline_sync(a.c, ib.as_ptr(), a.transfer.unwrap()) };
     until(&mut [&mut a, &mut b], |d| d[1].kinds().contains(&PC_SYNC_FAILED)).await;
 
-    // The group holds two: a third is refused.
+    // The relay admits two: a third is refused.
     let mut c = Driver::new(&invite, "c");
     until(&mut [&mut a, &mut b, &mut c], |d| d[2].kinds().contains(&PC_FULL)).await;
     drop(c);
@@ -297,5 +250,4 @@ async fn state_transfer_datagrams_replacement_and_a_full_group_through_the_c_abi
     let mut b2 = Driver::with_seed(&invite, "b again", b.seed);
     until(&mut [&mut a, &mut b, &mut b2], |d| d[1].kinds().contains(&PC_REPLACED) && d[0].has(PC_JOINED, b"b again"))
         .await;
-    assert!(unsafe { pc_member_rtt(a.m) } >= -1);
 }

@@ -1,5 +1,5 @@
 //! A load test that behaves like a game: many groups of three players, each
-//! over its own real WebSocket, end-to-end encrypted, through a relay.
+//! over its own real QUIC connection, end-to-end encrypted, through a relay.
 //!
 //! Every player, all the time:
 //! - sends its position 20 times a second (datagrams, 48 bytes);
@@ -13,19 +13,20 @@
 //! snapshot from the first player, while all of that carries on.
 //!
 //! Options: `--players N` per group (default 3; 4 with `--no-sync`), `--light` (commands only,
-//! to measure a path's own delay), `--no-sync` (no newcomers),
+//! to measure a path's own delay), `--no-sync` (no newcomers), and
 //! `--shape KBPS:MS` to put every player behind its own emulated access
-//! link of that rate and one-way delay, with a deep buffer, and `--quic`
-//! to have the spawned relay's players connect over QUIC.
+//! link of that rate and one-way delay, with a deep buffer.
 //!
 //! Reported: per class, the time from the sender's `send` to the receiver's
 //! event (both in this process, one clock), how much of what was sent
-//! arrived, and the relay's CPU and memory if it was started by this tool.
+//! arrived, how many players got in, and the relay's CPU and memory if it
+//! was started by this tool (which then reaches it over QUIC on the UDP
+//! port of the same number as its TCP one).
 //!
 //! ```text
 //! cargo build --release -p peerconnect-relay --examples
 //! target/release/examples/game_load --spawn target/release/peerconnect-relay --groups 100 --seconds 30
-//! target/release/examples/game_load --relay wss://relay.example.com --groups 2 --seconds 20
+//! target/release/examples/game_load --relay https://relay.example.com --groups 2 --seconds 20
 //! ```
 
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use peerconnect::client::group;
-use peerconnect::group::{Channel, Config, Event, Group, Identity, MemberId};
+use peerconnect::group::{Channel, Config, Event, Group, Identity, MemberId, transport};
 
 const TALKERS: usize = 2;
 const SNAPSHOT: usize = 2 << 20;
@@ -98,9 +99,8 @@ struct Stats {
     syncs_running: AtomicU64,
     snapshots: Histogram,
     failures: AtomicU64,
-    /// Players who were connected over QUIC, and over a WebSocket, when they first heard from the group.
-    over_quic: AtomicU64,
-    over_websocket: AtomicU64,
+    /// Players who heard from another player: in, over QUIC.
+    connected: AtomicU64,
     stop: AtomicBool,
 }
 
@@ -137,7 +137,6 @@ struct Args {
     shape: Option<(u64, u64)>,
     /// No newcomers: the same traffic without state transfer, for comparison.
     no_sync: bool,
-    quic: bool,
 }
 
 fn args() -> Args {
@@ -150,7 +149,6 @@ fn args() -> Args {
         light: false,
         shape: None,
         no_sync: false,
-        quic: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -164,7 +162,6 @@ fn args() -> Args {
             // Commands only, ten a second: to tell the path's own delay from queueing.
             "--light" => args.light = true,
             "--no-sync" => args.no_sync = true,
-            "--quic" => args.quic = true,
             // Each player behind its own link of this rate and delay, with a
             // deep buffer, as home and mobile links have: e.g. 2000:40.
             "--shape" => {
@@ -200,7 +197,7 @@ async fn main() {
             relay_process = Some(child);
             tokio::time::sleep(Duration::from_millis(300)).await;
             // The relay serves QUIC on the UDP port of the same number.
-            format!("{}://127.0.0.1:{port}", if args.quic { "quic" } else { "ws" })
+            format!("quic://127.0.0.1:{port}")
         }
         (None, None) => panic!("--relay <url> or --spawn <relay binary>"),
     };
@@ -216,8 +213,7 @@ async fn main() {
         syncs_running: AtomicU64::new(0),
         snapshots: Histogram::new(),
         failures: AtomicU64::new(0),
-        over_quic: AtomicU64::new(0),
-        over_websocket: AtomicU64::new(0),
+        connected: AtomicU64::new(0),
         stop: AtomicBool::new(false),
     });
     let duration = Duration::from_secs(args.seconds);
@@ -319,11 +315,7 @@ async fn main() {
         snaps.quantile(1.0),
         stats.failures.load(Ordering::Relaxed)
     );
-    println!(
-        "players over QUIC: {}, over WebSocket: {}",
-        stats.over_quic.load(Ordering::Relaxed),
-        stats.over_websocket.load(Ordering::Relaxed)
-    );
+    println!("players connected: {} of {}", stats.connected.load(Ordering::Relaxed), args.groups * members);
     if !samples.is_empty() {
         let busy: Vec<&(f64, u64)> = samples.iter().skip(3).collect();
         let cpu = busy.iter().map(|s| s.0).sum::<f64>() / busy.len().max(1) as f64;
@@ -395,8 +387,7 @@ async fn player(group: Group, g: usize, m: usize, members: usize, light: bool, s
                 Some(Event::Joined { member, profile }) if profile.starts_with(b"player") => {
                     if players.is_empty() && !counted {
                         counted = true;
-                        let over = if conn.via() == Some(group::Via::Quic) { &stats.over_quic } else { &stats.over_websocket };
-                        over.fetch_add(1, Ordering::Relaxed);
+                        stats.connected.fetch_add(1, Ordering::Relaxed);
                     }
                     players.insert(member);
                     present = players.len();
@@ -498,64 +489,87 @@ async fn newcomer(group: Group, at: Duration, stats: Arc<Stats>) {
     conn.leave().await;
 }
 
-/// A local proxy that gives every connection through it its own link of
-/// `kbps` each way and `delay_ms` one way: bytes queue behind each other at
-/// the link's rate, then take the delay, like a real access link with a
-/// deep buffer. Returns the URL to use instead of `relay`.
+/// A local UDP proxy that gives every player behind it (every address it
+/// hears from) its own link of `kbps` each way and `delay_ms` one way:
+/// packets queue behind each other at the link's rate, then take the delay,
+/// like a real access link with a deep buffer. Returns the relay URL to use
+/// instead of `relay`.
 async fn shaped_link(relay: &str, kbps: u64, delay_ms: u64) -> String {
-    let target = relay.trim_start_matches("ws://").to_string();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+    use std::net::SocketAddr;
+    use tokio::net::UdpSocket;
+
+    let target = transport::target(relay).expect("an https:// or quic:// relay");
+    let to = tokio::net::lookup_host((target.host.as_str(), target.port))
+        .await
+        .ok()
+        .and_then(|mut a| a.next())
+        .expect("the relay's address");
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    // quic://: the proxy's address is not the name on an https:// relay's certificate.
+    let url = format!("quic://{}{}", socket.local_addr().unwrap(), target.path.trim_end_matches('/'));
     tokio::spawn(async move {
+        let mut uplinks: HashMap<SocketAddr, Link> = HashMap::new();
+        let mut buf = vec![0u8; 65536];
         loop {
-            let Ok((client, _)) = listener.accept().await else { return };
-            let _ = client.set_nodelay(true);
-            let target = target.clone();
-            tokio::spawn(async move {
-                let Ok(upstream) = tokio::net::TcpStream::connect(target).await else { return };
-                let _ = upstream.set_nodelay(true);
-                let (cr, cw) = client.into_split();
-                let (ur, uw) = upstream.into_split();
-                tokio::spawn(link(cr, uw, kbps, delay_ms));
-                link(ur, cw, kbps, delay_ms).await;
-            });
+            let Ok((n, player)) = socket.recv_from(&mut buf).await else { return };
+            let uplink = match uplinks.entry(player) {
+                Entry::Occupied(uplink) => uplink.into_mut(),
+                Entry::Vacant(entry) => {
+                    let bind = if to.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                    let Ok(upstream) = UdpSocket::bind(bind).await else { continue };
+                    // The upstream socket stands for this player towards the relay.
+                    let upstream = Arc::new(upstream);
+                    let mut downlink = Link::new(socket.clone(), player, kbps, delay_ms);
+                    let from_relay = upstream.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65536];
+                        while let Ok((n, _)) = from_relay.recv_from(&mut buf).await {
+                            downlink.send(&buf[..n]);
+                        }
+                    });
+                    entry.insert(Link::new(upstream, to, kbps, delay_ms))
+                }
+            };
+            uplink.send(&buf[..n]);
         }
     });
     url
 }
 
-async fn link(
-    mut from: tokio::net::tcp::OwnedReadHalf,
-    mut to: tokio::net::tcp::OwnedWriteHalf,
-    kbps: u64,
-    delay_ms: u64,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
-    let writer = tokio::spawn(async move {
-        while let Some((at, chunk)) = rx.recv().await {
-            tokio::time::sleep_until(at).await;
-            if to.write_all(&chunk).await.is_err() {
-                return;
+/// One direction of a player's link.
+struct Link {
+    queue: tokio::sync::mpsc::UnboundedSender<(tokio::time::Instant, Vec<u8>)>,
+    bytes_per_ms: f64,
+    delay: Duration,
+    free_at: tokio::time::Instant,
+}
+
+impl Link {
+    /// A link that sends what it is given out of `out`, to `to`.
+    fn new(out: Arc<tokio::net::UdpSocket>, to: std::net::SocketAddr, kbps: u64, delay_ms: u64) -> Link {
+        let (queue, mut queued) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        tokio::spawn(async move {
+            while let Some((at, packet)) = queued.recv().await {
+                tokio::time::sleep_until(at).await;
+                let _ = out.send_to(&packet, to).await;
             }
+        });
+        Link {
+            queue,
+            bytes_per_ms: (kbps as f64 / 8.0).max(1.0),
+            delay: Duration::from_millis(delay_ms),
+            free_at: tokio::time::Instant::now(),
         }
-    });
-    let bytes_per_ms = (kbps as f64 / 8.0).max(1.0);
-    let mut free_at = tokio::time::Instant::now();
-    let mut buf = vec![0u8; 16 << 10];
-    loop {
-        let n = match from.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
+    }
+
+    fn send(&mut self, packet: &[u8]) {
         // Serialised at the link's rate behind what is already queued,
         // then the propagation delay.
         let now = tokio::time::Instant::now();
-        free_at = free_at.max(now) + Duration::from_secs_f64(n as f64 / bytes_per_ms / 1000.0);
-        if tx.send((free_at + Duration::from_millis(delay_ms), buf[..n].to_vec())).is_err() {
-            break;
-        }
+        self.free_at =
+            self.free_at.max(now) + Duration::from_secs_f64(packet.len() as f64 / self.bytes_per_ms / 1000.0);
+        let _ = self.queue.send((self.free_at + self.delay, packet.to_vec()));
     }
-    drop(tx);
-    let _ = writer.await;
 }

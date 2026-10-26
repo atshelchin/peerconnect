@@ -108,16 +108,16 @@ test('the camera turns on and off from our own card', async ({ page }) => {
 	const mine = page.locator('.person.mine');
 	await expect(mine.locator('.screen')).toHaveCount(0); // off until asked
 	await page.getByRole('button', { name: 'Turn your camera on: everyone sees you' }).click();
-	// What we send, as the others will see it: the fake camera is wide.
+	// What we send, as the others will see it: the fake camera is wide, sent at 720p.
 	const preview = mine.locator('canvas.screen');
 	await expect(preview).toBeVisible();
 	const size = () => preview.evaluate((c: HTMLCanvasElement) => [c.width, c.height]);
-	await expect.poll(size, { timeout: 10_000 }).toEqual([480, 270]);
+	await expect.poll(size, { timeout: 10_000 }).toEqual([1280, 720]);
 	// Turned a quarter turn, for everyone: tall.
 	await page
 		.getByRole('button', { name: 'Turn your picture a quarter turn, for everyone' })
 		.click();
-	await expect.poll(size, { timeout: 10_000 }).toEqual([270, 480]);
+	await expect.poll(size, { timeout: 10_000 }).toEqual([720, 1280]);
 	await page.getByRole('button', { name: 'Turn your camera off' }).click();
 	await expect(mine.locator('.screen')).toHaveCount(0);
 });

@@ -22,8 +22,10 @@ before(async () => {
   });
   relay = await new Promise((resolve, reject) => {
     relayProcess.on("error", reject);
+    // Its stderr is unbuffered: the line may come in pieces.
+    let log = "";
     relayProcess.stderr.on("data", (data) => {
-      const match = /listening on (\S+)/.exec(data);
+      const match = /listening on (\S+) /.exec((log += data));
       if (match) resolve(`ws://${match[1]}`);
     });
   });

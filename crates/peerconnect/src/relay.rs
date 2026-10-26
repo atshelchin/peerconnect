@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn group_decisions() {
-        let group = crate::group::Group::create("wss://r.example").unwrap();
+        let group = crate::group::Group::create("https://r.example").unwrap();
         let id = group.id();
         let (pending, hello) = GroupConn::new();
         let GroupConn::Pending(nonce) = pending else { unreachable!() };
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn group_paths() {
-        let id = crate::group::Group::create("wss://r.example").unwrap().id();
+        let id = crate::group::Group::create("https://r.example").unwrap().id();
         assert_eq!(group_from_path(&format!("/g1/{id}")), Some(id));
         assert_eq!(group_from_path(&format!("/relay/g1/{id}?x=1")), Some(id));
         assert_eq!(group_from_path(&format!("/v1/{id}")), None);

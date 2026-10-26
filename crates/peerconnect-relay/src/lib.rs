@@ -283,9 +283,10 @@ impl Relay {
         if path == "/" || path == "/healthz" {
             return text(StatusCode::OK, "peerconnect relay\n");
         }
-        let endpoint = match (relay::room_from_path(path), relay::group_from_path(path)) {
-            (Some(room), _) => Endpoint::Room(room),
-            (_, Some(group)) => Endpoint::Group(group),
+        let room = match (relay::room_from_path(path), relay::group_from_path(path)) {
+            (Some(room), _) => room,
+            // Groups travel over QUIC only (GROUP.md §3.6), on the UDP port.
+            (_, Some(_)) => return text(StatusCode::NOT_FOUND, "groups are served over QUIC and WebTransport only\n"),
             _ => return text(StatusCode::NOT_FOUND, "not found\n"),
         };
         let Some(key) = websocket_key(&req) else {
@@ -303,21 +304,15 @@ impl Relay {
         tokio::spawn(async move {
             let Ok(upgraded) = upgrade.await else { return };
             // Small buffers: most connections are idle, and frames are at
-            // most 64 KiB (16 KiB in groups).
-            let max = match endpoint {
-                Endpoint::Room(_) => wire::MAX_FRAME_LEN,
-                Endpoint::Group(_) => peerconnect::group::wire::MAX_FRAME_LEN,
-            };
+            // most 64 KiB.
+            let max = wire::MAX_FRAME_LEN;
             let config = WebSocketConfig::default()
                 .read_buffer_size(16 << 10)
                 .write_buffer_size(16 << 10)
                 .max_message_size(Some(max))
                 .max_frame_size(Some(max));
             let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
-            match endpoint {
-                Endpoint::Room(room) => self.connection(room, ws, slot).await,
-                Endpoint::Group(group) => self.group_websocket(group, ws, slot).await,
-            }
+            self.connection(room, ws, slot).await;
             drop(per_address);
         });
         let mut res = Response::new(Full::default());
@@ -524,12 +519,6 @@ fn receive(conn: &Conn, room: &RoomId, msg: &Message) -> Option<Action> {
         Message::Binary(frame) => conn.receive(room, relay::Incoming::Binary(frame)),
         _ => return None, // control frames are handled by the WebSocket layer
     })
-}
-
-#[derive(Clone, Copy)]
-enum Endpoint {
-    Room(RoomId),
-    Group(RoomId),
 }
 
 /// Keeps little unsent data in the kernel's send buffer, so that it waits in

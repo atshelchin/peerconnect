@@ -1,10 +1,11 @@
 //! The member state machine (GROUP.md §4–§7), free of I/O.
 //!
-//! Like [`crate::Peer`], a driver owns at most one WebSocket at a time,
-//! feeds the machine what happens to it, and carries out its outputs. Each
-//! [`Output::Send`] says the frame's [`Class`]: a driver should send the
-//! most urgent class first, and may drop [`Class::Voice`] frames when its
-//! socket is backed up (GROUP.md §7.2).
+//! Like [`crate::Peer`], a driver owns at most one connection at a time, a
+//! QUIC connection to the relay (GROUP.md §3.6), feeds the machine what
+//! happens to it, and carries out its outputs. Each [`Output::Send`] says
+//! the frame's [`Class`]: a driver sends it on that class's stream, and may
+//! drop [`Class::Voice`] and [`Class::Video`] frames when the connection is
+//! backed up (GROUP.md §7.2).
 //!
 //! The machine joins the group, admits the other members by their
 //! identities, and carries:
@@ -159,14 +160,16 @@ impl Channel {
 /// What the machine asks of its driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
-    /// Open a WebSocket to this URL (any previous one is already closed).
+    /// Open a QUIC connection to this `https://` or `quic://` URL (see
+    /// [`super::transport::target`]); any previous one is already closed.
     Connect(String),
-    /// Send a binary message. Send the most urgent class first; a
-    /// [`Class::Voice`] frame may be dropped if the socket is backed up.
+    /// Send a message on the stream of its class (voice and video as a
+    /// datagram where it fits); a [`Class::Voice`] frame may be dropped if
+    /// the connection is backed up.
     Send(Vec<u8>, Class),
-    /// Send the text message `ping`, ahead of anything queued if possible.
+    /// Send the empty message (`ping`) on the command stream.
     Ping,
-    /// Close the WebSocket (code 1000) and forget it.
+    /// Close the connection (code 1000) and forget it.
     Disconnect,
     /// Tell the application.
     Event(Event),
@@ -1861,7 +1864,7 @@ mod tests {
 
     /// A member that the relay has just welcomed into slot 0, alone.
     fn welcomed() -> Member {
-        let group = Group::create("wss://relay.test").unwrap();
+        let group = Group::create("https://relay.test").unwrap();
         let mut m = Member::new(group, Identity::generate(), Config::default(), 0).unwrap();
         m.handle_open(0);
         m.handle_binary(0, &crate::wire::hello(&[0; 32]));
@@ -1911,13 +1914,13 @@ mod tests {
         assert_eq!(m.send(Channel::Chat, b"x"), Err(SendError::Closed));
         assert!(!m.send_voice(0, b"x"));
         assert!(!m.send_datagram(None, b"x"));
-        assert_eq!(m.group().relay(), "wss://relay.test");
+        assert_eq!(m.group().relay(), "https://relay.test");
         assert_eq!(SendError::Busy.to_string(), "a state transfer is already under way");
     }
 
     #[test]
     fn offline_a_member_queues_stream_messages_and_drops_the_rest() {
-        let group = Group::create("wss://relay.test").unwrap();
+        let group = Group::create("https://relay.test").unwrap();
         let mut m = Member::new(group, Identity::generate(), Config::default(), 0).unwrap();
         assert_eq!(m.send(Channel::Chat, b"later"), Ok(0));
         assert!(!m.send_voice(0, b"x"));
@@ -1929,7 +1932,7 @@ mod tests {
 
     #[test]
     fn profiles_over_1_kib_are_refused() {
-        let group = Group::create("wss://relay.test").unwrap();
+        let group = Group::create("https://relay.test").unwrap();
         let config = Config { profile: vec![0; wire::MAX_PROFILE_LEN + 1], ..Config::default() };
         assert_eq!(Member::new(group.clone(), Identity::generate(), config, 0).err(), Some(Error::InvalidProfile));
         let config = Config { profile: vec![0; wire::MAX_PROFILE_LEN], ..Config::default() };
@@ -1957,7 +1960,7 @@ mod tests {
     /// until both have admitted each other. Returns them and the events
     /// each produced on the way.
     fn pair(config: Config) -> (Member, Member) {
-        let group = Group::create("wss://relay.test").unwrap();
+        let group = Group::create("https://relay.test").unwrap();
         let mut a = Member::new(group.clone(), Identity::generate(), config, 0).unwrap();
         let mut b = Member::new(group, Identity::generate(), Config::default(), 0).unwrap();
         for (m, slot, present) in [(&mut a, 0, 0b10), (&mut b, 1, 0b01)] {

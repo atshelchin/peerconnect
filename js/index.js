@@ -155,18 +155,22 @@ export class Connection extends EventTarget {
   }
 }
 
-// Groups (GROUP.md): up to four members, commands, chat, voice and state transfer.
+// Groups (GROUP.md): up to four members, commands, chat, voice, video and
+// state transfer, over WebTransport only (§3.6): a lost packet holds up only
+// its own class, and voice and video wait for nothing. There is no WebSocket
+// fallback; where WebTransport or UDP is not available, a member cannot join.
 
-/** Bytes unsent on the socket beyond which voice frames are dropped. */
+/** Bytes unsent on the voice stream beyond which voice frames are dropped. */
 const VOICE_BACKLOG = 4 << 10;
-/** Chat and state transfer are handed to the socket only while it has less than this unsent. */
-const LOW_BACKLOG = 16 << 10;
 /** Video waiting to be sent beyond which the oldest is dropped. */
 const VIDEO_BACKLOG = 64 << 10;
-/** How long WebTransport has to connect before the WebSocket is tried as well. */
-const WEBTRANSPORT_HEAD_START = 1500;
 /** WebTransport stream priorities, by class (0 command, 1 voice, 2 chat, 3 bulk, 4 video): higher goes first. */
 const SEND_ORDER = [4, 3, 2, 0, 1];
+
+/** Whether this runtime can join groups: it needs WebTransport. */
+export function groupsSupported() {
+  return typeof WebTransport === "function";
+}
 
 /**
  * Joins a group (a `Group` or its invite) and stays in it, reconnecting as
@@ -174,14 +178,14 @@ const SEND_ORDER = [4, 3, 2, 0, 1];
  * `identity.seed` to be recognised later. `profile` (a string or bytes, at
  * most 1 KiB) describes this member to the others.
  *
- * For an `https://` relay, it connects over WebTransport where the runtime
- * has it, falling back to the relay's `wss://` WebSocket. For a `quic://`
- * relay (one with no domain or certificate), over WebTransport too, pinning
- * the relay's weekly certificate, which needs no domain (GROUP.md §3.7),
- * falling back to its `ws://` WebSocket. `webTransport` is passed to the
- * `WebTransport` constructor (`serverCertificateHashes`, say).
+ * It connects over WebTransport: to an `https://` relay as it is, and to a
+ * `quic://` relay (one with no domain or certificate) pinning the relay's
+ * weekly certificate (GROUP.md §3.7). `webTransport` is passed to the
+ * `WebTransport` constructor (`serverCertificateHashes`, say). Throws a
+ * "NotSupportedError" DOMException where there is no WebTransport.
  */
 export function joinGroup(group, { identity, profile, webTransport } = {}) {
+  if (!groupsSupported()) throw new DOMException("groups need WebTransport", "NotSupportedError");
   return new GroupConnection(
     typeof group === "string" ? Group.parse(group) : group,
     identity ?? Identity.generate(),
@@ -191,21 +195,16 @@ export function joinGroup(group, { identity, profile, webTransport } = {}) {
 }
 
 /**
- * The ways to reach a group endpoint from JavaScript, in the order to try
- * them (GROUP.md §3.6, §3.7): `[{ type: "webtransport" | "websocket", url,
- * weekly? }]`, where `weekly` means pinning the weekly certificate.
+ * The WebTransport session for a group endpoint (GROUP.md §3.6, §3.7):
+ * `{ url, weekly }`, where `weekly` means pinning the weekly certificate;
+ * `null` for anything but an `https://` or `quic://` URL.
  */
-export function transportsFor(url) {
-  const match = /^(wss?|https|quic):\/\/([^/]+)(.*)$/.exec(url);
-  if (!match) return [];
+export function webTransportFor(url) {
+  const match = /^(https|quic):\/\/([^/]+)(.*)$/.exec(url);
+  if (!match) return null;
   const [, scheme, authority, path] = match;
-  if (scheme === "ws" || scheme === "wss") return [{ type: "websocket", url }];
-  if (scheme === "https") return [{ type: "webtransport", url }, { type: "websocket", url: `wss://${authority}${path}` }];
   // quic:// is 443 by default, as https:// is.
-  return [
-    { type: "webtransport", url: `https://${authority}${path}`, weekly: true },
-    { type: "websocket", url: `ws://${authority}${path}` },
-  ];
+  return { url: `https://${authority}${path}`, weekly: scheme === "quic" };
 }
 
 /** The SHA-256 hashes of the weekly certificates a relay may be serving now (GROUP.md §3.7). */
@@ -222,11 +221,10 @@ export class GroupConnection extends EventTarget {
   id;
 
   #member;
-  /** The open link to the relay. */
+  /** The open session to the relay. */
   #link = null;
-  /** Links being opened, of which the first to open wins. */
-  #opening = [];
-  #headStart = undefined;
+  /** The session being opened. */
+  #opening = null;
   #webTransport;
   #timer = undefined;
   #epoch = performance.now();
@@ -239,9 +237,9 @@ export class GroupConnection extends EventTarget {
     queueMicrotask(() => this.#pump());
   }
 
-  /** What the connection to the relay runs over: "webtransport", "websocket", or null while there is none. */
-  get via() {
-    return this.#link?.via ?? null;
+  /** Whether a WebTransport session to the relay is open now. */
+  get connected() {
+    return this.#link !== null;
   }
 
   /** The latest round trip to the relay, in milliseconds. */
@@ -366,20 +364,13 @@ export class GroupConnection extends EventTarget {
     this.#link?.send(frame, kind);
   }
 
-  /** Opens the first transport to work: WebTransport, with a head start, then the WebSocket. */
+  /** Opens a WebTransport session to the group's endpoint. */
   #open(url) {
-    const ways = transportsFor(url);
-    const webTransport = ways.find((w) => w.type === "webtransport");
-    const webSocket = ways.find((w) => w.type === "websocket");
-    const startWebSocket = () => {
-      clearTimeout(this.#headStart);
-      this.#headStart = undefined;
-      if (webSocket) this.#opening.push(new WebSocketLink(webSocket.url, handlers));
-    };
+    const target = webTransportFor(url);
     const handlers = {
       open: (link) => {
-        if (this.#link || !this.#opening.includes(link)) return link.close();
-        this.#stopOpening(link);
+        if (link !== this.#opening) return link.close();
+        this.#opening = null;
         this.#link = link;
         this.#member.handleOpen(this.#now());
         this.#pump();
@@ -395,118 +386,29 @@ export class GroupConnection extends EventTarget {
         this.#pump();
       },
       close: (link, code) => {
-        if (link === this.#link) {
-          this.#link = null;
-          this.#member.handleClose(this.#now(), code);
-          this.#pump();
-        } else if (this.#opening.includes(link)) {
-          // That way failed: try the next one now, and report once all have.
-          this.#opening = this.#opening.filter((l) => l !== link);
-          if (this.#headStart !== undefined) startWebSocket();
-          if (this.#opening.length === 0) {
-            this.#member.handleClose(this.#now(), undefined);
-            this.#pump();
-          }
-        }
+        if (link === this.#link) this.#link = null;
+        else if (link === this.#opening) this.#opening = null;
+        else return;
+        this.#member.handleClose(this.#now(), code);
+        this.#pump();
       },
     };
-    if (webTransport && typeof WebTransport === "function") {
-      const options = webTransport.weekly ? { serverCertificateHashes: weeklyHashes(), ...this.#webTransport } : this.#webTransport;
-      this.#opening.push(new WebTransportLink(webTransport.url, handlers, options));
-      this.#headStart = setTimeout(startWebSocket, WEBTRANSPORT_HEAD_START);
-    } else if (webSocket) {
-      startWebSocket();
-    } else {
+    if (!target) {
       queueMicrotask(() => {
         this.#member.handleClose(this.#now(), undefined);
         this.#pump();
       });
+      return;
     }
-  }
-
-  /** Abandons the links still opening, but `keep`. */
-  #stopOpening(keep) {
-    clearTimeout(this.#headStart);
-    this.#headStart = undefined;
-    for (const link of this.#opening) if (link !== keep) link.close();
-    this.#opening = [];
+    const options = target.weekly ? { serverCertificateHashes: weeklyHashes(), ...this.#webTransport } : this.#webTransport;
+    this.#opening = new WebTransportLink(target.url, handlers, options);
   }
 
   #disconnect() {
-    this.#stopOpening(null);
-    const link = this.#link;
-    this.#link = null;
+    const [opening, link] = [this.#opening, this.#link];
+    this.#opening = this.#link = null;
+    opening?.close();
     link?.close();
-  }
-}
-
-/**
- * A WebSocket to the relay: commands go at once; voice only if the socket
- * keeps up; chat, video and bulk, in that order, as it drains (video
- * dropping its oldest past its budget).
- */
-class WebSocketLink {
-  via = "websocket";
-  #socket;
-  /** Chat, video and bulk frames waiting for the socket to drain. */
-  #backlog = [[], [], []];
-  #videoBytes = 0;
-  #flushTimer = undefined;
-
-  constructor(url, on) {
-    const socket = new WebSocket(url);
-    socket.binaryType = "arraybuffer";
-    this.#socket = socket;
-    socket.onopen = () => on.open(this);
-    socket.onmessage = (event) =>
-      typeof event.data === "string" ? on.text(this, event.data) : on.binary(this, new Uint8Array(event.data));
-    socket.onclose = (event) => {
-      this.#backlog = [[], [], []];
-      on.close(this, event.code);
-    };
-  }
-
-  send(frame, kind) {
-    const socket = this.#socket;
-    if (kind === 0) socket.send(frame);
-    else if (kind === 1) {
-      if (socket.bufferedAmount <= VOICE_BACKLOG) socket.send(frame);
-    } else {
-      const queue = this.#backlog[{ 2: 0, 4: 1, 3: 2 }[kind]];
-      if (kind === 4) {
-        this.#videoBytes += frame.length;
-        while (this.#videoBytes > VIDEO_BACKLOG) this.#videoBytes -= queue.shift().length;
-      }
-      queue.push(frame);
-      this.#flush();
-    }
-  }
-
-  ping() {
-    this.#socket.send("ping");
-  }
-
-  #flush() {
-    clearTimeout(this.#flushTimer);
-    const socket = this.#socket;
-    if (socket.readyState !== WebSocket.OPEN) return;
-    while (socket.bufferedAmount < LOW_BACKLOG) {
-      const queue = this.#backlog.find((q) => q.length);
-      if (!queue) return;
-      const frame = queue.shift();
-      if (queue === this.#backlog[1]) this.#videoBytes -= frame.length;
-      socket.send(frame);
-    }
-    // WebSocket has no event for a drained buffer: look again shortly.
-    this.#flushTimer = setTimeout(() => this.#flush(), 5);
-  }
-
-  close() {
-    clearTimeout(this.#flushTimer);
-    this.#backlog = [[], [], []];
-    const socket = this.#socket;
-    socket.onopen = socket.onmessage = socket.onclose = null;
-    socket.close(1000);
   }
 }
 
@@ -517,7 +419,6 @@ class WebSocketLink {
  * datagrams, which wait for nothing. The empty message is ping, and pong.
  */
 class WebTransportLink {
-  via = "webtransport";
   #session;
   #on;
   #closed = false;
