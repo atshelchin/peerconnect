@@ -18,7 +18,7 @@ export const en = {
 		groups: {
 			title: 'Groups: multiplayer, voice and state sync — PeerConnect',
 			description:
-				'End-to-end encrypted groups of up to 32 members: commands, chat, voice and state transfer over an untrusted relay. Built for games and teams: JavaScript, Rust and C.'
+				'End-to-end encrypted groups of up to four members: commands, chat, voice and state transfer over an untrusted relay. Built for games and teams: JavaScript, Rust and C.'
 		},
 		demo: {
 			title: 'Live demo: pair two browsers — PeerConnect',
@@ -28,7 +28,7 @@ export const en = {
 		voice: {
 			title: 'Live demo: group voice and video chat — PeerConnect',
 			description:
-				'Talk and see each other, up to ten people, end-to-end encrypted, through a public PeerConnect relay: Opus voice, VP8 video and text chat. Open it on two devices.'
+				'Talk and see each other, up to four people, end-to-end encrypted, through a public PeerConnect relay: Opus voice, VP8 video and text chat. Open it on two devices.'
 		},
 		spec: {
 			title: 'Protocol specification v1 — PeerConnect',
@@ -218,7 +218,7 @@ export const en = {
 			eyebrow: 'Groups',
 			title: 'More than two? Make it a group.',
 			intro:
-				'Squads, shared worlds, teams: up to 32 members in one end-to-end encrypted group, on the same relays. Built for games, where a command must never wait behind a chat message.',
+				'Squads, shared worlds, teams: up to four members in one end-to-end encrypted group, on the same relays. Built for games, where a command must never wait behind a chat message.',
 			items: [
 				{
 					title: 'Members are keys',
@@ -266,7 +266,7 @@ export const en = {
 				},
 				{
 					q: 'Can more than two apps share a room?',
-					a: 'A room is for exactly two. For more, use a group: up to 32 members (relays admit 10 by default), with commands, chat, voice and state transfer, through the same relays. The groups guide explains how.'
+					a: 'A room is for exactly two. For more, use a group: up to four members, with commands, chat, voice and state transfer, through the same relays. The groups guide explains how.'
 				},
 				{
 					q: 'Is it ready for production?',
@@ -288,7 +288,7 @@ export const en = {
 	voice: {
 		eyebrow: 'Live demo',
 		title: 'Group voice and video chat',
-		lead: 'Talk with up to ten people at once, and turn the camera on to see each other, end-to-end encrypted. Create a room, send the link to a friend or open it on your phone, and speak.',
+		lead: 'Talk with up to four people at once, and turn the camera on to see each other, end-to-end encrypted. Create a room, send the link to a friend or open it on your phone, and speak.',
 		steps: [
 			'Create a room, and share the link.',
 			'Everyone who opens it enters a name, checks their microphone, camera and speakers if they like, and joins.',
@@ -299,7 +299,7 @@ export const en = {
 		loading: 'Loading…',
 		start: {
 			title: 'Start a voice room',
-			text: 'You get a link to share. Anyone with it can join, up to ten at a time, so share it privately.',
+			text: 'You get a link to share. Anyone with it can join, up to four at a time, so share it privately.',
 			create: 'Create a room'
 		},
 		join: {
@@ -331,7 +331,7 @@ export const en = {
 			camera: 'The camera is not available (permission denied, or none found).',
 			codecs:
 				'This browser cannot encode Opus audio (WebCodecs). Text chat works; for voice, use a recent Chrome, Edge or Firefox.',
-			full: 'The room is full (ten people). The page keeps trying.',
+			full: 'The room is full (four people). The page keeps trying.',
 			replaced: 'This room was opened with the same identity elsewhere.',
 			link: 'That link is not a valid room link.',
 			failed: 'The demo could not start in this browser.'
@@ -357,6 +357,25 @@ export const en = {
 			cameraOn: 'Turn your camera off',
 			cameraOff: 'Turn your camera on: everyone sees you',
 			video: 'Video from {name}',
+			layout: 'Layout',
+			gallery: 'Gallery',
+			speakerView: 'Speaker',
+			pin: 'Show {name} large',
+			unpin: 'Back to everyone',
+			whole: 'Watch {name} on the whole screen',
+			exitWhole: 'Leave the whole screen',
+			chat: 'Chat',
+			closeChat: 'Close the chat',
+			controls: 'Meeting controls',
+			short: {
+				mute: 'Mute',
+				unmute: 'Unmute',
+				startVideo: 'Start video',
+				stopVideo: 'Stop video',
+				sound: 'Sound',
+				chat: 'Chat',
+				invite: 'Invite'
+			},
 			switchCamera: 'Switch camera (front and back)',
 			rotateMine: 'Turn your picture a quarter turn, for everyone',
 			rotateTheirs: 'Turn {name}’s picture a quarter turn (only for you)'
