@@ -1,17 +1,18 @@
-//! A load test that behaves like a game: many groups of ten players, each
+//! A load test that behaves like a game: many groups of three players, each
 //! over its own real WebSocket, end-to-end encrypted, through a relay.
 //!
 //! Every player, all the time:
 //! - sends its position 20 times a second (datagrams, 48 bytes);
 //! - sends a game command twice a second (60–200 bytes);
 //! - sends a chat line every 10 s;
-//! - and in each group three players talk at once, 50 voice frames a second
+//! - and in each group two players talk at once, 50 voice frames a second
 //!   (80 bytes), the talkers changing every 3 s.
 //!
-//! Halfway through, a newcomer joins every group and fetches a 2 MB world
+//! Halfway through, a newcomer joins every group, which makes it four, the
+//! most a group holds (GROUP.md §3.2), and fetches a 2 MB world
 //! snapshot from the first player, while all of that carries on.
 //!
-//! Options: `--players N` per group (default 10), `--light` (commands only,
+//! Options: `--players N` per group (default 3; 4 with `--no-sync`), `--light` (commands only,
 //! to measure a path's own delay), `--no-sync` (no newcomers),
 //! `--shape KBPS:MS` to put every player behind its own emulated access
 //! link of that rate and one-way delay, with a deep buffer, and `--quic`
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 use peerconnect::client::group;
 use peerconnect::group::{Channel, Config, Event, Group, Identity, MemberId};
 
-const TALKERS: usize = 3;
+const TALKERS: usize = 2;
 const SNAPSHOT: usize = 2 << 20;
 
 /// Latency histogram: 10 µs buckets up to 2 s, then one overflow bucket.
@@ -145,7 +146,7 @@ fn args() -> Args {
         spawn: None,
         groups: 10,
         seconds: 30,
-        players: 10,
+        players: 3,
         light: false,
         shape: None,
         no_sync: false,
@@ -174,6 +175,8 @@ fn args() -> Args {
             other => panic!("unknown flag {other}"),
         }
     }
+    let room = peerconnect::group::wire::MAX_SLOTS - usize::from(!args.no_sync);
+    assert!((1..=room).contains(&args.players), "--players: 1 to {room} (a newcomer joins each group)");
     args
 }
 
@@ -190,7 +193,6 @@ async fn main() {
                 .env("PEERCONNECT_LISTEN", format!("127.0.0.1:{port}"))
                 .env("PEERCONNECT_MAX_PER_ADDRESS", "100000")
                 .env("PEERCONNECT_MAX_CONNECTIONS", "100000")
-                .env("PEERCONNECT_MAX_GROUP_MEMBERS", "16")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

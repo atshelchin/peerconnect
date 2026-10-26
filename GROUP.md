@@ -11,7 +11,7 @@ A **group** is defined by a 32-byte **group secret**. Whoever holds it can enter
 The relay:
 
 - admits a connection that proves it holds the group key, without learning the key;
-- gives every connection a **slot** (0–31) and tells everyone who is present;
+- gives every connection a **slot** (0–3) and tells everyone who is present;
 - forwards each frame to one member or to all, by priority, without reading it;
 - keeps no state beyond its open connections.
 
@@ -32,7 +32,7 @@ PeerConnect does not define what commands mean, does not order commands from dif
 | Group | The relationship of everyone holding one group secret. Not an object on the relay. |
 | Group ID | Where the group meets on a relay: an Ed25519 public key derived from the secret (§2.1). |
 | Member | A participant, known by its identity public key (its **member ID**). |
-| Slot | The number, 0–31, a relay gives a connection while it is in the group. |
+| Slot | The number, 0–3, a relay gives a connection while it is in the group. |
 | Incarnation | A random non-zero 64-bit number a member picks whenever it starts. It names that run's streams. |
 | Stream | The numbered sequence of messages one incarnation broadcasts on one channel (commands or chat). |
 | Sender key | A random key a member uses to encrypt everything it sends on one connection. |
@@ -94,7 +94,7 @@ under the same rules as SPEC.md §4.1 (any prefix; HTTP 404 if the last segment 
 
 ### 3.2 Slots
 
-A group on a relay has 32 slots, each holding at most one connection. A relay MAY admit fewer members (the reference relays: 10 by default); a connection beyond that limit is closed with **4429** (full).
+A group on a relay has **4 slots**, each holding at most one connection: a group has at most four members. A relay MUST NOT seat more than four connections in a group, and MAY admit fewer; a connection beyond its limit is closed with **4429** (full). Four keep a group what it is for, a squad or a small call where everyone can talk and be seen at once: every member sends its voice and video to every other, so what each receives grows with the group.
 
 - A connection whose token matches a seated connection's takes **its** slot, and the relay closes the older one with **4409** (replaced). A member that reconnects after a network change is never stuck behind its own dead connection, and a member's identity holds at most one slot.
 - Otherwise the connection takes the lowest free slot.
@@ -105,8 +105,10 @@ Relay frames:
 |---|---|---|---|
 | `0x80` | HELLO | relay → member | `nonce[32]` |
 | `0x81` | JOIN | member → relay | `token[16] ‖ signature[64]` |
-| `0x83` | WELCOME | relay → member | `slot[1] ‖ present[4]`: own slot, and a u32 bitmap (bit *n* = slot *n*) of the other occupied slots |
+| `0x83` | WELCOME | relay → member | `slot[1] ‖ present[4]`: own slot, and a u32 bitmap (bit *n* = slot *n*) of the other occupied slots; bits 4–31 are zero |
 | `0x84` | MEMBER | relay → member | `slot[1] ‖ present[1]` (`0x01`: a new connection now holds the slot, `0x00`: the slot is free) |
+
+A member ignores MEMBER for a slot above 3, and bits above 3 in WELCOME; a WELCOME giving it a slot above 3 is a protocol error (§7.1: reconnect).
 
 On seating a connection, the relay sends it WELCOME, then sends every other connection MEMBER (`slot`, `0x01`), including when the new connection replaced an older one in that slot. When a seated connection ends for any reason other than replacement, the relay sends every other connection MEMBER (`slot`, `0x00`).
 
@@ -364,7 +366,7 @@ The codec is the application's. Implementations that want to interoperate with t
 
 | Name | Value | Enforced by |
 |---|---|---|
-| Members | ≤ 32 slots; the reference relays admit 10 | relay (4429) |
+| Members | ≤ 4 (4 slots) | relay (4429) |
 | Frame size | ≤ 16,384 bytes | relay (1009) |
 | Message payload | ≤ 16,352 bytes | senders |
 | Video frame | ≤ 255 fragments of ≤ 1,000 bytes | senders |

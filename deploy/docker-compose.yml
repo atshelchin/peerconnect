@@ -17,7 +17,7 @@ services:
     environment:
       PEERCONNECT_MAX_CONNECTIONS: "10000"
       PEERCONNECT_MAX_PER_ADDRESS: "256"
-      PEERCONNECT_MAX_GROUP_MEMBERS: "10"
+      PEERCONNECT_MAX_GROUP_MEMBERS: "4"
       # Caddy appends the client's address to X-Forwarded-For.
       PEERCONNECT_TRUST_PROXY: "1"
       PEERCONNECT_QUIC_LISTEN: "0.0.0.0:443"

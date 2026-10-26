@@ -162,12 +162,12 @@ async fn members_talk() {
 }
 
 #[tokio::test]
-async fn ten_members_and_voice_latency() {
+async fn four_members_and_voice_latency() {
     let relay = Relay::start().await;
     let group = Group::create(&relay.url).unwrap();
-    let mut members: Vec<GroupConnection> = (0..10).map(|i| join(&group, &format!("m{i}"))).collect();
+    let mut members: Vec<GroupConnection> = (0..4).map(|i| join(&group, &format!("m{i}"))).collect();
     for m in &mut members {
-        admitted(m, 9).await;
+        admitted(m, 3).await;
     }
     // Three people talk at once, 20 ms frames of about 80 bytes, for 2 s.
     let start = Instant::now();
@@ -197,7 +197,7 @@ async fn ten_members_and_voice_latency() {
     latencies.sort();
     let p50 = latencies[latencies.len() / 2];
     let p99 = latencies[latencies.len() * 99 / 100];
-    eprintln!("voice through the relay, 10 members, 3 speakers: p50 {p50} µs, p99 {p99} µs");
+    eprintln!("voice through the relay, 4 members, 3 speakers: p50 {p50} µs, p99 {p99} µs");
     if !relay.external() {
         assert!(p99 < 50_000, "p99 {p99} µs");
     }
@@ -417,7 +417,8 @@ async fn a_full_group_refuses_the_next_member() {
     let relay = Relay::start().await;
     let group = Group::create(&relay.url).unwrap();
     let mut seated = Vec::new();
-    for _ in 0..10 {
+    // Four at most, on every relay (GROUP.md §3.2).
+    for _ in 0..wire::MAX_SLOTS {
         seated.push(raw_join(&group, &Identity::generate()).await);
     }
     let mut extra = raw(&group).await;

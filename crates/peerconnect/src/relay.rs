@@ -195,10 +195,12 @@ mod tests {
             GroupAction::Forward { to: None, class: group::Class::Voice }
         );
         assert_eq!(
-            seated.receive(&id, Incoming::Binary(&[0x03, 2, 5])),
-            GroupAction::Forward { to: Some(5), class: group::Class::Command }
+            seated.receive(&id, Incoming::Binary(&[0x03, 2, 3])),
+            GroupAction::Forward { to: Some(3), class: group::Class::Command }
         );
-        assert_eq!(seated.receive(&id, Incoming::Binary(&[0x03, 1, 5])), GroupAction::Close(close::PROTOCOL_ERROR));
+        assert_eq!(seated.receive(&id, Incoming::Binary(&[0x03, 1, 3])), GroupAction::Close(close::PROTOCOL_ERROR));
+        // Slots 0–3 only (GROUP.md §3.2).
+        assert_eq!(seated.receive(&id, Incoming::Binary(&[0x03, 2, 4])), GroupAction::Close(close::PROTOCOL_ERROR));
         assert_eq!(seated.receive(&id, Incoming::Binary(&join)), GroupAction::Close(close::PROTOCOL_ERROR));
         assert_eq!(seated.receive(&id, Incoming::Text("hi")), GroupAction::Close(close::PROTOCOL_ERROR));
         let big = vec![0x03; group::wire::MAX_FRAME_LEN + 1];

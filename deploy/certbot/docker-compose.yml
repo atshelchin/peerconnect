@@ -37,7 +37,7 @@ services:
       PEERCONNECT_TLS_KEY: /certs/privkey.pem
       PEERCONNECT_MAX_CONNECTIONS: "10000"
       PEERCONNECT_MAX_PER_ADDRESS: "256"
-      PEERCONNECT_MAX_GROUP_MEMBERS: "10"
+      PEERCONNECT_MAX_GROUP_MEMBERS: "4"
     volumes:
       - certs:/certs:ro
 volumes:

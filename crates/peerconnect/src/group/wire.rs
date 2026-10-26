@@ -32,7 +32,9 @@ pub const BULK: u8 = 0x61;
 
 /// `to` for every other member.
 pub const BROADCAST: u8 = 0xFF;
-pub const MAX_SLOTS: usize = 32;
+/// Slots in a group, and so members at most (GROUP.md §3.2): a small group
+/// that talks, shows video and plays together.
+pub const MAX_SLOTS: usize = 4;
 /// Largest frame. Small frames keep a less urgent frame from holding up a
 /// more urgent one for long, wherever they queue.
 pub const MAX_FRAME_LEN: usize = 16 << 10;
@@ -168,11 +170,11 @@ mod tests {
         assert_eq!(Class::of(BULK), Class::Bulk);
         assert_eq!(Class::of(0x7F), Class::Bulk);
         assert_eq!(route(3, &[COMMAND, 3, BROADCAST]), Some((None, Class::Command)));
-        assert_eq!(route(3, &[VOICE, 3, 4, 9]), Some((Some(4), Class::Voice)));
-        assert_eq!(route(3, &[VOICE, 2, 4]), None); // not its slot
+        assert_eq!(route(3, &[VOICE, 3, 1, 9]), Some((Some(1), Class::Voice)));
+        assert_eq!(route(3, &[VOICE, 2, 1]), None); // not its slot
         assert_eq!(route(3, &[VOICE, 3, 3]), None); // to itself
-        assert_eq!(route(3, &[VOICE, 3, 32]), None);
-        assert_eq!(route(3, &[0x80, 3, 4]), None);
+        assert_eq!(route(3, &[VOICE, 3, 4]), None); // no such slot: four at most
+        assert_eq!(route(3, &[0x80, 3, 1]), None);
         assert_eq!(route(3, &[VOICE, 3]), None);
         assert_eq!(MAX_PAYLOAD_LEN, 16_352);
     }

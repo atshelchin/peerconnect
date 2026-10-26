@@ -227,7 +227,7 @@ impl Sim {
         let group = Group::create("wss://relay.test").unwrap();
         let relay = Relay {
             group: group.id(),
-            limit: 10,
+            limit: wire::MAX_SLOTS,
             conns: HashMap::new(),
             slots: Default::default(),
             next_id: 0,
@@ -572,27 +572,27 @@ fn the_newest_connection_of_an_identity_replaces_the_old_one() {
 
 #[test]
 fn a_full_group_refuses_more_members() {
+    // Four at most (GROUP.md §3.2): the fifth is refused.
     let mut sim = Sim::new();
-    sim.relay.limit = 3;
-    for i in 0..4 {
+    for i in 0..5 {
         sim.add(Identity::generate(), &i.to_string());
     }
     sim.run(100);
-    let full = (0..4).filter(|&n| sim.nodes[n].events.contains(&Event::Full)).count();
+    let full = (0..5).filter(|&n| sim.nodes[n].events.contains(&Event::Full)).count();
     assert_eq!(full, 1);
-    for n in 0..4 {
+    for n in 0..5 {
         let online = sim.nodes[n].member.state() == State::Online;
-        assert_eq!(sim.joined(n).len(), if online { 2 } else { 0 });
+        assert_eq!(sim.joined(n).len(), if online { 3 } else { 0 });
     }
 }
 
 #[test]
 fn many_members_and_a_voice_flood_leave_commands_intact() {
     let mut sim = Sim::new();
-    let nodes: Vec<usize> = (0..10).map(|i| sim.add(Identity::generate(), &i.to_string())).collect();
+    let nodes: Vec<usize> = (0..wire::MAX_SLOTS).map(|i| sim.add(Identity::generate(), &i.to_string())).collect();
     sim.run(200);
     for &n in &nodes {
-        assert_eq!(sim.joined(n).len(), 9);
+        assert_eq!(sim.joined(n).len(), wire::MAX_SLOTS - 1);
     }
     for round in 0..50u16 {
         for &n in &nodes {

@@ -197,10 +197,10 @@
 <h2 id="groups">Groups</h2>
 <p>
 	A room is for exactly two peers. For more — a squad in a game, a shared world, a team — use a
-	<strong>group</strong>: up to 32 members (the relays admit 10 by default), each known by an
-	Ed25519 identity, with commands, chat, voice and state transfer that never get in each other’s
-	way. Groups are in the same JavaScript package and Rust crate, come with a C library for game
-	engines, and are served by the same relays.
+	<strong>group</strong>: up to four members, each known by an Ed25519 identity, with commands,
+	chat, voice and state transfer that never get in each other’s way. Groups are in the same
+	JavaScript package and Rust crate, come with a C library for game engines, and are served by the
+	same relays.
 </p>
 <p><a href="/groups">Read the groups guide →</a></p>
 
@@ -245,8 +245,8 @@
 				></tr
 			>
 			<tr
-				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>10</code></td><td
-					>Members per group, up to 32.</td
+				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>4</code></td><td
+					>Members per group, 1 to 4 (four is the protocol’s limit).</td
 				></tr
 			>
 			<tr

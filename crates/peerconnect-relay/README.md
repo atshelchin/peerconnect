@@ -12,7 +12,7 @@ peerconnect-relay                      # ws://0.0.0.0:8080, and QUIC on UDP 8080
 | `PEERCONNECT_LISTEN` | `0.0.0.0:8080` | Address to listen on |
 | `PEERCONNECT_MAX_CONNECTIONS` | `10000` | Concurrent connections (WebSocket and QUIC) |
 | `PEERCONNECT_MAX_PER_ADDRESS` | `256` | Concurrent connections per client address (IPv6 counted per /64) |
-| `PEERCONNECT_MAX_GROUP_MEMBERS` | `10` | Members per group, up to 32 |
+| `PEERCONNECT_MAX_GROUP_MEMBERS` | `4` | Members per group, 1 to 4 (four is the protocol's limit, GROUP.md §3.2) |
 | `PEERCONNECT_TRUST_PROXY` | off | Set to `1` behind a proxy that appends the client address to `X-Forwarded-For` |
 | `PEERCONNECT_QUIC_LISTEN` | the TCP address | UDP address for groups over QUIC: raw QUIC, and WebTransport for browsers; `off` turns QUIC off |
 | `PEERCONNECT_TLS_CERT`, `PEERCONNECT_TLS_KEY` | none | PEM certificate chain and key, read again whenever the files change: `wss://` next to `ws://` on the TCP port (told apart by their first byte), and WebTransport |

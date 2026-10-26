@@ -1,6 +1,6 @@
 # PeerConnect
 
-**End-to-end encrypted rooms and groups over an untrusted, stateless WebSocket relay: two peers with reliable delivery, or up to 32 members with commands, chat, voice and state transfer.**
+**End-to-end encrypted rooms and groups over an untrusted, stateless WebSocket relay: two peers with reliable delivery, or up to four members with commands, chat, voice, video and state transfer.**
 
 PeerConnect connects two applications — a phone and a laptop, a web app and a wallet, two services in different networks — through a relay that cannot read, forge or replay what they say, and that needs no database. One side creates a room and hands the other an invite (a QR code, a link); from then on the two can reconnect whenever they like, from wherever they are, and messages sent while one of them is away arrive when it comes back.
 
@@ -17,7 +17,7 @@ PeerConnect connects two applications — a phone and a laptop, a web app and a 
 - **Stateless relay.** A room exists on a relay only while someone is connected. A relay can restart, or be replaced by another one, and peers simply reconnect: the room is defined by keys the peers hold, not by anything stored on the server.
 - **Reliable, in order, exactly once.** Messages are numbered and kept by their sender until acknowledged, then resent after any disconnection, so nothing is lost or duplicated while both peers keep running. The sender is the offline queue; the relay stores nothing.
 - **Invites expire by design.** Once paired, the peers move to a room ID derived from their two identities. A leaked invite reaches nobody.
-- **Groups for games and teams.** Up to 32 members per group (10 by default) with [their own protocol](GROUP.md): commands, chat and voice that never get in each other's way, members known by their own keys, and state transfer that brings a newcomer up to date from the members already there. See [Groups](#groups).
+- **Groups for games and teams.** Up to four members per group with [their own protocol](GROUP.md): commands, chat and voice that never get in each other's way, members known by their own keys, and state transfer that brings a newcomer up to date from the members already there. See [Groups](#groups).
 - **One codebase.** A Rust core with no I/O runs the Linux relay, the Cloudflare relay, the Rust client, the C library for game engines and, compiled to WebAssembly, the JavaScript client.
 
 ## Quick start
@@ -107,7 +107,7 @@ cargo run -p peerconnect --features client --example chat -- join '<invite>' roo
 
 ## Groups
 
-A group is a squad, a team, a shared world: everyone holding its invite can join, up to 32 members at once (the relays admit 10 by default). It is a separate protocol, [GROUP.md](GROUP.md), on its own endpoint (`/g1/<id>`), served by the same relays.
+A group is a squad, a team, a shared world: everyone holding its invite can join, up to four members at once. It is a separate protocol, [GROUP.md](GROUP.md), on its own endpoint (`/g1/<id>`), served by the same relays.
 
 - **Members are keys.** Each member has an Ed25519 identity that the application keeps (one per player, say). Others see it, proven, as the member's ID, so the application can decide who owns what and who is only visiting. The relay never sees identities.
 - **Five classes of traffic, most urgent first:** commands, voice, chat, video, bulk. Each has its own queue on the sender, in the relay, and its own counters in the encryption. A burst of chat or a state transfer never holds up a command, voice never waits behind chat, and video, which can fill a link, never starves chat.
@@ -194,15 +194,15 @@ Engines with their own event loop drive [`group::Member`](crates/peerconnect/src
 
 ### Latency and load
 
-Measured on one Apple M2 Pro with the [game load test](crates/peerconnect-relay/examples/game_load.rs): every player is a real end-to-end encrypted WebSocket client; each sends its position 20 times a second, a game command twice a second and a chat line every 10 s; three players per group talk at once (50 voice frames a second); halfway through, a newcomer joins every group and loads a 2 MB snapshot. Latency is from the sender's `send` to the receiver's event.
+Measured on one Apple M2 Pro with the [game load test](crates/peerconnect-relay/examples/game_load.rs): every player is a real end-to-end encrypted WebSocket client; groups of three players, each sending its position 20 times a second, a game command twice a second and a chat line every 10 s, two per group talking at once (50 voice frames a second); halfway through, a newcomer joins every group, making it four, and loads a 2 MB snapshot. Latency is from the sender's `send` to the receiver's event.
 
 | Load (Linux relay, release build) | Commands p50 / p99 | Voice p50 / p99 | Voice p99 while snapshots load | Relay |
 |---|---|---|---|---|
-| 10 groups, 100 players | 0.95 / 2.6 ms | 0.80 / 2.4 ms | 6.0 ms | 0.4 cores, 6 MB |
-| 50 groups, 500 players | 0.92 / 3.5 ms | 0.77 / 3.3 ms | 2.7 ms | 1.7 cores, 19 MB |
-| 100 groups, 1,000 players | 1.6 / 17 ms | 1.4 / 15 ms | 19 ms | 4.1 cores, 35 MB |
+| 34 groups, 102 players | 0.38 / 0.91 ms | 0.31 / 0.84 ms | 6.5 ms | 0.23 cores, 13 MB |
+| 167 groups, 501 players | 0.67 / 2.6 ms | 0.56 / 2.4 ms | 1.1 ms | 1.0 cores, 29 MB |
+| 334 groups, 1,002 players | 1.1 / 38 ms | 0.87 / 30 ms | 58 ms | 2.3 cores, 50 MB |
 
-Everything reliable arrived, exactly once (save what was still in flight when the run stopped); so did the voice and positions. At 100 groups the machine is saturated: the load generator itself uses five to six of its cores. That forwarding is about 70,000 frames a second in and 335,000 out.
+Everything reliable arrived, exactly once (save what was still in flight when the run stopped); so did the voice and positions, and every snapshot. At 334 groups the machine is saturated, the load generator running on it too; that forwarding is about 55,000 frames a second in and 107,000 out.
 
 Real networks, emulated per player: each player behind its own access link of the given rate and one-way delay, with a deep buffer like real home and mobile links (`--shape`), three players and a newcomer loading 2 MB:
 
@@ -222,7 +222,7 @@ Browser voice (headless Chromium, 20 ms Opus frames, through the relay):
 | Through a link adding 0–60 ms of jitter each way | p50 110–140 ms; the jitter buffer adapts to about 120 ms; nothing lost |
 | After a 1 s stall | back to p50 50–70 ms within 2 s (frames dropped to catch up, not played late) |
 
-Lossy networks, with the Linux kernel dropping packets (`tc netem` on loopback in a 2-core arm64 VM: 20 ms and the given loss on each hop, so 40 ms from player to player; two groups of ten with the game load above; WebSocket against QUIC through the same relay):
+Lossy networks, with the Linux kernel dropping packets (`tc netem` on loopback in a 2-core arm64 VM: 20 ms and the given loss on each hop, so 40 ms from player to player; two groups of ten with the game load above, measured before groups were limited to four, so more traffic per player than a group now carries; WebSocket against QUIC through the same relay):
 
 | Loss per hop | | Voice p50 / p99 / p99.9 / max | Commands p99 / max | Voice arrived |
 |---|---|---|---|---|
@@ -305,7 +305,7 @@ What is covered:
 - **Flow control.** Regression tests send 16 MiB both ways at once, echo from inside the event loop, starve a sender with a peer that stops reading, and (opt-in, 80 s) trickle 16 MiB to a slow reader.
 - **End-to-end suite.** The same tests pass against the Linux relay and against the Cloudflare Worker running in local `workerd`, including a long idle test that confirms Durable Object hibernation and recovery.
 - **JavaScript SDK.** Tested in Node 22, Deno 2.7, Bun 1.4 and headless Chrome 155, against both relays, and talking to the Rust client.
-- **Groups.** A deterministic simulation (`crates/peerconnect/tests/group.rs`) runs up to ten members through admission, reconnection, backlogs resent in bursts, messages beyond what a sender keeps, replacement, a full group, voice floods, state transfer while commands flow (also from a member that is behind), a failed transfer, a relay that loses the end of a stream, and a relay replaying an earlier session. End-to-end tests (`crates/peerconnect-relay/tests/group_e2e.rs`) pass against both relays: ten members talking, a relay restart, a 4 MiB state transfer, the relay's wire behaviour, a member that stops reading, and commands overtaking a backlog of chat. The C library is driven through its C functions against a real relay, and its header compiled from C. Every kind of group frame is in the test vectors (`test-vectors/g1.json`), produced by the implementation and reproduced by an independent one written from GROUP.md (`verify-groups.mjs`). Line coverage of the group code by these tests: the member state machine 97%, the relay 99%, the Tokio driver 97%, the C library 92% (`cargo llvm-cov`). The [game load test](crates/peerconnect-relay/examples/game_load.rs) runs up to a thousand players over real sockets, optionally behind emulated access links.
+- **Groups.** A deterministic simulation (`crates/peerconnect/tests/group.rs`) runs groups up to the limit of four members through admission, reconnection, backlogs resent in bursts, messages beyond what a sender keeps, replacement, a full group, voice floods, state transfer while commands flow (also from a member that is behind), a failed transfer, a relay that loses the end of a stream, and a relay replaying an earlier session. End-to-end tests (`crates/peerconnect-relay/tests/group_e2e.rs`) pass against both relays: a full group of four talking, a relay restart, a 4 MiB state transfer, the relay's wire behaviour, a member that stops reading, and commands overtaking a backlog of chat. The C library is driven through its C functions against a real relay, and its header compiled from C. Every kind of group frame is in the test vectors (`test-vectors/g1.json`), produced by the implementation and reproduced by an independent one written from GROUP.md (`verify-groups.mjs`). Line coverage of the group code by these tests: the member state machine 97%, the relay 99%, the Tokio driver 97%, the C library 92% (`cargo llvm-cov`). The [game load test](crates/peerconnect-relay/examples/game_load.rs) runs up to a thousand players over real sockets, optionally behind emulated access links.
 - **Video.** Unit tests of fragmenting, reassembly, resending and keyframe requests; members over a relay that drops 8% of the video in the simulation (whole frames, in order, only decodable ones, also in the QUIC mode); real sockets over WebSocket, QUIC and lossy QUIC; the C library; and in headless Chromium with WebCodecs over WebSocket, WebTransport and lossy paths. Every video frame kind is in the test vectors.
 - **QUIC.** The group end-to-end suite runs again with every member on QUIC, checking that each is (and did not fall back). `group_quic.rs` speaks the relay protocol by hand over raw QUIC and WebTransport (every class, datagrams, voice too big for a datagram, full groups, replacement across transports, refused paths and streams, the join timeout), runs members on raw QUIC, WebTransport and WebSocket in one group, through a path losing 5% of packets each way, through a change of address (no reconnection), and with UDP refused or silently dropped (fallback within the head start), and serves `wss://` and WebTransport from one certificate. The simulation runs every group test as over QUIC too, over hundreds of seeds: classes overtaking each other at random, voice out of order, frames from a replaced connection still arriving. In headless Chromium, browsers join over WebTransport (certificate pinned by hash) with a Rust member on raw QUIC, and fall back to `wss://` when UDP is closed or the certificate is not trusted.
 

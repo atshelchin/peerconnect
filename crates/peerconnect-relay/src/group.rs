@@ -1,4 +1,4 @@
-//! Groups (GROUP.md §3): up to 32 slots per group, frames fanned out by
+//! Groups (GROUP.md §3): up to 4 slots per group, frames fanned out by
 //! class.
 //!
 //! Each connection has an outbox of four queues, one per class, which its

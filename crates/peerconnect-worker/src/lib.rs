@@ -8,7 +8,7 @@
 //! Nothing is ever written to storage.
 //!
 //! Groups (`/g1/<id>`, GROUP.md) get a Durable Object of their own class,
-//! [`Group`], which works the same way with up to 32 slots. The runtime
+//! [`Group`], which works the same way with up to 4 members. The runtime
 //! sends each frame as it is forwarded and does not report what is still
 //! buffered, so this relay cannot drop late voice or put commands first:
 //! for voice at scale, prefer the Linux relay.
@@ -346,8 +346,8 @@ extern "C" {
     fn auto_response_timestamp(this: &Hibernation, ws: &web_sys::WebSocket) -> Option<js_sys::Date>;
 }
 
-/// Members per group.
-const MAX_GROUP_MEMBERS: usize = 10;
+/// Members per group: as many as there are slots (GROUP.md §3.2).
+const MAX_GROUP_MEMBERS: usize = gwire::MAX_SLOTS;
 
 /// A group socket's attachment.
 #[derive(Serialize, Deserialize)]

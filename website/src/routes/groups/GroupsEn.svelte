@@ -34,9 +34,9 @@
 
 <h1>Groups</h1>
 <p class="lead">
-	A room joins exactly two peers. A group joins up to 32: a squad in a game, the players of a shared
-	world, a team. Members send each other commands, chat, voice and state, end-to-end encrypted,
-	through the same untrusted, stateless relays.
+	A room joins exactly two peers. A group joins up to four: a squad in a game, the players of a
+	shared world, a small team. Members send each other commands, chat, voice and state, end-to-end
+	encrypted, through the same untrusted, stateless relays.
 </p>
 
 <p class="try"><a href="/demo/voice">Try it: a group voice and video chat in your browser →</a></p>
@@ -81,9 +81,8 @@
 	</dd>
 	<dt>Slot</dt>
 	<dd>
-		The number, 0–31, that the relay gives a connection while it is in the group. The relay tells
-		every member who is present. A group has 32 slots; the reference relays admit 10 members by
-		default.
+		The number, 0–3, that the relay gives a connection while it is in the group. The relay tells
+		every member who is present. A group has 4 slots, so at most four members.
 	</dd>
 </dl>
 
@@ -484,8 +483,9 @@
 <h2 id="relays">Relays</h2>
 <p>
 	The Linux relay, its Docker image and the Cloudflare Worker serve groups next to rooms, with
-	nothing extra to set up (see <a href="/docs#relay">Run a relay</a>). They admit 10 members per
-	group; on the Linux relay, <code>PEERCONNECT_MAX_GROUP_MEMBERS</code> sets the limit, up to 32.
+	nothing extra to set up (see <a href="/docs#relay">Run a relay</a>). They admit four members per
+	group, the protocol’s limit; on the Linux relay, <code>PEERCONNECT_MAX_GROUP_MEMBERS</code> can lower
+	it.
 </p>
 <p>
 	The Linux relay keeps a queue per class for every recipient. It drops voice for a recipient that
@@ -625,9 +625,7 @@
 		<thead><tr><th>What</th><th>Limit</th></tr></thead>
 		<tbody>
 			<tr
-				><td>Members per group</td><td
-					>32 slots; the reference relays admit 10 by default, and turn away more with close code
-					4429</td
+				><td>Members per group</td><td>4 (4 slots); relays turn away more with close code 4429</td
 				></tr
 			>
 			<tr><td>Command or chat message</td><td>16,352 bytes</td></tr>

@@ -155,7 +155,7 @@ export class Connection extends EventTarget {
   }
 }
 
-// Groups (GROUP.md): up to 32 members, commands, chat, voice and state transfer.
+// Groups (GROUP.md): up to four members, commands, chat, voice and state transfer.
 
 /** Bytes unsent on the socket beyond which voice frames are dropped. */
 const VOICE_BACKLOG = 4 << 10;

@@ -6,7 +6,8 @@
 //! - `PEERCONNECT_MAX_CONNECTIONS` — concurrent WebSockets (default 10000)
 //! - `PEERCONNECT_MAX_PER_ADDRESS` — concurrent WebSockets per client
 //!   address, IPv6 counted per /64 (default 256)
-//! - `PEERCONNECT_MAX_GROUP_MEMBERS` — members per group, up to 32 (default 10)
+//! - `PEERCONNECT_MAX_GROUP_MEMBERS` — members per group, 1 to 4 (default 4,
+//!   the protocol's limit)
 //! - `PEERCONNECT_TRUST_PROXY=1` — take the client address from the last
 //!   `X-Forwarded-For` entry (only behind a proxy that sets it)
 //! - `PEERCONNECT_QUIC_LISTEN` — UDP address for groups over QUIC (default:
@@ -51,6 +52,11 @@ async fn main() -> ExitCode {
                 }
             }
         }
+    }
+    let slots = peerconnect::group::wire::MAX_SLOTS;
+    if !(1..=slots).contains(&config.max_group_members) {
+        eprintln!("PEERCONNECT_MAX_GROUP_MEMBERS must be 1 to {slots} (GROUP.md §3.2), got {}", config.max_group_members);
+        return ExitCode::FAILURE;
     }
     config.trust_proxy = env::var("PEERCONNECT_TRUST_PROXY").is_ok_and(|v| v == "1" || v == "true");
     let set = |name| env::var_os(name).filter(|v| !v.is_empty());

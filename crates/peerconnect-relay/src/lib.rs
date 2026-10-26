@@ -71,7 +71,8 @@ pub struct Config {
     /// Bytes queued towards one connection before its partner is held back.
     /// Worst-case buffer memory is about `max_connections × queue_bytes`.
     pub queue_bytes: usize,
-    /// Members per group, at most 32; more are refused with close code 4429.
+    /// Members per group, at most 4 (the protocol's limit, GROUP.md §3.2);
+    /// more are refused with close code 4429.
     pub max_group_members: usize,
     /// Reliable bytes queued towards one group connection beyond which it
     /// is not keeping up and is closed.
@@ -99,7 +100,7 @@ impl Default for Config {
             max_per_address: 256,
             trust_proxy: false,
             queue_bytes: 256 << 10,
-            max_group_members: 10,
+            max_group_members: peerconnect::group::wire::MAX_SLOTS,
             group_queue_bytes: 2 << 20,
             voice_queue_bytes: 8 << 10,
             video_queue_bytes: 64 << 10,

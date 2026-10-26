@@ -33,7 +33,7 @@
 
 <SpecDocument html={data.html} toc={data.toc} tocLabel={t.docs.toc}>
 	<p class="next">
-		Groups of up to 32 members have their own protocol: <a href="/spec/groups"
+		Groups of up to four members have their own protocol: <a href="/spec/groups"
 			>PeerConnect Groups, version 1</a
 		>. For how to use them, see the <a href="/groups">groups guide</a>.
 	</p>

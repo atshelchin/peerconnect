@@ -182,10 +182,9 @@
 
 <h2 id="groups">群组</h2>
 <p>
-	房间只供两个端使用。需要更多成员时——游戏小队、共享世界、团队——请使用<strong>群组</strong>：最多 32
-	名成员（中继默认允许 10 名），每个成员以一个 Ed25519
-	身份相互识别，指令、聊天、语音和状态同步互不干扰。群组就在同一个 JavaScript 包和 Rust crate
-	里，另有供游戏引擎使用的 C 库，并且由同一套中继提供服务。
+	房间只供两个端使用。需要更多成员时——游戏小队、共享世界、团队——请使用<strong>群组</strong>：最多 4
+	名成员，每个成员以一个 Ed25519 身份相互识别，指令、聊天、语音和状态同步互不干扰。群组就在同一个
+	JavaScript 包和 Rust crate 里，另有供游戏引擎使用的 C 库，并且由同一套中继提供服务。
 </p>
 <p><a href="/zh/groups">阅读群组指南 →</a></p>
 
@@ -230,8 +229,8 @@
 				></tr
 			>
 			<tr
-				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>10</code></td><td
-					>每个群组的成员数，最多 32。</td
+				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>4</code></td><td
+					>每个群组的成员数，1 到 4（4 是协议的上限）。</td
 				></tr
 			>
 			<tr
