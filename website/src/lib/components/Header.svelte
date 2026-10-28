@@ -14,13 +14,9 @@
 	const switchTo = $derived(localize(ENGLISH_ONLY.includes(i18n.path) ? '/' : i18n.path, other));
 	const links = $derived([
 		{ path: '/docs', href: i18n.href('/docs'), label: t.nav.docs },
-		{ path: '/groups', href: i18n.href('/groups'), label: t.nav.groups },
 		{ path: '/demo', href: i18n.href('/demo'), label: t.nav.demo },
 		{ path: '/spec', href: '/spec', label: t.nav.spec }
 	]);
-
-	// `/spec/groups` is part of the specification.
-	const current = (path: string) => i18n.path === path || i18n.path.startsWith(`${path}/`);
 
 	afterNavigate(() => {
 		if (menu) menu.open = false;
@@ -30,7 +26,7 @@
 {#snippet items()}
 	{#each links as link (link.path)}
 		<li>
-			<a href={link.href} aria-current={current(link.path) ? 'page' : undefined}>
+			<a href={link.href} aria-current={i18n.path === link.path ? 'page' : undefined}>
 				{link.label}
 			</a>
 		</li>

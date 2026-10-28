@@ -15,30 +15,15 @@ export const en = {
 			description:
 				'Build with PeerConnect in JavaScript or Rust, and run your own relay on Cloudflare Workers, Docker or a single binary.'
 		},
-		groups: {
-			title: 'Groups: multiplayer, voice and state sync — PeerConnect',
-			description:
-				'End-to-end encrypted groups of up to four: commands, chat, voice, video and state sync over QUIC, through an untrusted relay. For games and teams: JavaScript, Rust and C.'
-		},
 		demo: {
 			title: 'Live demo: pair two browsers — PeerConnect',
 			description:
 				'Pair two browsers with a QR code and chat end-to-end encrypted through a public PeerConnect relay. Runs the real protocol in WebAssembly.'
 		},
-		voice: {
-			title: 'Live demo: group voice and video chat — PeerConnect',
-			description:
-				'Talk and see each other, up to four people, end-to-end encrypted, through a public PeerConnect relay: Opus voice, VP8 video and text chat. Open it on two devices.'
-		},
 		spec: {
 			title: 'Protocol specification v1 — PeerConnect',
 			description:
 				'The PeerConnect v1 specification: rooms and invites, stateless relay admission, the Noise IKpsk1 handshake, the reliable stream and its security considerations.'
-		},
-		specGroups: {
-			title: 'Groups specification v1 — PeerConnect',
-			description:
-				'The PeerConnect Groups v1 specification: group secrets and identities, slot admission, sender keys, four traffic classes, reliable streams and state transfer.'
 		},
 		notFound: {
 			title: 'Page not found — PeerConnect',
@@ -48,7 +33,6 @@ export const en = {
 	nav: {
 		home: 'Home',
 		docs: 'Docs',
-		groups: 'Groups',
 		demo: 'Demo',
 		spec: 'Spec',
 		github: 'GitHub',
@@ -166,7 +150,7 @@ export const en = {
 				},
 				{
 					title: 'Single binary',
-					text: 'One command: <code>cargo install peerconnect-relay</code>. Five environment variables, connection limits per client address included.'
+					text: 'One command: <code>cargo install peerconnect-relay</code>. Four environment variables, connection limits per client address included.'
 				}
 			],
 			public:
@@ -214,32 +198,6 @@ export const en = {
 				}
 			]
 		},
-		groups: {
-			eyebrow: 'Groups',
-			title: 'More than two? Make it a group.',
-			intro:
-				'Squads, shared worlds, teams: up to four members in one end-to-end encrypted group, over QUIC through the Linux relay. Built for games, where a command must never wait behind a chat message, nor voice behind a lost packet.',
-			items: [
-				{
-					title: 'Members are keys',
-					text: 'Each member is an Ed25519 identity that the app keeps, one per player say. The others see it, proven, so the app decides who owns what and who is only visiting.'
-				},
-				{
-					title: 'Five classes of traffic',
-					text: 'Commands, voice, chat, video and bulk, most urgent first, each with its own queue at the sender and in the relay, and its own QUIC stream. A chat flood or a snapshot never holds up a command.'
-				},
-				{
-					title: 'Newcomers catch up exactly',
-					text: 'A member sends a snapshot of the app’s state, marked with the commands it contains. The newcomer gets the snapshot, then every later command, none twice.'
-				},
-				{
-					title: 'Voice, in browsers and engines',
-					text: 'Opus over WebCodecs with an adaptive jitter buffer, sent only while you speak. Rust and a C library for Unity, Unreal and Godot use the same frame format.'
-				}
-			],
-			guide: 'Read the groups guide',
-			spec: 'Groups specification'
-		},
 		faq: {
 			eyebrow: 'FAQ',
 			title: 'Questions',
@@ -265,10 +223,6 @@ export const en = {
 					a: 'Nothing you need to handle. Rooms are not stored on the relay: peers reconnect, authenticate again and resume the stream without losing or duplicating a message.'
 				},
 				{
-					q: 'Can more than two apps share a room?',
-					a: 'A room is for exactly two. For more, use a group: up to four members, with commands, chat, voice, video and state transfer, over QUIC through the Linux relay. The groups guide explains how.'
-				},
-				{
 					q: 'Is it ready for production?',
 					a: 'Not yet. The protocol is a v1 draft, extensively tested but not externally audited, and the wire format may still change. It is ready for prototypes and feedback.'
 				}
@@ -285,141 +239,12 @@ export const en = {
 		copy: 'Copy',
 		copied: 'Copied'
 	},
-	voice: {
-		eyebrow: 'Live demo',
-		title: 'Group voice and video chat',
-		lead: 'Talk with up to four people at once, and turn the camera on to see each other, end-to-end encrypted. Create a room, send the link to a friend or open it on your phone, and speak.',
-		steps: [
-			'Create a room, and share the link.',
-			'Everyone who opens it enters a name, checks their microphone, camera and speakers if they like, and joins.',
-			'Turn your microphone on from your card and speak, and your camera if you like. Use headphones if you are in the same room, or the microphones hear each other.'
-		],
-		note: 'The real thing: the Rust core in WebAssembly, Opus and VP8 through WebCodecs, an adaptive jitter buffer per speaker, video put back together whole from its fragments, all through the public relay <code>{relay}</code> over WebTransport (QUIC), where a lost packet holds up only itself and voice and video wait for nothing; the relay sees only ciphertext. The room key is in the link after <code>#</code>, which browsers never send to a server.',
-		noscript: 'The demo needs JavaScript and WebAssembly.',
-		loading: 'Loading…',
-		start: {
-			title: 'Start a voice room',
-			text: 'You get a link to share. Anyone with it can join, up to four at a time, so share it privately.',
-			create: 'Create a room'
-		},
-		join: {
-			title: 'Join the room',
-			name: 'Your name',
-			namePlaceholder: 'e.g. Alice',
-			button: 'Join',
-			starting: 'Joining…',
-			hint: 'Your microphone and camera stay off until you turn them on. Nothing is recorded or stored.'
-		},
-		devices: {
-			title: 'Check your devices (optional)',
-			hint: 'Try them before you join: nothing here is sent to anyone.',
-			mic: 'Microphone',
-			camera: 'Camera',
-			speakers: 'Speakers',
-			default: 'Default',
-			device: 'Device',
-			testMic: 'Test',
-			testCamera: 'Test',
-			testSpeakers: 'Play a sound',
-			stop: 'Stop',
-			level: 'Microphone level',
-			micOnJoin: 'Microphone on when I join',
-			cameraOnJoin: 'Camera on when I join'
-		},
-		problems: {
-			mic: 'The microphone is not available (permission denied, or none found). You can still listen and chat.',
-			camera: 'The camera is not available (permission denied, or none found).',
-			codecs:
-				'This browser cannot encode Opus audio (WebCodecs). Text chat works; for voice, use a recent Chrome, Edge or Firefox.',
-			webtransport:
-				'This browser has no WebTransport, so it cannot join. Use a recent Chrome, Edge or Firefox.',
-			unreachable:
-				'The relay cannot be reached. Rooms travel over UDP (QUIC) only, which browsers cannot use through a proxy: if you use one (a system proxy, Clash and the like), add {host} to its exceptions. Or the network blocks UDP. The page keeps trying.',
-			full: 'The room is full (four people). The page keeps trying.',
-			replaced: 'This room was opened with the same identity elsewhere.',
-			link: 'That link is not a valid room link.',
-			failed: 'The demo could not start in this browser.'
-		},
-		state: {
-			offline: 'Connecting…',
-			online: 'Connected · end-to-end encrypted',
-			closed: 'Left'
-		},
-		room: {
-			people: 'In the room',
-			you: 'you',
-			alone: 'Nobody else is here yet. Share the link.',
-			leave: 'Leave',
-			micOn: 'Turn your microphone off',
-			micOff: 'Turn your microphone on: everyone hears you',
-			hearOn: 'Turn your headphones off: you hear nobody',
-			hearOff: 'Hear everyone again',
-			muteThem: 'Stop hearing {name} (only for you)',
-			unmuteThem: 'Hear {name} again',
-			theirMicOff: '{name} muted their microphone',
-			theirHearingOff: '{name} turned their headphones off and hears nobody',
-			cameraOn: 'Turn your camera off',
-			cameraOff: 'Turn your camera on: everyone sees you',
-			video: 'Video from {name}',
-			shareOff: 'Share your screen',
-			shareOn: 'Stop sharing your screen',
-			screenOf: '{name}’s screen',
-			screenVideo: 'Screen shared by {name}',
-			sharing: 'You are sharing your screen',
-			stopSharing: 'Stop',
-			dataSaver: 'Data saver: receive video at 360p at most',
-			layout: 'Layout',
-			gallery: 'Gallery',
-			speakerView: 'Speaker',
-			pin: 'Show {name} large',
-			unpin: 'Back to everyone',
-			whole: 'Watch {name} on the whole screen',
-			exitWhole: 'Leave the whole screen',
-			chat: 'Chat',
-			closeChat: 'Close the chat',
-			controls: 'Meeting controls',
-			short: {
-				mute: 'Mute',
-				unmute: 'Unmute',
-				startVideo: 'Start video',
-				stopVideo: 'Stop video',
-				share: 'Share',
-				stopShare: 'Stop share',
-				dataSaver: 'Data saver',
-				sound: 'Sound',
-				chat: 'Chat',
-				invite: 'Invite'
-			},
-			switchCamera: 'Switch camera (front and back)',
-			rotateMine: 'Turn your picture a quarter turn, for everyone',
-			rotateTheirs: 'Turn {name}’s picture a quarter turn (only for you)',
-			network: {
-				good: 'Network: good',
-				fair: 'Network: fair',
-				poor: 'Network: poor'
-			},
-			videoPaused: 'Your connection is slow: video is paused, voice continues.'
-		},
-		invite: {
-			title: 'Invite',
-			copy: 'Copy link',
-			copied: 'Copied'
-		},
-		chat: {
-			title: 'Chat',
-			placeholder: 'Write a message',
-			send: 'Send',
-			empty: 'No messages yet.'
-		},
-		again: 'Start over'
-	},
 	demo: {
 		eyebrow: 'Live demo',
 		title: 'Pair two browsers',
 		lead: 'Open this page on your phone and your laptop — or in two browser windows — connect them with a QR code, and chat end-to-end encrypted.',
 		note: 'This is the real protocol: the Rust core compiled to WebAssembly, talking through the public relay <code>{relay}</code>. Each browser tab is its own peer, and reloading the tab keeps your room.',
 		noscript: 'The demo needs JavaScript and WebAssembly.',
-		voiceLink: 'More than two? Try the group voice and video chat demo →',
 		steps: [
 			'Create a room on one device.',
 			'Scan the QR code with the other, or open the link there.',
@@ -503,7 +328,6 @@ export const en = {
 		project: 'Project',
 		resources: 'Resources',
 		publicRelay: 'Public relay',
-		groupSpec: 'Groups specification',
 		status: 'Spec v1 · draft'
 	}
 };

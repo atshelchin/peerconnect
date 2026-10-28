@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { en } from './en';
-import { ENGLISH_ONLY, LANGS, dict, langOf, localize, unlocalize } from './index';
+import { LANGS, dict, langOf, localize, unlocalize } from './index';
 import { zh } from './zh';
 
 describe('language routing', () => {
@@ -13,7 +13,7 @@ describe('language routing', () => {
 	});
 
 	it('maps paths to and from each language', () => {
-		for (const path of ['/', '/docs', '/groups', '/demo', '/demo/voice', '/spec/groups']) {
+		for (const path of ['/', '/docs', '/demo']) {
 			for (const lang of LANGS) {
 				const localized = localize(path, lang);
 				expect(langOf(localized)).toBe(lang);
@@ -22,12 +22,6 @@ describe('language routing', () => {
 		}
 		expect(localize('/', 'zh')).toBe('/zh');
 		expect(localize('/docs', 'zh')).toBe('/zh/docs');
-		expect(localize('/groups', 'zh')).toBe('/zh/groups');
-		expect(unlocalize('/zh/groups')).toBe('/groups');
-	});
-
-	it('keeps the specifications in English only', () => {
-		expect(ENGLISH_ONLY).toEqual(['/spec', '/spec/groups']);
 	});
 });
 

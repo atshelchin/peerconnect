@@ -91,6 +91,6 @@ jobs:
           docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
       - name: Test the published image
         run: |
-          docker run -d -p 8080:8080 -p 8080:8080/udp "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
+          docker run -d -p 8080:8080 "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/healthz && exit 0; sleep 1; done
           exit 1

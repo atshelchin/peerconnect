@@ -234,29 +234,7 @@
 	</div>
 </section>
 
-<section class="section" id="groups">
-	<div class="container">
-		<div class="section-head">
-			<span class="eyebrow">{h.groups.eyebrow}</span>
-			<h2>{h.groups.title}</h2>
-			<p>{h.groups.intro}</p>
-		</div>
-		<div class="group-cards">
-			{#each h.groups.items as item (item.title)}
-				<article class="card group-card">
-					<h3>{item.title}</h3>
-					<p>{item.text}</p>
-				</article>
-			{/each}
-		</div>
-		<div class="group-actions">
-			<a class="button primary" href={i18n.href('/groups')}>{h.groups.guide}</a>
-			<a class="button secondary" href="/spec/groups">{h.groups.spec}</a>
-		</div>
-	</div>
-</section>
-
-<section class="section alt" id="faq">
+<section class="section" id="faq">
 	<div class="container split">
 		<div class="section-head">
 			<span class="eyebrow">{h.faq.eyebrow}</span>
@@ -387,7 +365,6 @@
 	.feature p,
 	.step p,
 	.relay-card p,
-	.group-card p,
 	.use p {
 		color: var(--muted);
 		font-size: 0.97rem;
@@ -486,26 +463,6 @@
 		border: 1px dashed var(--line-strong);
 		border-radius: var(--radius);
 		color: var(--ink-2);
-	}
-
-	.group-cards {
-		display: grid;
-		grid-template-columns: repeat(4, 1fr);
-		gap: 20px;
-	}
-
-	.group-card {
-		display: grid;
-		align-content: start;
-		gap: 10px;
-		padding: 24px;
-	}
-
-	.group-actions {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 12px;
-		margin-top: 28px;
 	}
 
 	.ledger {
@@ -675,8 +632,7 @@
 		}
 
 		.steps,
-		.uses,
-		.group-cards {
+		.uses {
 			grid-template-columns: repeat(2, 1fr);
 			row-gap: 32px;
 		}
@@ -698,7 +654,6 @@
 		.features,
 		.steps,
 		.uses,
-		.group-cards,
 		.ledger {
 			grid-template-columns: 1fr;
 		}

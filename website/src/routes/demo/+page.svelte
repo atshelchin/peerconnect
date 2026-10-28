@@ -46,7 +46,6 @@
 	<Demo />
 
 	<p class="note">{@html t.demo.note.replace('{relay}', RELAY_URL)}</p>
-	<p class="note"><a href={i18n.href('/demo/voice')}>{t.demo.voiceLink}</a></p>
 </section>
 
 <style>

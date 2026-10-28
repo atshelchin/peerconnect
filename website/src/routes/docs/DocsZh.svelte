@@ -4,7 +4,6 @@
 		{ id: 'install', label: '安装' },
 		{ id: 'javascript', label: 'JavaScript' },
 		{ id: 'rust', label: 'Rust' },
-		{ id: 'groups', label: '群组' },
 		{ id: 'relay', label: '运行中继' },
 		{ id: 'limits', label: '限制参数' },
 		{ id: 'security', label: '安全清单' },
@@ -14,7 +13,7 @@
 
 <script lang="ts">
 	import CodeBlock from '#lib/components/CodeBlock.svelte';
-	import { GROUP_RELAY_URL, RELAY_URL, REPO_URL } from '#lib/site.ts';
+	import { RELAY_URL, REPO_URL } from '#lib/site.ts';
 	import {
 		binary,
 		installJs,
@@ -180,37 +179,23 @@
 	<code>… -- join '&lt;invite&gt;' room-b</code>。
 </p>
 
-<h2 id="groups">群组</h2>
-<p>
-	房间只供两个端使用。需要更多成员时——游戏小队、共享世界、团队——请使用<strong>群组</strong>：最多 4
-	名成员，每个成员以一个 Ed25519
-	身份相互识别，指令、聊天、语音、视频和状态同步互不干扰。群组就在同一个 JavaScript 包和 Rust crate
-	里，另有供游戏引擎使用的 C 库。群组只走 QUIC（浏览器里是 WebTransport），所以需要放行了 UDP 端口的
-	Linux 中继，成员也必须能经 UDP 连到它（见<a href="/zh/groups#who-can-join">哪些成员加入不了</a
-	>）。
-</p>
-<p><a href="/zh/groups">阅读群组指南 →</a></p>
-
 <h2 id="relay">运行中继</h2>
 <p>
-	中继在房间的两个席位之间转发帧，不存储任何东西。它会检查每个连接是否持有房间密钥，但自己并不知道这个密钥，因此不需要账号，也不需要任何配置。Linux
-	中继（Docker 或二进制文件）还在 UDP 端口上经 QUIC 提供<a href="/zh/groups">群组</a>；Cloudflare
-	Worker 只提供房间。公共中继可供任何人测试使用：房间用 <code>{RELAY_URL}</code>，群组用
-	<code>{GROUP_RELAY_URL}</code>；其他场景请运行你自己的中继。
+	中继在房间的两个席位之间转发帧，不存储任何东西。它会检查每个连接是否持有房间密钥，但自己并不知道这个密钥，因此不需要账号，也不需要任何配置。公共中继
+	<code>{RELAY_URL}</code> 可供任何人测试使用；其他场景请运行你自己的中继。
 </p>
 <h3 id="cloudflare">Cloudflare Workers</h3>
 <p>
 	每个房间 ID 对应一个独立的 Durable Object，并使用 WebSocket Hibernation
 	API：空闲房间零成本，出问题的房间也只会耗尽它自己。在 Cloudflare 控制台添加自定义域名后，即可通过 <code
 		>wss://relay.你的域名</code
-	> 访问。它只提供房间：Workers 无法接受 QUIC，而群组需要 QUIC。
+	> 访问。
 </p>
 <CodeBlock code={cloudflare('zh')} lang="sh" title="shell" />
 <h3 id="docker">Docker</h3>
 <p>
 	镜像里只有一个静态二进制文件。可以放在任意终止 TLS 的反向代理之后，或使用自带的 Compose
-	文件，它会加上 Caddy 自动启用 HTTPS。除了 TCP 端口，还要映射 UDP 端口：房间走 TCP，群组走 UDP 上的
-	QUIC。使用 Compose 文件时，请放行 TCP 80 和 443，以及 UDP 443。
+	文件，它会加上 Caddy 自动启用 HTTPS。
 </p>
 <CodeBlock code={docker('zh')} lang="sh" title="shell" />
 <h3 id="binary">二进制文件</h3>
@@ -235,50 +220,22 @@
 				></tr
 			>
 			<tr
-				><td><code>PEERCONNECT_MAX_GROUP_MEMBERS</code></td><td><code>4</code></td><td
-					>每个群组的成员数，1 到 4（4 是协议的上限）。</td
-				></tr
-			>
-			<tr
 				><td><code>PEERCONNECT_TRUST_PROXY</code></td><td>关闭</td><td
 					>如果前面的反向代理会把客户端地址追加到 <code>X-Forwarded-For</code>，设为
 					<code>1</code>。</td
-				></tr
-			>
-			<tr
-				><td><code>PEERCONNECT_QUIC_LISTEN</code></td><td>同 <code>PEERCONNECT_LISTEN</code></td><td
-					>群组走 QUIC 的 UDP 地址；设为 <code>off</code> 即关闭群组。</td
-				></tr
-			>
-			<tr
-				><td><code>PEERCONNECT_TLS_CERT</code>、<code>PEERCONNECT_TLS_KEY</code></td><td>无</td><td
-					>PEM 证书链和私钥，文件变化时会重新读取：用于 TCP 端口上的 <code>wss://</code>，以及
-					<code>https://</code> 群组中继地址的 WebTransport。不设置时，群组使用 <code>quic://</code>
-					地址和每周证书。</td
 				></tr
 			>
 		</tbody>
 	</table>
 </div>
 <p>所有中继都会响应 <code>GET /healthz</code>，用于健康检查。</p>
-<h3 id="relay-groups">提供群组</h3>
-<p>
-	群组没有 WebSocket 传输，所以中继的 UDP 端口必须放行，防火墙和 Docker
-	里都要。有域名和证书时，邀请使用
-	<code>https://relay.example.com</code>（UDP 443）；两者都没有时，使用
-	<code>quic://203.0.113.9:8080</code>，端口随意。放在 Cloudflare 后面的域名不能开启代理：Cloudflare
-	的代理不转发 QUIC。中继地址的写法见<a href="/zh/groups#relays">群组指南</a>{#if REPO_URL}；<a
-			href="{REPO_URL}/blob/main/deploy/README.md"
-			rel="external">部署指南</a
-		>（英文）为每种情况都给出了配置：Caddy、certbot、systemd，以及没有域名的情形{/if}。
-</p>
 
 <h2 id="limits">限制参数</h2>
 <div class="table">
 	<table>
 		<thead><tr><th>项目</th><th>上限</th></tr></thead>
 		<tbody>
-			<tr><td>每个房间的端数</td><td>2（需要更多时请使用<a href="/zh/groups">群组</a>）</td></tr>
+			<tr><td>每个房间的端数</td><td>2</td></tr>
 			<tr><td>单条消息大小</td><td>16 MiB，以最大 64 KiB 的帧发送</td></tr>
 			<tr><td>在途未确认数据</td><td>4 MiB（单条更大的消息可以超出）</td></tr>
 			<tr
@@ -333,8 +290,4 @@
 		>设计经历了多轮对抗性评审，测试向量也由独立实现复现，但这些都不能代替外部的密码学审计。
 	</li>
 </ul>
-<p class="next">
-	完整的协议及其威胁模型见<a href="/spec">协议规范</a>（英文）；群组另有<a href="/spec/groups"
-		>单独的规范</a
-	>。
-</p>
+<p class="next">完整的协议及其威胁模型见<a href="/spec">协议规范</a>（英文）。</p>

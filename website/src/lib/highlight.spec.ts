@@ -19,15 +19,6 @@ describe('highlight', () => {
 		);
 	});
 
-	it('marks C', () => {
-		const html = highlight('pc_output out; /* x */ pc_member_poll(m, &out) != PC_NONE', 'c');
-		expect(html).toContain('<span class="tok-type">pc_output</span>');
-		expect(html).toContain('<span class="tok-comment">/* x */</span>');
-		expect(html).toContain('<span class="tok-fn">pc_member_poll</span>');
-		expect(html).toContain('<span class="tok-macro">PC_NONE</span>');
-		expect(html).toContain('&amp;out');
-	});
-
 	it('leaves text as it is, escaped', () => {
 		expect(highlight('a < b', 'text')).toBe('a &lt; b');
 	});

@@ -64,12 +64,8 @@ pub mod close {
     pub const UNAUTHORIZED: u16 = 4401;
     /// No `JOIN` within the join timeout, or idle for too long.
     pub const TIMEOUT: u16 = 4408;
-    /// A newer connection took this seat (or, in a group, this identity's slot).
+    /// A newer connection took this seat.
     pub const REPLACED: u16 = 4409;
-    /// The group is full on this relay.
-    pub const FULL: u16 = 4429;
-    /// Over raw QUIC: the request path names no group (HTTP 404 elsewhere).
-    pub const NOT_FOUND: u16 = 4404;
 }
 
 /// The two seats of a room.

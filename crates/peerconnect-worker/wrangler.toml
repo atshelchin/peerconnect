@@ -16,7 +16,8 @@ new_sqlite_classes = ["Room"]
 tag = "v2"
 new_sqlite_classes = ["Group"]
 
-# Groups moved to the Linux relay (QUIC only, GROUP.md §3.6).
+# v2 and v3 added and removed the Group object of the groups protocol (tag
+# groups-voice-video). They stay: Cloudflare keeps the migration history.
 [[migrations]]
 tag = "v3"
 deleted_classes = ["Group"]

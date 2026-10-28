@@ -21,18 +21,8 @@ function headingId(text: string): string {
 	return numbered ? `sec-${numbered[1].replace(/\./g, '-')}` : slug(text);
 }
 
-/** The repository's specifications that the site shows, and where. */
-export const DOCUMENTS: Record<string, string> = {
-	'SPEC.md': '/spec',
-	'GROUP.md': '/spec/groups'
-};
-
-const sectionId = (number: string) => `sec-${number.replace(/\./g, '-')}`;
-
-/** Renders a specification (SPEC.md, GROUP.md): anchors on headings, links for
- * `§n.n` references (`SPEC.md §n.n` into that page), links to the other
- * specifications on the site, and other repository-relative links pointed at
- * the repository (or dropped). */
+/** Renders SPEC.md: anchors on headings, links for `§n.n` references, and
+ * repository-relative links pointed at the repository (or dropped). */
 export function renderSpec(markdown: string): { html: string; toc: TocEntry[] } {
 	const toc: TocEntry[] = [];
 	const marked = new Marked({
@@ -51,11 +41,6 @@ export function renderSpec(markdown: string): { html: string; toc: TocEntry[] } 
 					const external = href.startsWith('#') ? '' : ' rel="external"';
 					return `<a href="${escapeHtml(href)}"${external}>${inner}</a>`;
 				}
-				// Another specification shown on the site.
-				const [file, hash] = href.split('#');
-				if (file in DOCUMENTS) {
-					return `<a href="${escapeHtml(DOCUMENTS[file] + (hash ? `#${hash}` : ''))}">${inner}</a>`;
-				}
 				// A file in the repository.
 				return REPO_URL
 					? `<a href="${escapeHtml(`${REPO_URL}/blob/main/${href}`)}" rel="external">${inner}</a>`
@@ -64,19 +49,13 @@ export function renderSpec(markdown: string): { html: string; toc: TocEntry[] } 
 		}
 	});
 	const body = marked.parse(markdown, { async: false });
-	// Section references: into this document ("§5.3"), into another one on the
-	// site ("SPEC.md §4.1"), but not into those elsewhere ("RFC 4648 §5").
+	// Section references, but not those into other documents ("RFC 4648 §5").
 	const html = body
 		.replace(/<table>/g, '<div class="table"><table>')
 		.replace(/<\/table>/g, '</table></div>')
 		.replace(
-			/(RFC \d{1,5} |([A-Z]+\.md) )?§(\d+(?:\.\d+)*)/g,
-			(match, prefix: string | undefined, file: string | undefined, number: string) => {
-				if (!prefix) return `<a href="#${sectionId(number)}">${match}</a>`;
-				if (file && file in DOCUMENTS)
-					return `<a href="${DOCUMENTS[file]}#${sectionId(number)}">${match}</a>`;
-				return match;
-			}
+			/(?<!RFC \d{1,5} )§(\d+(?:\.\d+)*)/g,
+			(match, number: string) => `<a href="#sec-${number.replace(/\./g, '-')}">${match}</a>`
 		);
 	return { html, toc };
 }

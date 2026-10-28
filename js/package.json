@@ -1,7 +1,7 @@
 {
   "name": "peerconnect",
   "version": "0.1.0",
-  "description": "PeerConnect: end-to-end encrypted rooms and groups (commands, chat, voice, video) over an untrusted relay, on WebSocket or WebTransport",
+  "description": "PeerConnect: two peers, one room, end-to-end encrypted over an untrusted WebSocket relay",
   "keywords": [
     "e2ee",
     "end-to-end encryption",
@@ -9,11 +9,7 @@
     "websocket",
     "relay",
     "pairing",
-    "webassembly",
-    "voice chat",
-    "multiplayer",
-    "video chat",
-    "webtransport"
+    "webassembly"
   ],
   "homepage": "https://peerconnect.dev",
   "repository": {
@@ -30,23 +26,11 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./index.js"
-    },
-    "./voice": {
-      "types": "./voice.d.ts",
-      "default": "./voice.js"
-    },
-    "./video": {
-      "types": "./video.d.ts",
-      "default": "./video.js"
     }
   },
   "files": [
     "index.js",
     "index.d.ts",
-    "voice.js",
-    "voice.d.ts",
-    "video.js",
-    "video.d.ts",
     "dist/",
     "LICENSE-MIT",
     "LICENSE-APACHE"
@@ -59,9 +43,7 @@
   },
   "scripts": {
     "build": "sh scripts/build.sh",
-    "test": "node --test test/*.test.js",
-    "prepack": "cp ../LICENSE-MIT ../LICENSE-APACHE . && test -f dist/module.js",
-    "test:voice": "node test/voice.browser.mjs",
-    "test:video": "node test/video.browser.mjs"
+    "test": "node --test",
+    "prepack": "cp ../LICENSE-MIT ../LICENSE-APACHE . && test -f dist/module.js"
   }
 }

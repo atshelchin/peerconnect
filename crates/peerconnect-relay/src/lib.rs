@@ -7,12 +7,6 @@
 //! memory, and one that accepts nothing for 30 s is disconnected rather than
 //! allowed to hold its partner hostage. The only shared state is the seat
 //! table, one small mutex per room.
-//!
-//! Groups (`/g1/<id>`) work differently, without backpressure: see [`group`].
-//! They can also be reached over QUIC, on a UDP socket ([`quic`]): raw QUIC
-//! for native members, and WebTransport for browsers, which needs a
-//! certificate they trust ([`Tls`]). With one, the TCP listener also
-//! accepts `wss://` next to plain `ws://`, told apart by their first byte.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -33,7 +27,6 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use peerconnect::RoomId;
 use peerconnect::relay::{self, Action, Conn};
 use peerconnect::wire::{self, Role, close};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
@@ -41,14 +34,6 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role as WsRole, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-
-mod group;
-pub mod quic;
-mod tls;
-mod traffic;
-
-pub use tls::Tls;
-pub use traffic::Budget;
 
 /// A connection that accepts nothing forwarded to it for this long is closed.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -73,99 +58,32 @@ pub struct Config {
     /// Bytes queued towards one connection before its partner is held back.
     /// Worst-case buffer memory is about `max_connections × queue_bytes`.
     pub queue_bytes: usize,
-    /// Members per group, at most 4 (the protocol's limit, GROUP.md §3.2);
-    /// more are refused with close code 4429.
-    pub max_group_members: usize,
-    /// Reliable bytes queued towards one group connection beyond which it
-    /// is not keeping up and is closed.
-    pub group_queue_bytes: usize,
-    /// Command and voice bytes queued towards a group connection beyond
-    /// which voice frames for it are dropped: bounds how late audio gets.
-    pub voice_queue_bytes: usize,
-    /// Video bytes queued towards a group connection beyond which its
-    /// oldest video is dropped: bounds how late video gets.
-    pub video_queue_bytes: usize,
-    /// What one group connection may send, in bytes per second, sustained
-    /// and in bursts. Beyond it voice is dropped and the rest delayed.
-    pub group_rate: usize,
-    pub group_burst: usize,
-    /// The certificate for `wss://` and WebTransport, reloaded when its
-    /// files change. Without it the relay serves plain `ws://`, and raw QUIC
-    /// with a certificate of its own making.
-    pub tls: Option<Tls>,
-    /// What the relay may send members of groups, a month and a second:
-    /// beyond it, everyone's video shrinks (voice and the rest never do).
-    pub budget: Budget,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config {
-            max_connections: 10_000,
-            max_per_address: 256,
-            trust_proxy: false,
-            queue_bytes: 256 << 10,
-            max_group_members: peerconnect::group::wire::MAX_SLOTS,
-            group_queue_bytes: 2 << 20,
-            voice_queue_bytes: 8 << 10,
-            video_queue_bytes: 1 << 20,
-            group_rate: 2 << 20,
-            group_burst: 4 << 20,
-            tls: None,
-            budget: Budget::default(),
-        }
+        Config { max_connections: 10_000, max_per_address: 256, trust_proxy: false, queue_bytes: 256 << 10 }
     }
 }
 
 /// Serves the relay on `listener` until `shutdown` completes, then closes
 /// every connection with 1001 (going away) and waits briefly for them.
-///
-/// Panics if [`Config::tls`] names files that do not hold a certificate;
-/// [`serve_all`] reports that instead.
 pub async fn serve(listener: TcpListener, config: Config, shutdown: impl Future<Output = ()>) {
-    if let Err(err) = serve_all(listener, None, config, shutdown).await {
-        panic!("{err}");
-    }
-}
-
-/// Like [`serve`], and serves groups over QUIC on `quic` too.
-pub async fn serve_all(
-    listener: TcpListener,
-    quic: Option<std::net::UdpSocket>,
-    config: Config,
-    shutdown: impl Future<Output = ()>,
-) -> Result<(), String> {
-    let certificate = tls::Certificate::new(config.tls.as_ref())?;
-    let acceptor = certificate
-        .is_configured()
-        .then(|| tokio_rustls::TlsAcceptor::from(Arc::new(certificate.server_config(&[b"http/1.1"], false))));
-    let endpoint = match quic {
-        Some(socket) => Some(quic::endpoint(socket, &certificate).map_err(|err| format!("cannot serve QUIC: {err}"))?),
-        None => None,
-    };
     let relay = Arc::new(Relay {
         rooms: Mutex::new(HashMap::new()),
-        groups: Mutex::new(HashMap::new()),
         addresses: Arc::new(Mutex::new(HashMap::new())),
         slots: Arc::new(Semaphore::new(config.max_connections)),
         next_id: AtomicU64::new(0),
         stop: watch::channel(false).0,
-        traffic: traffic::Traffic::new(),
         config,
     });
-    let watcher = tokio::spawn(certificate.clone().watch());
-    tokio::spawn(traffic::watch(relay.traffic.clone(), relay.config.budget.clone(), relay.stop.subscribe()));
-    if let Some(endpoint) = &endpoint {
-        tokio::spawn(relay.clone().serve_quic(endpoint.clone()));
-    }
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
-                limit_unsent(&stream);
-                tokio::spawn(relay.clone().tcp(stream, peer.ip(), acceptor.clone()));
+                tokio::spawn(relay.clone().http(stream, peer.ip()));
             }
             () = &mut shutdown => break,
         }
@@ -173,23 +91,15 @@ pub async fn serve_all(
     relay.stop.send_replace(true);
     let all = relay.config.max_connections as u32;
     let _ = timeout(Duration::from_secs(5), relay.slots.acquire_many(all)).await;
-    watcher.abort();
-    if let Some(endpoint) = endpoint {
-        let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
-    }
-    Ok(())
 }
 
 struct Relay {
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
-    groups: Mutex<HashMap<RoomId, Arc<group::GroupRoom>>>,
     /// Open WebSockets per client address.
     addresses: Arc<Mutex<HashMap<IpAddr, usize>>>,
     slots: Arc<Semaphore>,
     next_id: AtomicU64,
     stop: watch::Sender<bool>,
-    /// What group connections send, and the video ceiling that keeps it in budget.
-    traffic: Arc<traffic::Traffic>,
     config: Config,
 }
 
@@ -255,26 +165,10 @@ impl Outbox {
     }
 }
 
-pub(crate) type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
+type Ws = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 impl Relay {
-    /// Serves a TCP connection: TLS if it starts with a TLS handshake
-    /// record and a certificate is configured, plain HTTP otherwise.
-    async fn tcp(self: Arc<Self>, stream: tokio::net::TcpStream, peer: IpAddr, tls: Option<tokio_rustls::TlsAcceptor>) {
-        let Some(tls) = tls else { return self.http(stream, peer).await };
-        let mut first = [0];
-        match timeout(wire::JOIN_TIMEOUT, stream.peek(&mut first)).await {
-            Ok(Ok(1)) if first[0] == 0x16 => {
-                if let Ok(Ok(stream)) = timeout(wire::JOIN_TIMEOUT, tls.accept(stream)).await {
-                    self.http(stream, peer).await;
-                }
-            }
-            Ok(Ok(1)) => self.http(stream, peer).await,
-            _ => {}
-        }
-    }
-
-    async fn http(self: Arc<Self>, stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, peer: IpAddr) {
+    async fn http(self: Arc<Self>, stream: tokio::net::TcpStream, peer: IpAddr) {
         let service = hyper::service::service_fn(move |req| {
             let relay = self.clone();
             async move { Ok::<_, Infallible>(relay.route(req, peer)) }
@@ -293,11 +187,8 @@ impl Relay {
         if path == "/" || path == "/healthz" {
             return text(StatusCode::OK, "peerconnect relay\n");
         }
-        let room = match (relay::room_from_path(path), relay::group_from_path(path)) {
-            (Some(room), _) => room,
-            // Groups travel over QUIC only (GROUP.md §3.6), on the UDP port.
-            (_, Some(_)) => return text(StatusCode::NOT_FOUND, "groups are served over QUIC and WebTransport only\n"),
-            _ => return text(StatusCode::NOT_FOUND, "not found\n"),
+        let Some(room) = relay::room_from_path(path) else {
+            return text(StatusCode::NOT_FOUND, "not found\n");
         };
         let Some(key) = websocket_key(&req) else {
             return text(StatusCode::UPGRADE_REQUIRED, "expected a WebSocket upgrade\n");
@@ -313,14 +204,12 @@ impl Relay {
         let upgrade = hyper::upgrade::on(req);
         tokio::spawn(async move {
             let Ok(upgraded) = upgrade.await else { return };
-            // Small buffers: most connections are idle, and frames are at
-            // most 64 KiB.
-            let max = wire::MAX_FRAME_LEN;
+            // Small buffers: most connections are idle, and frames are at most 64 KiB.
             let config = WebSocketConfig::default()
                 .read_buffer_size(16 << 10)
                 .write_buffer_size(16 << 10)
-                .max_message_size(Some(max))
-                .max_frame_size(Some(max));
+                .max_message_size(Some(wire::MAX_FRAME_LEN))
+                .max_frame_size(Some(wire::MAX_FRAME_LEN));
             let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
             self.connection(room, ws, slot).await;
             drop(per_address);
@@ -531,36 +420,7 @@ fn receive(conn: &Conn, room: &RoomId, msg: &Message) -> Option<Action> {
     })
 }
 
-/// Keeps little unsent data in the kernel's send buffer, so that it waits in
-/// the relay's queues instead, where urgent frames overtake the rest and
-/// late voice is dropped. Throughput is unaffected: this bounds only what
-/// has not been sent yet, not what is in flight.
-fn limit_unsent(stream: &tokio::net::TcpStream) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::os::fd::AsRawFd;
-        // Not in the libc crate on every platform.
-        #[cfg(target_os = "linux")]
-        const TCP_NOTSENT_LOWAT: libc::c_int = 25;
-        #[cfg(target_os = "macos")]
-        const TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
-        let lowat: libc::c_int = 32 << 10;
-        // SAFETY: a valid socket descriptor and a correctly sized option value.
-        unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                TCP_NOTSENT_LOWAT,
-                (&lowat as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = stream;
-}
-
-pub(crate) fn close_message(code: u16) -> Message {
+fn close_message(code: u16) -> Message {
     Message::Close(Some(CloseFrame { code: code.into(), reason: "".into() }))
 }
 

@@ -20,7 +20,6 @@
 			<h2>{t.footer.project}</h2>
 			<ul>
 				<li><a href={i18n.href('/docs')}>{t.nav.docs}</a></li>
-				<li><a href={i18n.href('/groups')}>{t.nav.groups}</a></li>
 				<li><a href={i18n.href('/demo')}>{t.nav.demo}</a></li>
 				<li><a href="/spec">{t.nav.spec}</a></li>
 				{#if REPO_URL}
@@ -33,7 +32,6 @@
 			<ul>
 				<li><a href={i18n.href('/docs') + '#relay'}>{t.home.relay.guide}</a></li>
 				<li><a href={i18n.href('/docs') + '#limitations'}>{t.home.security.limitations}</a></li>
-				<li><a href="/spec/groups">{t.footer.groupSpec}</a></li>
 				<li>
 					<span class="label">{t.footer.publicRelay}</span>
 					<code>{RELAY_URL.replace('wss://', '')}</code>

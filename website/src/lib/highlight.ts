@@ -1,7 +1,7 @@
 // A small syntax highlighter for the few languages the site shows. It runs
 // while pages are prerendered, so no highlighting code reaches the browser.
 
-export type CodeLang = 'js' | 'rust' | 'c' | 'sh' | 'toml' | 'text';
+export type CodeLang = 'js' | 'rust' | 'sh' | 'toml' | 'text';
 
 type Rule = [kind: string, pattern: RegExp];
 
@@ -29,18 +29,6 @@ const RULES: Record<Exclude<CodeLang, 'text'>, Rule[]> = {
 			/\b(?:use|let|mut|fn|pub|struct|enum|impl|match|if|else|while|for|in|loop|return|async|await|move|ref|as|where|self|Self|crate|mod|const|static|true|false|Some|None|Ok|Err)\b/
 		],
 		['type', /\b[A-Z][A-Za-z0-9_]*\b/],
-		['fn', /\b[a-z_][a-z0-9_]*(?=\s*\()/]
-	],
-	c: [
-		['comment', /\/\/[^\n]*|\/\*[\s\S]*?\*\//],
-		['string', /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/],
-		['number', /\b\d[\d_]*(?:\.\d+)?\b/],
-		[
-			'keyword',
-			/\b(?:if|else|for|while|do|switch|case|break|continue|return|default|const|static|struct|typedef|enum|sizeof|void|NULL)\b/
-		],
-		['macro', /\bPC_[A-Z_]+\b/],
-		['type', /\b(?:u?int(?:8|16|32|64)_t|size_t|char|int|bool|pc_[a-z_]+)\b(?!\s*\()/],
 		['fn', /\b[a-z_][a-z0-9_]*(?=\s*\()/]
 	],
 	sh: [

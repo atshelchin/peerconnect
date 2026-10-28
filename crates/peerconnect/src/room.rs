@@ -22,10 +22,6 @@ impl RoomId {
         &self.0
     }
 
-    pub(crate) fn from_key(key: [u8; 32]) -> RoomId {
-        RoomId(key)
-    }
-
     /// Relay side: checks a `JOIN` frame against the `HELLO` nonce and returns
     /// the seat it claims, or the close code to reject it with.
     pub fn verify_join(&self, nonce: &[u8; wire::NONCE_LEN], frame: &[u8]) -> Result<Role, u16> {
@@ -387,7 +383,7 @@ fn usable(key: &PublicKey) -> bool {
 }
 
 /// Validates a relay base URL and strips any trailing slash.
-pub(crate) fn relay_url(url: &str) -> Result<String, Error> {
+fn relay_url(url: &str) -> Result<String, Error> {
     let rest = url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://")).ok_or(Error::InvalidRelayUrl)?;
     let host = rest.split('/').next().unwrap_or_default();
     let valid = !host.is_empty() && rest.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'?' | b'#'));

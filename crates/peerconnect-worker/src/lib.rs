@@ -6,12 +6,6 @@
 //! socket's seat lives in its attachment, so the object can be evicted from
 //! memory at any time and rebuild its view of the room on the next event.
 //! Nothing is ever written to storage.
-//!
-//! Groups (`/g1/<id>`, GROUP.md) are not served here: they travel over QUIC
-//! only (GROUP.md §3.6), which Workers cannot accept, and a relay must be
-//! able to drop late voice and put commands first, which a Worker cannot
-//! either (the runtime does not report what it has buffered). Groups use the
-//! Linux relay.
 
 use std::cell::{Cell, RefCell, RefMut};
 
@@ -37,17 +31,15 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if path == "/" || path == "/healthz" {
         return Response::ok("peerconnect relay\n");
     }
-    let room = match (relay::room_from_path(&path), relay::group_from_path(&path)) {
-        (Some(room), _) => room,
-        (_, Some(_)) => return Response::error("groups are served over QUIC by the Linux relay, not here\n", 404),
-        _ => return Response::error("not found\n", 404),
+    let Some(room) = relay::room_from_path(&path) else {
+        return Response::error("not found\n", 404);
     };
     let upgrade = req.headers().get("Upgrade")?;
     if !upgrade.is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
         return Response::error("expected a WebSocket upgrade\n", 426);
     }
-    let objects = env.durable_object("ROOMS")?;
-    let stub = objects.id_from_name(&room.to_string())?.get_stub()?;
+    let rooms = env.durable_object("ROOMS")?;
+    let stub = rooms.id_from_name(&room.to_string())?.get_stub()?;
     stub.fetch_with_request(req).await
 }
 

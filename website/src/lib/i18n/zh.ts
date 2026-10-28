@@ -13,30 +13,15 @@ export const zh: Dict = {
 			description:
 				'用 JavaScript 或 Rust 接入 PeerConnect，并在 Cloudflare Workers、Docker 或单个二进制文件上运行你自己的中继。'
 		},
-		groups: {
-			title: '群组：多人游戏、语音与状态同步 — PeerConnect',
-			description:
-				'最多 4 名成员的端到端加密群组：指令、聊天、语音、视频和状态同步，经 QUIC 通过不受信任的中继传输。面向游戏与团队协作的 JavaScript、Rust 和 C 开发指南。'
-		},
 		demo: {
 			title: '在线演示：配对两个浏览器 — PeerConnect',
 			description:
 				'用二维码配对两个浏览器，通过公共 PeerConnect 中继进行端到端加密聊天。演示运行的是编译为 WebAssembly 的真实协议实现。'
 		},
-		voice: {
-			title: '在线演示：多人语音视频聊天 — PeerConnect',
-			description:
-				'最多四人一起语音、开摄像头互相看见，端到端加密，经公共 PeerConnect 中继转发：Opus 语音、VP8 视频，外加文字聊天。在两台设备上打开即可体验。'
-		},
 		spec: {
 			title: '协议规范 v1 — PeerConnect',
 			description:
 				'PeerConnect v1 协议规范：房间与邀请、无状态中继准入、Noise IKpsk1 握手、可靠消息流与安全考量。'
-		},
-		specGroups: {
-			title: '群组协议规范 v1 — PeerConnect',
-			description:
-				'PeerConnect 群组协议 v1 规范：群组密钥与身份、席位准入、发送方密钥、五种流量类别、可靠消息流与状态同步。'
 		},
 		notFound: {
 			title: '页面不存在 — PeerConnect',
@@ -46,7 +31,6 @@ export const zh: Dict = {
 	nav: {
 		home: '首页',
 		docs: '文档',
-		groups: '群组',
 		demo: '演示',
 		spec: '规范',
 		github: 'GitHub',
@@ -161,7 +145,7 @@ export const zh: Dict = {
 				},
 				{
 					title: '单个二进制文件',
-					text: '一条命令：<code>cargo install peerconnect-relay</code>。五个环境变量即可配置，内置按客户端地址的连接数限制。'
+					text: '一条命令：<code>cargo install peerconnect-relay</code>。四个环境变量即可配置，内置按客户端地址的连接数限制。'
 				}
 			],
 			public:
@@ -201,32 +185,6 @@ export const zh: Dict = {
 				}
 			]
 		},
-		groups: {
-			eyebrow: '群组',
-			title: '不止两个？那就建个群组。',
-			intro:
-				'游戏小队、共享世界、协作团队：一个端到端加密的群组最多容纳 4 名成员，经 QUIC 通过 Linux 中继传输。它为游戏而设计——指令绝不能排在聊天消息后面，语音也不能被一个丢失的包拖住。',
-			items: [
-				{
-					title: '成员就是密钥',
-					text: '每个成员都是一个由应用保管的 Ed25519 身份，比如每位玩家一个。其他成员看到的是经过证明的身份，应用据此决定谁拥有什么、谁只是来参观。'
-				},
-				{
-					title: '五种流量，各走各的道',
-					text: '指令、语音、聊天、视频、批量数据，按紧急程度排序，在发送方和中继里各有各的队列，各走各的 QUIC 流。刷屏的聊天或庞大的快照永远不会拖慢一条指令。'
-				},
-				{
-					title: '新成员精确追上进度',
-					text: '已有成员发来应用状态的快照，并标明其中包含了哪些指令。新成员先拿到快照，再收到之后的每一条指令，不多也不重。'
-				},
-				{
-					title: '语音：浏览器与游戏引擎通用',
-					text: '基于 WebCodecs 的 Opus 编码，配合自适应抖动缓冲，只在说话时发送。Rust 以及供 Unity、Unreal、Godot 使用的 C 库采用相同的帧格式。'
-				}
-			],
-			guide: '阅读群组指南',
-			spec: '群组协议规范'
-		},
 		faq: {
 			eyebrow: 'FAQ',
 			title: '常见问题',
@@ -252,10 +210,6 @@ export const zh: Dict = {
 					a: '你什么都不用处理。房间并不存储在中继上：两端会重新连接、重新认证并继续消息流，不丢失也不重复任何一条消息。'
 				},
 				{
-					q: '一个房间能容纳两个以上的应用吗？',
-					a: '房间只供两方使用。需要更多成员时，请使用群组：最多 4 名成员，支持指令、聊天、语音、视频与状态同步，经 QUIC 通过 Linux 中继传输。具体做法见群组指南。'
-				},
-				{
 					q: '可以用于生产环境吗？',
 					a: '还不行。协议目前是 v1 草案，经过了大量测试但尚未经过外部审计，线上格式也可能变化。它已经适合用来做原型和提供反馈。'
 				}
@@ -272,141 +226,12 @@ export const zh: Dict = {
 		copy: '复制',
 		copied: '已复制'
 	},
-	voice: {
-		eyebrow: '在线演示',
-		title: '多人语音视频聊天',
-		lead: '最多四人同时语音，也可以打开摄像头互相看见，端到端加密。创建一个房间，把链接发给朋友或者在手机上打开，然后开口说话。',
-		steps: [
-			'创建房间，分享链接。',
-			'打开链接的人输入名字，可以先检查麦克风、摄像头和扬声器，然后加入。',
-			'在自己的卡片上打开麦克风就能说话，想露脸再打开摄像头。如果几台设备在同一个房间里，请戴耳机，否则麦克风会互相拾音。'
-		],
-		note: '这是真实的协议：Rust 内核编译成 WebAssembly，用 WebCodecs 编码 Opus 和 VP8，每个说话人一个自适应抖动缓冲，视频由分片完整拼回，全部经公共中继 <code>{relay}</code> 以 WebTransport（QUIC）转发：丢一个包只耽误它自己，语音和视频不等任何东西；中继只看得到密文。房间密钥在链接 <code>#</code> 之后的部分，浏览器不会把它发给任何服务器。',
-		noscript: '本演示需要 JavaScript 和 WebAssembly。',
-		loading: '加载中…',
-		start: {
-			title: '创建语音房间',
-			text: '你会得到一个可以分享的链接。持有链接的人都能加入，同时最多四人，所以请私下分享。',
-			create: '创建房间'
-		},
-		join: {
-			title: '加入房间',
-			name: '你的名字',
-			namePlaceholder: '例如：小明',
-			button: '加入',
-			starting: '正在加入…',
-			hint: '麦克风和摄像头在你主动打开之前都保持关闭。不会录音，也不会保存任何内容。'
-		},
-		devices: {
-			title: '检查设备（可选）',
-			hint: '加入前先试一试：这里的一切都不会发给任何人。',
-			mic: '麦克风',
-			camera: '摄像头',
-			speakers: '扬声器',
-			default: '默认',
-			device: '设备',
-			testMic: '测试',
-			testCamera: '测试',
-			testSpeakers: '播放提示音',
-			stop: '停止',
-			level: '麦克风音量',
-			micOnJoin: '加入时打开麦克风',
-			cameraOnJoin: '加入时打开摄像头'
-		},
-		problems: {
-			mic: '麦克风不可用（权限被拒绝或未找到设备）。你仍然可以收听和打字聊天。',
-			camera: '摄像头不可用（权限被拒绝或未找到设备）。',
-			codecs:
-				'这个浏览器无法编码 Opus 音频（WebCodecs）。文字聊天可用；语音请使用较新的 Chrome、Edge 或 Firefox。',
-			webtransport:
-				'这个浏览器不支持 WebTransport，无法加入房间。请使用最新版的 Chrome、Edge 或 Firefox。',
-			unreachable:
-				'连不上中继。房间只走 UDP（QUIC），而浏览器走代理时用不了它：如果开着代理（系统代理、Clash 等），请把 {host} 加到代理的例外（绕过）列表。也可能是所在网络屏蔽了 UDP。页面会继续尝试。',
-			full: '房间已满（四人）。页面会继续尝试加入。',
-			replaced: '这个房间已在别处用同一身份打开。',
-			link: '这不是一个有效的房间链接。',
-			failed: '演示无法在这个浏览器中启动。'
-		},
-		state: {
-			offline: '连接中…',
-			online: '已连接 · 端到端加密',
-			closed: '已离开'
-		},
-		room: {
-			people: '房间里',
-			you: '你',
-			alone: '还没有其他人。把链接分享出去吧。',
-			leave: '离开',
-			micOn: '关闭麦克风',
-			micOff: '打开麦克风：大家都能听到你',
-			hearOn: '关闭耳机：你听不到任何人',
-			hearOff: '打开耳机，恢复收听',
-			muteThem: '不听 {name}（只对你生效）',
-			unmuteThem: '恢复收听 {name}',
-			theirMicOff: '{name} 关了麦克风',
-			theirHearingOff: '{name} 关了耳机，听不到大家',
-			cameraOn: '关闭摄像头',
-			cameraOff: '打开摄像头：大家都能看见你',
-			video: '{name} 的视频',
-			shareOff: '共享你的屏幕',
-			shareOn: '停止共享屏幕',
-			screenOf: '{name} 的屏幕',
-			screenVideo: '{name} 共享的屏幕',
-			sharing: '你正在共享屏幕',
-			stopSharing: '停止',
-			dataSaver: '省流量：接收的视频最高 360p',
-			layout: '布局',
-			gallery: '宫格',
-			speakerView: '演讲者',
-			pin: '放大 {name}',
-			unpin: '回到所有人',
-			whole: '全屏看 {name}',
-			exitWhole: '退出全屏',
-			chat: '聊天',
-			closeChat: '收起聊天',
-			controls: '会议控制',
-			short: {
-				mute: '静音',
-				unmute: '解除静音',
-				startVideo: '开启视频',
-				stopVideo: '关闭视频',
-				share: '共享屏幕',
-				stopShare: '停止共享',
-				dataSaver: '省流量',
-				sound: '声音',
-				chat: '聊天',
-				invite: '邀请'
-			},
-			switchCamera: '切换前后摄像头',
-			rotateMine: '把你的画面转 90°（大家看到的都会转）',
-			rotateTheirs: '把 {name} 的画面转 90°（只对你）',
-			network: {
-				good: '网络：良好',
-				fair: '网络：一般',
-				poor: '网络：较差'
-			},
-			videoPaused: '你的网络较慢：已暂停视频，语音照常。'
-		},
-		invite: {
-			title: '邀请',
-			copy: '复制链接',
-			copied: '已复制'
-		},
-		chat: {
-			title: '聊天',
-			placeholder: '输入消息',
-			send: '发送',
-			empty: '还没有消息。'
-		},
-		again: '重新开始'
-	},
 	demo: {
 		eyebrow: '在线演示',
 		title: '配对两个浏览器',
 		lead: '在手机和电脑上（或两个浏览器窗口中）打开本页，用二维码把它们连起来，然后进行端到端加密聊天。',
 		note: '这里运行的是真实协议：Rust 核心编译成 WebAssembly，通过公共中继 <code>{relay}</code> 通信。每个浏览器标签页都是一个独立的端，刷新标签页不会丢失房间。',
 		noscript: '演示需要 JavaScript 和 WebAssembly。',
-		voiceLink: '不止两个人？试试多人语音视频聊天演示 →',
 		steps: [
 			'在一台设备上创建房间。',
 			'用另一台设备扫描二维码，或在那里打开链接。',
@@ -488,7 +313,6 @@ export const zh: Dict = {
 		project: '项目',
 		resources: '资源',
 		publicRelay: '公共中继',
-		groupSpec: '群组协议规范',
 		status: '规范 v1 · 草案'
 	}
 };

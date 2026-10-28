@@ -53,23 +53,6 @@ Persist the room when you create or join it, and again after `"paired"` (inviter
 
 Messages are delivered in order, exactly once, as long as both sides keep running; unacknowledged messages live in memory, so a page reload loses those not yet delivered.
 
-## Groups
-
-Up to four members with commands, chat, voice, video and state transfer ([GROUP.md](https://github.com/atshelchin/peerconnect/blob/main/GROUP.md)), over WebTransport only: a lost packet holds up only its own class, and voice and video wait for nothing. There is no WebSocket fallback, so groups need a runtime with WebTransport (not Node.js; check `groupsSupported()`), UDP that gets through, and no HTTP proxy in the way. Group relays are the Linux relay, at an `https://` URL, or `quic://` for one without a domain.
-
-```js
-import { Group, groupsSupported, Identity, joinGroup } from "peerconnect";
-
-const group = Group.create("https://group-relay.peerconnect.dev"); // group.toString() is the invite
-const conn = joinGroup(group, { identity: Identity.generate(), profile: "alice" }); // throws without WebTransport
-conn.addEventListener("message", (e) => console.log(e.detail.from, new TextDecoder().decode(e.detail.data)));
-conn.send("chat", "hello");
-```
-
-`peerconnect/voice` (`startVoice`) and `peerconnect/video` (`startVideo`) add speech and camera video through WebCodecs. Video is simulcast: give `startVideo` several `layers` (say 640 × 360 and 1280 × 720) and each receiver gets the one that suits the size it shows your picture at, while you encode only the layers someone is watching.
-
-Voice is Opus (32 kbit/s, 20 ms frames), sent only while you speak and played through an adaptive jitter buffer per speaker. Each packet carries copies of the two before it, in its Opus padding, so a lost datagram is brought back by one of the next two: at 5% loss each way, under 0.5% of speech goes missing in our tests, against 10% without (`redundancy: 0`). Receivers that know nothing of the copies decode the packets as before. What is lost for good is bridged by the last pitch period, faded out. `voice.stats()` counts frames `played`, `recovered` from copies, `concealed`, `late` and `dropped`.
-
 ## Building
 
 From a clone of [the repository](https://github.com/atshelchin/peerconnect):
