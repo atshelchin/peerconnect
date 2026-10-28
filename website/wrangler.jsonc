@@ -21,8 +21,8 @@
 		{
 			"binding": "SITE_DB",
 			"database_name": "peerconnect-site",
-			// Created at the first deploy with these.
-			"database_id": "00000000-0000-0000-0000-000000000000",
+			// Created 2026-10-28.
+			"database_id": "633a8ead-0aa6-42a5-ba3b-0d5e37d65383",
 			"migrations_dir": "migrations"
 		}
 	],
