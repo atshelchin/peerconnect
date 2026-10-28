@@ -12,7 +12,7 @@
 //! objects (`/usage`), and from the internal API (`/internal/…`).
 
 use peerconnect::token::{Generation, Refusal, Window};
-use peerconnect::usage::{Day, Traffic, day_of, next_day_ms, split_days};
+use peerconnect::usage::{Day, Thresholds, Traffic, day_of, next_day_ms, split_days};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use worker::*;
@@ -298,8 +298,16 @@ impl Client {
     async fn count_on(&self, day: String, f: impl FnOnce(&mut Day)) -> Result<()> {
         let key = format!("{DAY_PREFIX}{day}");
         let mut counts: Day = self.state.storage().get(&key).await.ok().flatten().unwrap_or_else(|| Day::new(day));
+        let before = counts.clone();
         f(&mut counts);
         self.state.storage().put(&key, &counts).await?;
+        let crossed = thresholds(&self.env).crossed(&before, &counts);
+        if !crossed.is_empty() {
+            let id = self.id().await;
+            for (kind, value, threshold) in crossed {
+                alert(&self.env, &counts.day, &id, kind, value, threshold).await;
+            }
+        }
         if !matches!(self.state.storage().get_alarm().await, Ok(Some(_))) {
             self.state.storage().set_alarm((next_day_ms(now()) + AFTER_MIDNIGHT_MS) as i64).await?;
         }
@@ -325,6 +333,47 @@ impl Client {
     /// The days not yet written out, today's included, oldest first.
     async fn pending(&self) -> Result<Vec<Day>> {
         Ok(self.days().await?.into_iter().map(|(_, day)| day).collect())
+    }
+}
+
+/// The alert thresholds: `ALERT_CONNECTIONS`, `ALERT_BYTES`,
+/// `ALERT_REJECTIONS`, `ALERT_LIMITED` (per client per day; 0 turns one off),
+/// else the defaults.
+fn thresholds(env: &Env) -> Thresholds {
+    let defaults = Thresholds::default();
+    let get = |name: &str, default: u64| crate::setting(env, name).parse().unwrap_or(default);
+    Thresholds {
+        connections: get("ALERT_CONNECTIONS", defaults.connections),
+        bytes: get("ALERT_BYTES", defaults.bytes),
+        rejections: get("ALERT_REJECTIONS", defaults.rejections),
+        limited: get("ALERT_LIMITED", defaults.limited),
+    }
+}
+
+/// Records that `client` crossed a threshold today. Once per client, day and
+/// kind (the table's key); best effort, like the rest of metering.
+async fn alert(env: &Env, day: &str, client: &str, kind: &str, value: u64, threshold: u64) {
+    console_log!("peerconnect: alert: {client} {kind} {value} >= {threshold} on {day}");
+    let Ok(db) = env.d1("RELAY_DB") else { return };
+    let values: Vec<wasm_bindgen::JsValue> = vec![
+        (now() as f64).into(),
+        day.into(),
+        client.into(),
+        kind.into(),
+        (value as f64).into(),
+        (threshold as f64).into(),
+    ];
+    let written = match db
+        .prepare(
+            "INSERT OR IGNORE INTO alerts (at, day, client, kind, value, threshold) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&values)
+    {
+        Ok(statement) => statement.run().await.map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
+        console_error!("peerconnect: alert not written: {e}");
     }
 }
 

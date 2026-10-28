@@ -14,7 +14,7 @@ import {
 	setAppState
 } from '#lib/server/db.ts';
 import { signedIn, signedInForm } from '#lib/server/guard.ts';
-import { RelayError, issuanceAudit, revoke, usageDays } from '#lib/server/relay.ts';
+import { RelayError, alerts, issuanceAudit, revoke, usageDays } from '#lib/server/relay.ts';
 import type { Actions, PageServerLoad } from './$types';
 
 export const prerender = false;
@@ -36,13 +36,14 @@ async function owner(config: SiteConfig, cookies: import('@sveltejs/kit').Cookie
 export const load: PageServerLoad = async ({ url, cookies }) => {
 	const config = siteConfig(url);
 	const { acct, csrf } = await owner(config, cookies, url);
-	const [accounts, apps, owners, audit, issuance, days] = await Promise.all([
+	const [accounts, apps, owners, audit, issuance, days, raised] = await Promise.all([
 		adminAccounts(config.db),
 		adminApps(config.db),
 		clientOwners(config.db),
 		recentAudit(config.db, 100),
 		issuanceAudit(config.relay, 100).catch(() => []),
-		usageDays(config.relay, 30).catch(() => [])
+		usageDays(config.relay, 30).catch(() => []),
+		alerts(config.relay, 100).catch(() => [])
 	]);
 	// Finished days of the last 30, per account that answers for the client.
 	const perAccount = new Map<
@@ -80,7 +81,14 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
 			.map(([day, u]) => ({ day, ...u }))
 			.sort((a, b) => b.day.localeCompare(a.day)),
 		audit,
-		issuance
+		issuance,
+		alerts: raised.map((a) => {
+			const owner = owners.get(a.client);
+			return {
+				...a,
+				login: owner ? (logins.get(owner) ?? owner) : a.client.startsWith('t-') ? 'trial' : '—'
+			};
+		})
 	};
 };
 

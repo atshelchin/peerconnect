@@ -99,6 +99,10 @@ const en = {
 		more: '{n} clients are left: delete again to go on.'
 	},
 	admin: {
+		alerts: 'Alerts',
+		noAlerts: 'No client has crossed a threshold.',
+		alertsNote:
+			'A client’s day crossing a threshold (connections, bytes, refused tokens, rate-limited connections), once a day each. Thresholds: ALERT_* on the relay.',
 		days: 'Every day (finished days, last 30)',
 		top: 'Top accounts by estimated cost',
 		accounts: 'Accounts',
@@ -236,6 +240,10 @@ const zh: ConsoleDict = {
 		more: '还剩 {n} 个客户端，请再点一次删除继续。'
 	},
 	admin: {
+		alerts: '告警',
+		noAlerts: '还没有客户端越过阈值。',
+		alertsNote:
+			'某个客户端当天的用量越过阈值（连接数、流量、被拒的 token、被限流的连接），每类每天一次。阈值在 relay 的 ALERT_* 变量里。',
 		days: '每天（已结束的日子，最近 30 天）',
 		top: '估算费用最高的账户',
 		accounts: '账户',

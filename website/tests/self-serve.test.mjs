@@ -526,4 +526,8 @@ test("the admin page is the owner's alone, and suspends accounts and disables ap
 		account: bobAccount,
 		state: 'active'
 	});
+
+	// x1's tokens were refused twice: the relay under test alerts at 2 (run-self-serve.sh).
+	const after = await (await admin.fetch('/admin')).text();
+	assert.match(after, new RegExp(`data-alert="rejections"[\\s\\S]*?${again.client_id}`));
 });

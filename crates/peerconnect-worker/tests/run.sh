@@ -15,7 +15,7 @@ trap 'kill "$pid" 2>/dev/null || true; rm -rf "$state"' EXIT
 npx --yes wrangler@4 d1 migrations apply RELAY_DB --local --persist-to "$state" > /dev/null
 npx --yes wrangler@4 dev --port "$port" --ip 127.0.0.1 --persist-to "$state" \
   --var REQUIRE_TOKEN:1 --var "PEERCONNECT_TOKEN_SECRET:$token_secret" \
-  --var "PEERCONNECT_SERVICE_SECRET:$service_secret" > "$state/wrangler.log" 2>&1 &
+  --var "PEERCONNECT_SERVICE_SECRET:$service_secret" --var ALERT_REJECTIONS:2 > "$state/wrangler.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 180); do
   [ "$(curl -sf --noproxy '*' "http://127.0.0.1:$port/")" = "peerconnect relay" ] && break

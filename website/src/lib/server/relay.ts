@@ -104,6 +104,20 @@ export async function usageDays(config: RelayConfig, days = 30): Promise<UsageRo
 	return internal(config, `usage?days=${days}`);
 }
 
+export interface AlertRow {
+	at: number;
+	day: string;
+	client: string;
+	kind: 'connections' | 'bytes' | 'rejections' | 'limited';
+	value: number;
+	threshold: number;
+}
+
+/** The latest abuse alerts: a client's day crossing a threshold (admin). */
+export async function alerts(config: RelayConfig, limit = 100): Promise<AlertRow[]> {
+	return internal(config, `alerts?limit=${limit}`);
+}
+
 /** The relay's latest issuance audit rows (admin). */
 export async function issuanceAudit(config: RelayConfig, limit = 100): Promise<IssuanceRow[]> {
 	return internal(config, `audit?limit=${limit}`);

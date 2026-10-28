@@ -114,8 +114,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 /// A WebSocket accepted only to be closed with `code` (SPEC §4.1): browsers
 /// report a close code, never an HTTP status. (Under `wrangler dev`, the
-/// local proxy logs "Network connection lost" for each; clients get 4403 all
-/// the same.)
+/// local proxy logs "Network connection lost" for each; in production the
+/// request ends as `responseStreamDisconnected`, without an exception.)
 fn refuse(code: u16, reason: &str) -> Result<Response> {
     let pair = WebSocketPair::new()?;
     pair.server.accept()?;

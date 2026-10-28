@@ -1,9 +1,10 @@
 # Self-serve access to the PeerConnect relay
 
 **Status:** approved by the owner (2026-10-28), with server-issued tokens added
-(below). Phases 1–3 are built and tested locally; not deployed. Not built
-yet: the scheduled abuse alerts and Analytics Engine signals (phase 3), and
-the rollout (phase 4).
+(below). Phases 1–3 are built and tested locally; not deployed. Deployed
+2026-10-28; tokens required on relay.peerconnect.dev since then. After the
+owner's decision of the same day, there is no SDK: the API (API.md), the
+specification and llms.txt.
 
 Today anyone can open rooms on `wss://relay.peerconnect.dev`, anonymously.
 Nobody can tell who uses it, how much, or stop one abuser without stopping
@@ -197,11 +198,21 @@ usage per day with the estimated Cloudflare cost, alerts, both audit logs.
 
 ## Metering and alerts
 
-As clientmcp: exact daily counts in the Client objects (billing-grade), Workers
-Analytics Engine for the live view and alerts, a scheduled check every 10
-minutes against thresholds (connections per minute, bytes per hour, rejections
-from one client), alerts on the admin page. No quota yet: rate limits only
-against blatant abuse; thresholds are configuration.
+Exact daily counts in the Client objects (billing-grade), written to the
+relay's D1 when the day closes.
+
+Alerts are raised by the same objects as they count, rather than by a
+scheduled job reading Analytics Engine (the first plan): a client's day
+crossing a threshold writes one row to the relay's `alerts` table, once per
+client, day and kind, and the admin page lists them. That needs no cron, no
+API token, and works on the exact numbers.
+
+- Thresholds, per client per UTC day, set on the relay as `ALERT_CONNECTIONS`
+  (default 10,000), `ALERT_BYTES` (10 GB), `ALERT_REJECTIONS` (100 refused
+  tokens: a leaked or guessed one) and `ALERT_LIMITED` (1,000 rate-limited
+  connections); 0 turns one off.
+- No quota yet: the rate limits stop only blatant abuse (120 connections a
+  minute per client; the trial 20, and 50 MB a day).
 
 ## Where it runs
 

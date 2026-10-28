@@ -16,7 +16,7 @@ TOKEN_SECRET=$(openssl rand -hex 32)
 SERVICE=$(openssl rand -hex 32)
 GH_ID=test-client-id
 GH_SECRET=$(openssl rand -hex 20)
-printf 'PEERCONNECT_TOKEN_SECRET=%s\nPEERCONNECT_SERVICE_SECRET=%s\nREQUIRE_TOKEN=1\n' "$TOKEN_SECRET" "$SERVICE" > "$RUN/relay.vars"
+printf 'PEERCONNECT_TOKEN_SECRET=%s\nPEERCONNECT_SERVICE_SECRET=%s\nREQUIRE_TOKEN=1\nALERT_REJECTIONS=2\n' "$TOKEN_SECRET" "$SERVICE" > "$RUN/relay.vars"
 printf 'SERVICE_SECRET=%s\nGITHUB_CLIENT_ID=%s\nGITHUB_CLIENT_SECRET=%s\nSESSION_KEY=%s\nAPP_SECRET_KEY=%s\n' \
   "$SERVICE" "$GH_ID" "$GH_SECRET" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > "$RUN/site.vars"
 

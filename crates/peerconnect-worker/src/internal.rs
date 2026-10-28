@@ -18,6 +18,7 @@
 //! - `POST /internal/clients/<id>/delete`  `{actor}`: for good
 //! - `GET  /internal/usage?days=30`        finished days' usage, per client
 //! - `GET  /internal/audit?limit=100`      the latest issuance audit rows
+//! - `GET  /internal/alerts?limit=100`     the latest abuse alerts
 
 use peerconnect::token::{Claims, Keys, is_id};
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ pub(crate) async fn handle(mut req: Request, env: &Env, keys: Option<&Keys>) -> 
     match req.path().as_str() {
         "/internal/usage" => return usage_days(&req, env).await,
         "/internal/audit" => return audit_log(&req, env).await,
+        "/internal/alerts" => return alerts(&req, env).await,
         _ => {}
     }
     let path = req.path();
@@ -160,6 +162,19 @@ async fn audit_log(req: &Request, env: &Env) -> Result<Response> {
     let rows = env
         .d1("RELAY_DB")?
         .prepare("SELECT at, client, action, gen, actor FROM issuance_audit ORDER BY at DESC LIMIT ?1")
+        .bind(&[f64::from(limit).into()])?
+        .all()
+        .await?
+        .results::<Value>()?;
+    Response::from_json(&rows)
+}
+
+/// The latest alerts, newest first.
+async fn alerts(req: &Request, env: &Env) -> Result<Response> {
+    let limit = bounded(req, "limit", 100, 1000);
+    let rows = env
+        .d1("RELAY_DB")?
+        .prepare("SELECT at, day, client, kind, value, threshold FROM alerts ORDER BY at DESC LIMIT ?1")
         .bind(&[f64::from(limit).into()])?
         .all()
         .await?

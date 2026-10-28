@@ -153,3 +153,17 @@ test("the trial is rate limited with 4429", async () => {
   assert.deepEqual(codes.slice(0, 20), Array(20).fill("hello"));
   assert.equal(codes[21], 4429);
 });
+
+test("a client crossing a threshold raises one alert a day", async () => {
+  const client = unique("c");
+  const old = await mint(client);
+  await internal(`clients/${client}/rotate`, { exp: exp(), actor: "test" });
+  const room = Room.create(RELAY);
+  // The relay under test alerts at 2 rejections a day (run.sh).
+  for (let i = 0; i < 3; i++) assert.equal(await firstFrame(`${RELAY}/v1/${room.id}?token=${old}`), 4403);
+  const alerts = (await internal("alerts?limit=50")).body.filter((a) => a.client === client);
+  assert.equal(alerts.length, 1, JSON.stringify(alerts));
+  assert.equal(alerts[0].kind, "rejections");
+  assert.equal(alerts[0].value, 2);
+  assert.equal(alerts[0].threshold, 2);
+});

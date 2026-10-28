@@ -37,6 +37,30 @@
 		</form>
 	{/if}
 
+	<h2>{t.alerts} ({data.alerts.length})</h2>
+	<p class="muted">{t.alertsNote}</p>
+	{#if data.alerts.length === 0}
+		<p class="muted">{t.noAlerts}</p>
+	{:else}
+		<div class="table">
+			<table>
+				<tbody>
+					{#each data.alerts as a (a.day + a.client + a.kind)}
+						<tr data-alert={a.kind}
+							><td>{dateMs(a.at)}</td><td>@{a.login}<br /><code>{a.client}</code></td><td
+								>{a.kind}</td
+							><td
+								>{a.kind === 'bytes' ? mb(a.value) : a.value} ≥ {a.kind === 'bytes'
+									? mb(a.threshold)
+									: a.threshold}</td
+							></tr
+						>
+					{/each}
+				</tbody>
+			</table>
+		</div>
+	{/if}
+
 	<h2>{t.days}</h2>
 	<p class="muted">{t.costNote}</p>
 	<div class="table">

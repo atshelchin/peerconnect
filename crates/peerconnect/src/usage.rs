@@ -84,6 +84,39 @@ impl Day {
     }
 }
 
+/// A day's use beyond which a client is worth a look (`docs/self-serve.md`,
+/// "Metering and alerts"). Not limits: nothing is refused for crossing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Thresholds {
+    pub connections: u64,
+    pub bytes: u64,
+    pub rejections: u64,
+    pub limited: u64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Thresholds { connections: 10_000, bytes: 10_000_000_000, rejections: 100, limited: 1_000 }
+    }
+}
+
+impl Thresholds {
+    /// The thresholds that going from `before` to `after` crossed, as
+    /// `(kind, value, threshold)`: each fires once a day, when it is crossed.
+    pub fn crossed(&self, before: &Day, after: &Day) -> Vec<(&'static str, u64, u64)> {
+        [
+            ("connections", before.connections, after.connections, self.connections),
+            ("bytes", before.bytes(), after.bytes(), self.bytes),
+            ("rejections", before.rejections, after.rejections, self.rejections),
+            ("limited", before.limited, after.limited, self.limited),
+        ]
+        .into_iter()
+        .filter(|&(_, was, now, at)| at > 0 && was < at && now >= at)
+        .map(|(kind, _, now, at)| (kind, now, at))
+        .collect()
+    }
+}
+
 /// The UTC day of `epoch_ms`, as `YYYY-MM-DD`.
 pub fn day_of(epoch_ms: u64) -> String {
     let days = (epoch_ms / DAY_MS) as i64;
@@ -137,6 +170,28 @@ mod tests {
         let split = split_days(midnight - 1_000, midnight + 2_500);
         assert_eq!(split, vec![("2026-10-26".to_owned(), 1_000), ("2026-10-27".to_owned(), 2_500)]);
         assert!(split_days(5, 5).is_empty());
+    }
+
+    #[test]
+    fn a_threshold_fires_once_when_crossed() {
+        let t = Thresholds { connections: 3, bytes: 1_000, rejections: 1, limited: 0 };
+        let mut day = Day::new("2026-10-28".into());
+        let step = |day: &mut Day, f: &dyn Fn(&mut Day)| {
+            let before = day.clone();
+            f(day);
+            t.crossed(&before, day)
+        };
+        assert!(step(&mut day, &|d| d.connections += 2).is_empty());
+        assert_eq!(step(&mut day, &|d| d.connections += 1), vec![("connections", 3, 3)]);
+        assert!(step(&mut day, &|d| d.connections += 1).is_empty(), "once a day");
+        assert_eq!(
+            step(&mut day, &|d| {
+                d.bytes_out += 2_000;
+                d.rejections += 1;
+            }),
+            vec![("bytes", 2_000, 1_000), ("rejections", 1, 1)]
+        );
+        assert!(step(&mut day, &|d| d.limited += 5).is_empty(), "0 turns a threshold off");
     }
 
     #[test]
