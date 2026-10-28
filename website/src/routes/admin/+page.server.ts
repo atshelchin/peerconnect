@@ -67,26 +67,62 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
 		perDay.set(row.day, d);
 	}
 	const logins = new Map(accounts.map((a) => [a.id, a.login]));
+	const appNames = new Map(apps.map((p) => [p.id, p.name]));
+	/** IDs in a log line, as people know them: `a-…` → @login, `app_…` → its name. */
+	const readable = (text: string) =>
+		text
+			.replace(/\b(?:account:|admin:)?(a-[a-z2-7]{20})\b/g, (m, id: string) =>
+				logins.has(id) ? `@${logins.get(id)}` : m
+			)
+			.replace(/\b(?:app:)?(app_[a-z2-7]{16})\b/g, (m, id: string) =>
+				appNames.has(id) ? `${appNames.get(id)}` : m
+			);
+	const today = new Date().toISOString().slice(0, 10);
+	const daysList = [...perDay.entries()]
+		.map(([day, u]) => ({ day, ...u }))
+		.sort((a, b) => a.day.localeCompare(b.day));
 	return {
 		login: acct.login,
 		avatar: acct.avatar_url,
+		self: acct.id,
 		csrf,
+		totals: {
+			accounts: accounts.length,
+			suspended: accounts.filter((a) => a.state !== 'active').length,
+			apps: apps.length,
+			disabled: apps.filter((p) => p.state !== 'active').length,
+			clients: accounts.reduce((n, a) => n + a.clients, 0),
+			alertsToday: raised.filter((a) => a.day === today).length,
+			connections: daysList.reduce((n, d) => n + d.connections, 0),
+			bytes: daysList.reduce((n, d) => n + d.bytes, 0),
+			cost: daysList.reduce((n, d) => n + d.cost, 0)
+		},
 		accounts: accounts.map((a) => ({ ...a, usage: perAccount.get(a.id) ?? null })),
 		apps,
 		top: [...perAccount.entries()]
 			.map(([id, u]) => ({ id, login: logins.get(id) ?? id, ...u }))
 			.sort((a, b) => b.cost - a.cost)
-			.slice(0, 20),
-		days: [...perDay.entries()]
-			.map(([day, u]) => ({ day, ...u }))
-			.sort((a, b) => b.day.localeCompare(a.day)),
-		audit,
-		issuance,
+			.slice(0, 10),
+		days: daysList,
+		audit: audit.map((row) => ({
+			at: row.at * 1000,
+			action: row.action,
+			who: row.account_id ? (logins.get(row.account_id) ?? row.account_id) : '',
+			detail: readable(row.detail),
+			actor: readable(row.actor)
+		})),
+		issuance: issuance.map((row) => ({
+			at: row.at,
+			action: row.action,
+			client: row.client,
+			gen: row.gen,
+			actor: readable(row.actor)
+		})),
 		alerts: raised.map((a) => {
 			const owner = owners.get(a.client);
 			return {
 				...a,
-				login: owner ? (logins.get(owner) ?? owner) : a.client.startsWith('t-') ? 'trial' : '—'
+				login: owner ? (logins.get(owner) ?? owner) : a.client.startsWith('t-') ? 'trial' : null
 			};
 		})
 	};

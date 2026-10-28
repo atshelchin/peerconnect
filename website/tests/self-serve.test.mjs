@@ -488,7 +488,12 @@ test("the admin page is the owner's alone, and suspends accounts and disables ap
 	assert.equal(page.status, 200);
 	const html = await page.text();
 	assert.match(html, /@bob/);
-	const bobAccount = html.match(/@bob<br\s*\/?>\s*<code[^>]*>(a-[a-z2-7]{20})/)?.[1];
+	// The row whose account is bob's: its ID is the row's data-account.
+	const bobAccount = html
+		.split('data-account="')
+		.slice(1)
+		.find((row) => row.split('</tr>')[0].includes('@bob</strong>'))
+		?.slice(0, 22);
 	assert.ok(bobAccount, "bob's account is listed");
 
 	const disabled = await admin.submit('/admin?/app', {

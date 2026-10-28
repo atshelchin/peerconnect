@@ -518,6 +518,7 @@ export async function takeTrial(
 export interface AdminAccount {
 	id: string;
 	login: string;
+	avatar_url: string;
 	created_at: number;
 	last_seen_at: number;
 	state: 'active' | 'suspended';
@@ -530,7 +531,7 @@ export interface AdminAccount {
 export async function adminAccounts(db: D1Database): Promise<AdminAccount[]> {
 	const { results } = await db
 		.prepare(
-			"SELECT a.id, i.login, a.created_at, a.last_seen_at, a.state, a.client_limit, a.app_limit, (SELECT COUNT(*) FROM apps p WHERE p.account_id = a.id AND p.deleted_at IS NULL) AS apps, (SELECT COUNT(*) FROM clients c WHERE c.account_id = a.id AND c.deleted_at IS NULL) AS clients FROM accounts a JOIN identities i ON i.account_id = a.id AND i.provider = 'github' ORDER BY a.last_seen_at DESC LIMIT 1000"
+			"SELECT a.id, i.login, i.avatar_url, a.created_at, a.last_seen_at, a.state, a.client_limit, a.app_limit, (SELECT COUNT(*) FROM apps p WHERE p.account_id = a.id AND p.deleted_at IS NULL) AS apps, (SELECT COUNT(*) FROM clients c WHERE c.account_id = a.id AND c.deleted_at IS NULL) AS clients FROM accounts a JOIN identities i ON i.account_id = a.id AND i.provider = 'github' ORDER BY a.last_seen_at DESC LIMIT 1000"
 		)
 		.all<AdminAccount>();
 	return results;

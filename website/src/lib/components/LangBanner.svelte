@@ -10,7 +10,10 @@
 
 	onMount(() => {
 		const preferred = preferredLang();
-		if (preferred !== i18n.lang && !ENGLISH_ONLY.includes(i18n.path)) suggested = preferred;
+		// Not on the signed-in pages, where it would sit over the work.
+		const signedIn = /^\/(account|admin|connect|developers)(\/|$)/.test(i18n.path);
+		if (preferred !== i18n.lang && !ENGLISH_ONLY.includes(i18n.path) && !signedIn)
+			suggested = preferred;
 	});
 
 	function dismiss() {
