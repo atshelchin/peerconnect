@@ -21,7 +21,7 @@ FROM scratch
 # Links the image to the repository on the GitHub Container Registry.
 LABEL org.opencontainers.image.source="https://github.com/atshelchin/peerconnect" \
       org.opencontainers.image.description="PeerConnect relay: end-to-end encrypted two-peer rooms over WebSocket" \
-      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+      org.opencontainers.image.licenses="MIT"
 COPY --from=build /peerconnect-relay /peerconnect-relay
 ENV PEERCONNECT_LISTEN=0.0.0.0:8080
 EXPOSE 8080

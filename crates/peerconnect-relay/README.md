@@ -21,4 +21,4 @@ It speaks plain `ws://`; put a TLS-terminating proxy in front of it for `wss://`
 
 A Docker image, a Compose file with automatic HTTPS and a Cloudflare Workers relay are in the [repository](https://github.com/atshelchin/peerconnect); the [deployment guide](https://peerconnect.dev/docs#relay) covers all of them.
 
-Licensed under either of [Apache License, Version 2.0](https://github.com/atshelchin/peerconnect/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/atshelchin/peerconnect/blob/main/LICENSE-MIT) at your option.
+Licensed under the [MIT license](https://github.com/atshelchin/peerconnect/blob/main/LICENSE).

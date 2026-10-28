@@ -36,4 +36,4 @@ Without the `client` feature the crate does no I/O: `Peer` is a state machine th
 
 The protocol is a v1 draft and has not been externally audited.
 
-Licensed under either of [Apache License, Version 2.0](https://github.com/atshelchin/peerconnect/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/atshelchin/peerconnect/blob/main/LICENSE-MIT) at your option.
+Licensed under the [MIT license](https://github.com/atshelchin/peerconnect/blob/main/LICENSE).
