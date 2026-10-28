@@ -1,7 +1,8 @@
 {
   "name": "peerconnect",
+  "private": true,
   "version": "0.1.0",
-  "description": "PeerConnect: two peers, one room, end-to-end encrypted over an untrusted WebSocket relay",
+  "description": "PeerConnect reference implementation in JavaScript (the Rust core in WebAssembly). Not published: PeerConnect is offered as an API (API.md, SPEC.md).",
   "keywords": [
     "e2ee",
     "end-to-end encryption",
@@ -20,7 +21,7 @@
   "bugs": {
     "url": "https://github.com/atshelchin/peerconnect/issues"
   },
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": {
@@ -38,8 +39,7 @@
     "auth.js",
     "auth.d.ts",
     "dist/",
-    "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE"
   ],
   "sideEffects": [
     "./index.js"
@@ -50,6 +50,6 @@
   "scripts": {
     "build": "sh scripts/build.sh",
     "test": "node --test",
-    "prepack": "cp ../LICENSE-MIT ../LICENSE-APACHE . && test -f dist/module.js"
+    "prepack": "cp ../LICENSE . && test -f dist/module.js"
   }
 }

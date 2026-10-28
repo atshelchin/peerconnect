@@ -6,7 +6,7 @@
 	import { LOCALE } from '#lib/i18n/index.ts';
 	import { i18n } from '#lib/i18n/current.svelte.ts';
 	import { RELAY_URL, REPO_URL, SITE_URL } from '#lib/site.ts';
-	import { jsQuick, rustQuick } from '#lib/snippets.ts';
+	import { accessSh, agentPrompt, relaySketch } from '#lib/snippets.ts';
 
 	const t = $derived(i18n.t);
 	const h = $derived(t.home);
@@ -37,10 +37,7 @@
 			description: t.meta.home.description,
 			url: SITE_URL,
 			programmingLanguage: ['Rust', 'JavaScript', 'WebAssembly'],
-			license: [
-				'https://opensource.org/licenses/MIT',
-				'https://www.apache.org/licenses/LICENSE-2.0'
-			],
+			license: 'https://opensource.org/licenses/MIT',
 			...(REPO_URL ? { codeRepository: REPO_URL } : {})
 		},
 		{
@@ -157,8 +154,9 @@
 		<CodeTabs
 			id="quick"
 			tabs={[
-				{ label: 'JavaScript', code: jsQuick(i18n.lang), lang: 'js', title: 'app.js' },
-				{ label: 'Rust', code: rustQuick(i18n.lang), lang: 'rust', title: 'main.rs' }
+				{ label: 'HTTP API', code: accessSh(i18n.lang), lang: 'sh', title: 'shell' },
+				{ label: 'Relay', code: relaySketch(i18n.lang), lang: 'text', title: 'SPEC §4–§6' },
+				{ label: 'llms.txt', code: agentPrompt(i18n.lang), lang: 'text', title: 'prompt' }
 			]}
 		/>
 	</div>

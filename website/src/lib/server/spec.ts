@@ -21,8 +21,13 @@ function headingId(text: string): string {
 	return numbered ? `sec-${numbered[1].replace(/\./g, '-')}` : slug(text);
 }
 
-/** Renders SPEC.md: anchors on headings, links for `§n.n` references, and
- * repository-relative links pointed at the repository (or dropped). */
+/** Repository documents that are pages of this site. */
+const PAGES: Record<string, string> = { 'SPEC.md': '/spec', 'API.md': '/docs/api' };
+
+/** Renders SPEC.md or API.md: anchors on headings, links for `§n.n`
+ * references (`SPEC §n.n` into the specification), links to the documents
+ * that are pages here, and other repository-relative links pointed at the
+ * repository (or dropped). */
 export function renderSpec(markdown: string): { html: string; toc: TocEntry[] } {
 	const toc: TocEntry[] = [];
 	const marked = new Marked({
@@ -41,6 +46,7 @@ export function renderSpec(markdown: string): { html: string; toc: TocEntry[] } 
 					const external = href.startsWith('#') ? '' : ' rel="external"';
 					return `<a href="${escapeHtml(href)}"${external}>${inner}</a>`;
 				}
+				if (PAGES[href]) return `<a href="${PAGES[href]}">${inner}</a>`;
 				// A file in the repository.
 				return REPO_URL
 					? `<a href="${escapeHtml(`${REPO_URL}/blob/main/${href}`)}" rel="external">${inner}</a>`
@@ -54,8 +60,9 @@ export function renderSpec(markdown: string): { html: string; toc: TocEntry[] } 
 		.replace(/<table>/g, '<div class="table"><table>')
 		.replace(/<\/table>/g, '</table></div>')
 		.replace(
-			/(?<!RFC \d{1,5} )§(\d+(?:\.\d+)*)/g,
-			(match, number: string) => `<a href="#sec-${number.replace(/\./g, '-')}">${match}</a>`
+			/(?<!RFC \d{1,5} )(SPEC )?§(\d+(?:\.\d+)*)/g,
+			(match, spec: string | undefined, number: string) =>
+				`<a href="${spec ? '/spec' : ''}#sec-${number.replace(/\./g, '-')}">${match}</a>`
 		);
 	return { html, toc };
 }

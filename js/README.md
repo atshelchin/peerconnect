@@ -1,10 +1,8 @@
 # peerconnect (JavaScript)
 
-Two peers, one room, end-to-end encrypted, reliable messaging over an untrusted WebSocket relay. Works in browsers, Node.js 22+, Deno and Bun. The protocol runs in WebAssembly compiled from the Rust implementation (46 KB gzipped, inlined, so no bundler setup is needed). Guide, specification and a live demo: <https://peerconnect.dev>.
+> **Reference implementation, not a package.** PeerConnect is offered as an API: the relay protocol ([SPEC.md](../SPEC.md)) and the HTTP API ([API.md](../API.md)). This directory is the repository's own JavaScript implementation, used by the live demo; read it and test against it, but it is not published to npm or supported. The `import` lines below describe it as it is used inside this repository (the website depends on it as `file:../js`).
 
-```sh
-npm install peerconnect
-```
+Two peers, one room, end-to-end encrypted, reliable messaging over an untrusted WebSocket relay. Works in browsers, Node.js 22+, Deno and Bun. The protocol runs in WebAssembly compiled from the Rust implementation (46 KB gzipped, inlined, so no bundler setup is needed). Guide, specification and a live demo: <https://peerconnect.dev>.
 
 ```js
 import { connect, Room } from "peerconnect";
@@ -68,4 +66,4 @@ npm test              # runs against the Rust relay in ../target/debug (cargo bu
 
 ## License
 
-MIT OR Apache-2.0, at your option.
+MIT.

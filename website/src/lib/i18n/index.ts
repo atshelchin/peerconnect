@@ -33,5 +33,5 @@ export function localize(path: string, lang: Lang): string {
 	return path === '/' ? '/zh' : `/zh${path}`;
 }
 
-/** Pages that exist in English only (the normative specification). */
-export const ENGLISH_ONLY = ['/spec'];
+/** Pages that exist in English only (the normative specification and API reference). */
+export const ENGLISH_ONLY = ['/spec', '/docs/api'];

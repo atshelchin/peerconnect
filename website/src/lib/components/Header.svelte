@@ -14,6 +14,7 @@
 	const switchTo = $derived(localize(ENGLISH_ONLY.includes(i18n.path) ? '/' : i18n.path, other));
 	const links = $derived([
 		{ path: '/docs', href: i18n.href('/docs'), label: t.nav.docs },
+		{ path: '/docs/api', href: '/docs/api', label: t.nav.api },
 		{ path: '/demo', href: i18n.href('/demo'), label: t.nav.demo },
 		{ path: '/spec', href: '/spec', label: t.nav.spec },
 		{ path: '/developers', href: i18n.href('/developers'), label: t.nav.developers }

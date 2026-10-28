@@ -28,15 +28,16 @@
 
 	const megabytes = (bytes: number) => `${(bytes / 1e6).toFixed(1)} MB`;
 
-	const webSnippet = $derived(`import { connect, Room } from "peerconnect";
-import { startConnect, finishConnect } from "peerconnect/auth";
+	const webSnippet = $derived(`# 1. ${a.stepOpen}
+${SITE_URL}/connect?app=${data.app.id}&redirect_uri=${encodeURIComponent(data.redirectUri)}&state=<state>&code_challenge=<S256 challenge>&code_challenge_method=S256&installation=<installation ID>
 
-// "Connect with PeerConnect": off to ${SITE_URL}, and back to your redirect URI.
-startConnect({ appId: "${data.app.id}", redirectUri: "${data.redirectUri}" });
-
-// On the redirect URI's page: the person's token, kept like a password.
-const { token } = await finishConnect({ appId: "${data.app.id}" });
-const conn = connect(Room.create("${data.relayUrl}"), { token });`);
+# 2. ${a.stepBack}
+#    ${data.redirectUri}?code=<code>&state=<state>
+curl ${SITE_URL}/api/token -H "content-type: application/json" -d '{
+  "grant_type": "authorization_code", "client_id": "${data.app.id}",
+  "code": "<code>", "code_verifier": "<verifier>", "redirect_uri": "${data.redirectUri}"
+}'
+# → {"token": "…", "relay_url": "${data.relayUrl}", "login": "…", …}`);
 
 	const serverSnippet = $derived(`curl ${SITE_URL}/api/apps/${data.app.id}/tokens \\
   -H "authorization: Bearer $PEERCONNECT_APP_SECRET" \\
@@ -86,10 +87,10 @@ const conn = connect(Room.create("${data.relayUrl}"), { token });`);
 
 	<h2>{a.integrate}</h2>
 	<h3>① {a.pathA}</h3>
-	<p>{a.pathALead}</p>
-	<CodeBlock code={webSnippet} lang="js" title="app.js" />
+	<p>{a.pathALead} <a href="/docs/api#sec-4">API §4</a></p>
+	<CodeBlock code={webSnippet} lang="sh" title="OAuth + PKCE" />
 	<h3>② {a.pathB}</h3>
-	<p>{a.pathBLead}</p>
+	<p>{a.pathBLead} <a href="/docs/api#sec-5">API §5</a></p>
 	<CodeBlock code={serverSnippet} lang="sh" title="server" />
 
 	<h3>{a.testToken}</h3>

@@ -81,7 +81,9 @@ const en = {
 		integrate: 'Integrate',
 		pathA: 'Your users connect with GitHub',
 		pathALead:
-			'Send people to peerconnect.dev/connect; they sign in and come back with a code, which your app exchanges for their token. In a web app:',
+			'Send people to peerconnect.dev/connect with a PKCE challenge; they sign in and come back with a code, which your app exchanges for their token.',
+		stepOpen: 'Open, in the browser (the system browser for native apps):',
+		stepBack: 'They come back with a code: exchange it, with the verifier.',
 		pathB: 'Your server issues the tokens',
 		pathBLead:
 			'Your users never see PeerConnect: your server asks for a token per user with the app secret, and hands it to your app.',
@@ -218,7 +220,9 @@ const zh: ConsoleDict = {
 		integrate: '接入',
 		pathA: '用户用 GitHub 连接',
 		pathALead:
-			'把用户带到 peerconnect.dev/connect，他们登录后带着 code 回来，你的应用用 code 换取他们的 token。网页应用里：',
+			'带着 PKCE challenge 把用户带到 peerconnect.dev/connect，他们登录后带着 code 回来，你的应用用 code 换取他们的 token。',
+		stepOpen: '在浏览器里打开（原生应用用系统浏览器）：',
+		stepBack: '用户带着 code 回来：连同 verifier 一起换取 token。',
 		pathB: '由你的服务器签发 token',
 		pathBLead:
 			'用户完全看不到 PeerConnect：你的服务器用 App Secret 为每个用户申请 token，再交给你的应用。',

@@ -8,17 +8,22 @@ export const en = {
 		home: {
 			title: 'PeerConnect — end-to-end encrypted channels between two apps',
 			description:
-				'Pair two apps with a QR code, then talk end-to-end encrypted through a stateless WebSocket relay that cannot read or forge a thing. Rust, JavaScript, self-hosted.'
+				'Pair two apps with a QR code, then talk end-to-end encrypted through a stateless WebSocket relay that cannot read or forge a thing. An open protocol and API.'
 		},
 		docs: {
 			title: 'Get started — PeerConnect',
 			description:
-				'Build with PeerConnect in JavaScript or Rust, and run your own relay on Cloudflare Workers, Docker or a single binary.'
+				'Get tokens for the PeerConnect relay, implement a client from the open specification in any language, and run your own relay on Cloudflare, Docker or one binary.'
 		},
 		demo: {
 			title: 'Live demo: pair two browsers — PeerConnect',
 			description:
 				'Pair two browsers with a QR code and chat end-to-end encrypted through a public PeerConnect relay. Runs the real protocol in WebAssembly.'
+		},
+		api: {
+			title: 'API reference — PeerConnect',
+			description:
+				'The PeerConnect HTTP API: app IDs and secrets, Connect with PeerConnect (OAuth with PKCE), server-issued tokens, trial tokens, and tokens on the relay.'
 		},
 		spec: {
 			title: 'Protocol specification v1 — PeerConnect',
@@ -36,6 +41,7 @@ export const en = {
 		demo: 'Demo',
 		spec: 'Spec',
 		developers: 'Developers',
+		api: 'API',
 		github: 'GitHub',
 		skip: 'Skip to content',
 		language: 'Language',
@@ -92,8 +98,8 @@ export const en = {
 					text: 'After first contact, both peers move to a room ID derived from their two identities. A leaked QR code or link leads nowhere.'
 				},
 				{
-					title: 'Runs where you are',
-					text: 'One Rust core with no I/O powers the Linux relay, the Cloudflare Workers relay, the Rust client and — compiled to WebAssembly — the JavaScript SDK for browsers, Node.js, Deno and Bun.'
+					title: 'Any language',
+					text: 'An open specification with test vectors: implement a peer in any language, or have your AI agent do it from llms.txt. The Rust and JavaScript implementations in the repository are there to read.'
 				},
 				{
 					title: 'Specified and tested',
@@ -129,11 +135,11 @@ export const en = {
 			]
 		},
 		code: {
-			eyebrow: 'Developer experience',
-			title: 'A private channel in a few lines',
+			eyebrow: 'API',
+			title: 'An API, a protocol and llms.txt',
 			intro:
-				'The same protocol and the same core in the browser and on the server. Connections reconnect and resume on their own.',
-			note: '<code>npm install peerconnect</code> · <code>cargo add peerconnect</code> — see <a href="{docs}#install">Install</a>.'
+				'Get tokens over HTTP, implement the open protocol in any language, or hand the specification to your AI agent.',
+			note: 'No SDK to install: see <a href="{docs}#access">Get access</a>, the <a href="/docs/api">API reference</a> and <a href="/llms.txt">llms.txt</a>.'
 		},
 		relay: {
 			eyebrow: 'Self-hosting',
@@ -325,7 +331,7 @@ export const en = {
 	},
 	footer: {
 		tagline: 'An open protocol for private, reliable channels between two apps.',
-		license: 'Code dual-licensed MIT or Apache-2.0.',
+		license: 'Code under the MIT license.',
 		project: 'Project',
 		resources: 'Resources',
 		publicRelay: 'Public relay',

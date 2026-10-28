@@ -7,6 +7,7 @@ const PAGES: { path: string; translated: boolean; priority: string }[] = [
 	{ path: '/', translated: true, priority: '1.0' },
 	{ path: '/docs', translated: true, priority: '0.9' },
 	{ path: '/demo', translated: true, priority: '0.8' },
+	{ path: '/docs/api', translated: false, priority: '0.9' },
 	{ path: '/spec', translated: false, priority: '0.8' }
 ];
 

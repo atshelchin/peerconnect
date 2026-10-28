@@ -6,17 +6,22 @@ export const zh: Dict = {
 		home: {
 			title: 'PeerConnect — 两个应用之间的端到端加密通道',
 			description:
-				'扫码配对两个应用，经由无状态的 WebSocket 中继进行端到端加密通信，中继既读不到也伪造不了任何消息。提供 Rust 与 JavaScript 实现，可自行部署。'
+				'扫码配对两个应用，经由无状态的 WebSocket 中继进行端到端加密通信，中继既读不到也伪造不了任何消息。开放协议、HTTP API 与 llms.txt，可自行部署。'
 		},
 		docs: {
 			title: '快速上手 — PeerConnect',
 			description:
-				'用 JavaScript 或 Rust 接入 PeerConnect，并在 Cloudflare Workers、Docker 或单个二进制文件上运行你自己的中继。'
+				'获取 PeerConnect relay 的 token，按开放的协议规范用任意语言实现客户端，并在 Cloudflare Workers、Docker 或单个二进制文件上运行你自己的中继。'
 		},
 		demo: {
 			title: '在线演示：配对两个浏览器 — PeerConnect',
 			description:
 				'用二维码配对两个浏览器，通过公共 PeerConnect 中继进行端到端加密聊天。演示运行的是编译为 WebAssembly 的真实协议实现。'
+		},
+		api: {
+			title: 'API 参考 — PeerConnect',
+			description:
+				'PeerConnect HTTP API：App ID 与 App Secret、OAuth + PKCE 连接、服务端签发 token、试用 token，以及 relay 上的 token。'
 		},
 		spec: {
 			title: '协议规范 v1 — PeerConnect',
@@ -34,6 +39,7 @@ export const zh: Dict = {
 		demo: '演示',
 		spec: '规范',
 		developers: '开发者',
+		api: 'API',
 		github: 'GitHub',
 		skip: '跳到正文',
 		language: '语言',
@@ -89,8 +95,8 @@ export const zh: Dict = {
 					text: '首次连接后，两端会迁移到一个由双方身份推导出的房间 ID。二维码或链接即使泄露，也找不到任何人。'
 				},
 				{
-					title: '随处可运行',
-					text: '同一个不含 I/O 的 Rust 核心驱动 Linux 中继、Cloudflare Workers 中继、Rust 客户端，并编译为 WebAssembly 供浏览器、Node.js、Deno 和 Bun 使用。'
+					title: '任意语言',
+					text: '开放的协议规范与测试向量：用任意语言实现一个端，或者让你的 AI agent 照着 llms.txt 来写。仓库里的 Rust 和 JavaScript 实现可供参考。'
 				},
 				{
 					title: '有规范，有测试',
@@ -126,10 +132,10 @@ export const zh: Dict = {
 			]
 		},
 		code: {
-			eyebrow: '开发体验',
-			title: '几行代码，一条私密通道',
-			intro: '浏览器与服务器使用同一个协议、同一个核心。连接会自动重连并续传。',
-			note: '<code>npm install peerconnect</code> · <code>cargo add peerconnect</code>，详见<a href="{docs}#install">安装</a>。'
+			eyebrow: 'API',
+			title: 'API、协议与 llms.txt',
+			intro: '通过 HTTP 获取 token，用任意语言实现开放协议，或者把规范交给你的 AI agent。',
+			note: '不需要安装 SDK：见<a href="{docs}#access">获取凭证</a>、<a href="/docs/api">API 参考</a>和 <a href="/llms.txt">llms.txt</a>。'
 		},
 		relay: {
 			eyebrow: '自行部署',
@@ -310,7 +316,7 @@ export const zh: Dict = {
 	},
 	footer: {
 		tagline: '一个在两个应用之间建立私密、可靠通道的开放协议。',
-		license: '代码采用 MIT 或 Apache-2.0 双许可。',
+		license: '代码采用 MIT 许可证。',
 		project: '项目',
 		resources: '资源',
 		publicRelay: '公共中继',

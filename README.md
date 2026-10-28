@@ -17,13 +17,21 @@ PeerConnect connects two applications — a phone and a laptop, a web app and a 
 - **Stateless relay.** A room exists on a relay only while someone is connected. A relay can restart, or be replaced by another one, and peers simply reconnect: the room is defined by keys the peers hold, not by anything stored on the server.
 - **Reliable, in order, exactly once.** Messages are numbered and kept by their sender until acknowledged, then resent after any disconnection, so nothing is lost or duplicated while both peers keep running. The sender is the offline queue; the relay stores nothing.
 - **Invites expire by design.** Once paired, the peers move to a room ID derived from their two identities. A leaked invite reaches nobody.
-- **One codebase.** A Rust core with no I/O runs the Linux relay, the Cloudflare relay, the Rust client and, compiled to WebAssembly, the JavaScript client.
+- **Any language.** An open specification with test vectors; a Rust core with no I/O runs both relays and the reference implementations.
 
 Groups of up to four members with voice and video, over QUIC, were part of PeerConnect until the tag [`groups-voice-video`](https://github.com/atshelchin/peerconnect/tree/groups-voice-video); `main` is two-peer rooms only.
 
-## Quick start
+## Using it
 
-### Run a relay
+PeerConnect is offered as an API, not as an SDK:
+
+- **The relay protocol**, [SPEC.md](SPEC.md): what a peer sends and expects, with [test vectors](test-vectors). Your application implements the peer side, in any language.
+- **The HTTP API**, [API.md](API.md): `wss://relay.peerconnect.dev` requires a token on each connection, which says which application uses the relay and nothing more. Try it with a trial token (`POST https://peerconnect.dev/api/trial`); for an application, register it on [peerconnect.dev/developers](https://peerconnect.dev/developers) for an app ID and an app secret, and either let your users connect it with their GitHub account (OAuth 2.0 with PKCE) or have your server issue a token per user with the app secret.
+- **[llms.txt](https://peerconnect.dev/llms.txt)** and **[llms-full.txt](https://peerconnect.dev/llms-full.txt)**, for an AI agent writing the client.
+
+The Rust core ([`crates/peerconnect`](crates/peerconnect)) and the JavaScript implementation ([`js/`](js)) in this repository are reference implementations: read them, test against them, but they are not published or supported as packages.
+
+## Run a relay
 
 **Docker**, behind any TLS-terminating proxy:
 
@@ -41,73 +49,9 @@ cargo install worker-build
 cd crates/peerconnect-worker && npx wrangler deploy
 ```
 
-**Binary**: `cargo install peerconnect-relay`, then run `peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`. `PEERCONNECT_TOKEN_SECRET` makes it require tokens ([SPEC §4.1](SPEC.md)): `peerconnect-relay token <client> --ttl 30d` mints one.
+**Binary**: `cargo install peerconnect-relay`, then run `peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`. `PEERCONNECT_TOKEN_SECRET` makes it require tokens (SPEC §4.1): `peerconnect-relay token <client> --ttl 30d` mints one. Without it, a relay admits everyone.
 
-### Tokens for the public relay
-
-`wss://relay.peerconnect.dev` requires a token on each connection, which says which application uses the relay and nothing more ([SPEC §4.1](SPEC.md), [docs/self-serve.md](docs/self-serve.md)). Try it with the public trial (`connect(room, { token: trialToken })`, from `peerconnect/auth`); for an application, register it on [peerconnect.dev/developers](https://peerconnect.dev/developers) for an app ID and an app secret, and either let your users connect it with their GitHub account (OAuth with PKCE: `startConnect` / `finishConnect`) or have your server issue a token per user with the app secret. Your own relay needs no token unless you set `PEERCONNECT_TOKEN_SECRET`.
-
-### JavaScript (browsers, Node.js 22+, Deno, Bun)
-
-```sh
-npm install peerconnect
-```
-
-```js
-import { connect, Room } from "peerconnect";
-
-// Peer A creates a room and shows the invite (e.g. as a QR code).
-const room = Room.create("wss://relay.example.com");
-showQrCode(room.invite);
-
-const conn = connect(room);
-conn.addEventListener("paired", () => save(conn.room.toString())); // persist: it is a secret
-conn.addEventListener("state", () => console.log(conn.state));     // offline | waiting | connected | closed
-conn.addEventListener("message", (e) => console.log(new TextDecoder().decode(e.data)));
-
-// Peer B scans it, and saves its room right away (it holds the identity A will pin).
-const joined = Room.join(scannedInvite);
-save(joined.toString());
-const connB = connect(joined);
-connB.addEventListener("paired", () => save(connB.room.toString()));
-connB.send("hello");                  // queued; delivered as soon as A is reachable
-connB.addEventListener("delivered", (e) => console.log("A has everything below", e.detail));
-
-// Later, after a restart: connect(savedString) and carry on. Both sides reconnect on their own.
-// To end the room: conn.close(), save conn.room (it is now "closing"), delete it once closed.
-```
-
-The WebAssembly is inlined, so the package loads without bundler configuration (46 KB gzipped). To build it from source: `sh js/scripts/build.sh` (needs `wasm-bindgen-cli`).
-
-### Rust
-
-```toml
-peerconnect = { version = "0.1", features = ["client"] }
-```
-
-```rust
-use peerconnect::{client, Event, Room, State};
-
-let room = Room::join(&invite.parse()?);
-save(&room.to_string());               // before connecting: it holds the identity the inviter pins
-let mut conn = client::connect(room);
-conn.send(b"hello").await?;            // queued until the inviter is reachable
-while let Some(event) = conn.next().await {
-    match event {
-        Event::Message(data) => println!("{}", String::from_utf8_lossy(&data)),
-        Event::Paired => save(&conn.room().to_string()),
-        Event::State(State::Closed(_)) => break,
-        _ => {}
-    }
-}
-```
-
-Without the `client` feature the crate does no I/O: [`Peer`](crates/peerconnect/src/peer.rs) is a state machine that any WebSocket library and event loop can drive. Try the terminal chat:
-
-```sh
-cargo run -p peerconnect --features client --example chat -- new ws://localhost:8080 room-a
-cargo run -p peerconnect --features client --example chat -- join '<invite>' room-b
-```
+To try the protocol from a terminal, the reference implementation has a chat example: `cargo run -p peerconnect --features client --example chat -- new wss://relay.peerconnect.dev room-a` (with `PEERCONNECT_TOKEN` set to a token), then `… -- join '<invite>' room-b` in a second terminal.
 
 ## How it works
 
@@ -125,13 +69,14 @@ The design decisions, and how they differ from the original draft, are explained
 | Path | What |
 |---|---|
 | [`SPEC.md`](SPEC.md) | The protocol, version 1 |
+| [`API.md`](API.md) | The HTTP API: app IDs and secrets, tokens |
 | [`test-vectors/`](test-vectors) | Conformance vectors, and an independent checker written from the spec |
-| [`crates/peerconnect`](crates/peerconnect) | Protocol core (no I/O), plus the optional Tokio client |
+| [`crates/peerconnect`](crates/peerconnect) | Protocol core (no I/O), plus a Tokio client: the reference implementation |
 | [`crates/peerconnect-relay`](crates/peerconnect-relay) | Relay for Linux and Docker (Tokio, hyper, tungstenite) |
 | [`crates/peerconnect-worker`](crates/peerconnect-worker) | Relay for Cloudflare Workers and Durable Objects |
-| [`crates/peerconnect-wasm`](crates/peerconnect-wasm), [`js/`](js) | JavaScript SDK |
+| [`crates/peerconnect-wasm`](crates/peerconnect-wasm), [`js/`](js) | JavaScript reference implementation (the core in WebAssembly), used by the live demo; not published |
 | [`deploy/`](deploy) | docker-compose with automatic HTTPS |
-| [`website/`](website) | [peerconnect.dev](https://peerconnect.dev): introduction, guide, specification and live demo, in English and Chinese |
+| [`website/`](website) | [peerconnect.dev](https://peerconnect.dev): introduction, guide, API reference, specification, llms.txt, developer accounts and live demo, in English and Chinese |
 
 ## Testing
 
@@ -139,7 +84,7 @@ The design decisions, and how they differ from the original draft, are explained
 cargo test                              # unit tests, deterministic simulation, end-to-end over real sockets
 node test-vectors/verify.mjs            # re-derives every test vector with node:crypto only
 PEERCONNECT_RELAY=ws://127.0.0.1:8787 cargo test -p peerconnect-relay --test e2e   # same suite against any relay
-cd js && npm run build && npm test      # JavaScript SDK, including interop with the Rust client
+cd js && npm run build && npm test      # the JavaScript reference implementation, including interop with the Rust one
 ```
 
 What is covered:
@@ -155,7 +100,7 @@ What is covered:
   - relay restarts, replacement, keepalive loss, lost handshakes, tampering and reconnection storms.
 - **Flow control.** Regression tests send 16 MiB both ways at once, echo from inside the event loop, starve a sender with a peer that stops reading, and (opt-in, 80 s) trickle 16 MiB to a slow reader.
 - **End-to-end suite.** The same tests pass against the Linux relay and against the Cloudflare Worker running in local `workerd`, including a long idle test that confirms Durable Object hibernation and recovery.
-- **JavaScript SDK.** Tested in Node 22, Deno 2.7, Bun 1.4 and headless Chrome 155, against both relays, and talking to the Rust client.
+- **JavaScript reference implementation.** Tested in Node 22, Deno 2.7, Bun 1.4 and headless Chrome 155, against both relays, and talking to the Rust client.
 
 ## Performance
 
@@ -190,4 +135,4 @@ These are loopback numbers: they show the protocol's and the relay's own overhea
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT; see [LICENSE](LICENSE).

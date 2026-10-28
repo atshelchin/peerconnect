@@ -67,7 +67,9 @@ test('the sitemap lists every page, and each one exists', async ({ request }) =>
 	const xml = await (await request.get('/sitemap.xml')).text();
 	const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
 	expect(locs.sort()).toEqual(
-		['/', '/zh', '/docs', '/zh/docs', '/demo', '/zh/demo', '/spec'].map((p) => SITE + p).sort()
+		['/', '/zh', '/docs', '/zh/docs', '/docs/api', '/demo', '/zh/demo', '/spec']
+			.map((p) => SITE + p)
+			.sort()
 	);
 	for (const loc of locs) expect((await request.get(loc.replace(SITE, ''))).status()).toBe(200);
 });
@@ -104,4 +106,23 @@ test('only the demo loads the WebAssembly SDK', async ({ page }) => {
 	await page.goto('/demo', { waitUntil: 'networkidle' });
 	await expect(page.getByRole('button', { name: 'Create a room' })).toBeVisible();
 	expect(Math.max(...scripts)).toBeGreaterThan(150_000);
+});
+
+test('the API reference, llms.txt and the raw documents are served', async ({ page, request }) => {
+	await page.goto('/docs/api');
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('PeerConnect API');
+	await expect(page.locator('a[href="/spec#sec-4-1"]').first()).toBeVisible();
+	const llms = await request.get('/llms.txt');
+	expect(llms.headers()['content-type']).toContain('text/plain');
+	const text = await llms.text();
+	expect(text).toMatch(/^# PeerConnect\n\n> /);
+	expect(text).toContain('/docs/api.md');
+	expect(text).toContain('not to install');
+	const full = await (await request.get('/llms-full.txt')).text();
+	expect(full).toContain('# PeerConnect API');
+	expect(full).toContain('# PeerConnect Protocol, version 1');
+	for (const path of ['/spec.md', '/docs/api.md']) {
+		const res = await request.get(path);
+		expect(res.headers()['content-type']).toContain('text/markdown');
+	}
 });

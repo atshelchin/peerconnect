@@ -1,10 +1,8 @@
 <script module lang="ts">
 	export const toc = [
 		{ id: 'concepts', label: 'Concepts' },
-		{ id: 'install', label: 'Install' },
-		{ id: 'tokens', label: 'Tokens' },
-		{ id: 'javascript', label: 'JavaScript' },
-		{ id: 'rust', label: 'Rust' },
+		{ id: 'access', label: 'Get access' },
+		{ id: 'client', label: 'Build a client' },
 		{ id: 'relay', label: 'Run a relay' },
 		{ id: 'limits', label: 'Limits' },
 		{ id: 'security', label: 'Security checklist' },
@@ -15,23 +13,15 @@
 <script lang="ts">
 	import CodeBlock from '#lib/components/CodeBlock.svelte';
 	import { RELAY_URL, REPO_URL } from '#lib/site.ts';
-	import {
-		binary,
-		installJs,
-		cloudflare,
-		docker,
-		jsFull,
-		tokensJs,
-		rustDependency,
-		rustFull
-	} from '#lib/snippets.ts';
+	import { accessSh, binary, cloudflare, docker } from '#lib/snippets.ts';
 </script>
 
 <h1>Get started</h1>
 <p class="lead">
 	PeerConnect gives two applications a private, reliable channel through a relay neither has to
-	trust. This guide covers the ideas you need, the JavaScript and Rust libraries, and running your
-	own relay.
+	trust. It is offered as an API: this guide covers the ideas you need, getting access, what a
+	client implements, and running your own relay. The <a href="/docs/api">API reference</a> and the
+	<a href="/spec">specification</a> have every detail.
 </p>
 
 <h2 id="concepts">Concepts</h2>
@@ -59,16 +49,16 @@
 	</dd>
 	<dt>Room record</dt>
 	<dd>
-		Everything a peer needs to reconnect, as a string: <code>room.toString()</code>. It contains
-		secrets, so store it like a password. Save it when you create or join a room, after
-		<code>paired</code>, and after <code>close()</code>.
+		Everything a peer needs to reconnect: the room secret, its identity key, the peer’s key once
+		pinned, and where the two meet (<a href="/spec#sec-3-4">§3.4</a>). It contains secrets, so store
+		it like a password. Save it when the room is created or joined, when pairing completes, and when
+		the room starts closing.
 	</dd>
 	<dt>Connection</dt>
 	<dd>
-		A live link to the room. It reconnects on its own, and its state is one of
-		<code>offline</code> (connecting or waiting to retry), <code>waiting</code> (on the relay, the
-		peer is not), <code>connected</code> (end-to-end session established) and
-		<code>closed</code>.
+		A peer’s live link to the room through the relay. A client reconnects on its own, with backoff,
+		and is <em>offline</em> (connecting or waiting to retry), <em>waiting</em> (on the relay, the
+		peer is not), <em>connected</em> (end-to-end session established) or <em>closed</em>.
 	</dd>
 	<dt>Delivery</dt>
 	<dd>
@@ -78,151 +68,82 @@
 	</dd>
 </dl>
 
-<h2 id="install">Install</h2>
-<p>
-	The JavaScript SDK is on npm and the Rust crates are on crates.io, all at version 0.1 while the
-	protocol is a draft.
-</p>
-<h3>JavaScript</h3>
-<p>
-	The JavaScript SDK is the Rust core compiled to WebAssembly, inlined into the package so it loads
-	in browsers, Node.js 22+, Deno and Bun without bundler configuration (46 KB gzipped).
-</p>
-<CodeBlock code={installJs('en')} lang="sh" title="shell" />
-<h3>Rust</h3>
-<p>
-	The crate does no I/O by default: its <code>Peer</code> is a state machine that any WebSocket
-	library and event loop can drive. The <code>client</code> feature adds a ready-made Tokio client.
-</p>
-<CodeBlock code={rustDependency} lang="toml" title="Cargo.toml" />
-<p>
-	To build from source instead, clone <a href={REPO_URL} rel="external">the repository</a>: its
-	README has the steps.
-</p>
-
-<h2 id="tokens">Tokens</h2>
+<h2 id="access">Get access</h2>
 <p>
 	The public relay, <code>{RELAY_URL}</code>, requires a token on every connection, so that it knows
-	which application uses it and can stop abuse; it learns nothing more from it than before. Each
-	peer brings its own token, which is not part of the room or the invite. There are three ways to
-	get one:
+	which application uses it and can stop abuse; it learns nothing more from it. Each peer brings its
+	own token, which is not part of the room or the invite. There are three ways to get one:
 </p>
 <ol>
 	<li>
-		<strong>The public trial</strong>, for trying PeerConnect: <code>trialToken</code> fetches a token
-		that lasts two hours, without an account.
+		<strong>The public trial</strong>, for trying PeerConnect: <code>POST /api/trial</code> answers a
+		token that lasts two hours, without an account.
 	</li>
 	<li>
 		<strong>Your users connect your app.</strong> Register it on
 		<a href="/developers">the developers page</a> (sign in with GitHub) for an app ID and an app
 		secret. People open <code>peerconnect.dev/connect</code> from your app, sign in, and come back with
-		a code that your app exchanges for their token (OAuth with PKCE).
+		a code that your app exchanges for their token (OAuth 2.0 with PKCE).
 	</li>
 	<li>
 		<strong>Your server issues the tokens</strong>, for apps whose users have no reason to see
 		PeerConnect: it asks for one per user with the app secret.
 	</li>
 </ol>
-<CodeBlock code={tokensJs('en')} lang="js" title="tokens.js" />
+<CodeBlock code={accessSh('en')} lang="sh" title="shell" />
 <p>
-	Pass a function as <code>token</code> and the connection asks it again whenever the relay refuses
-	the token (close code 4403), then carries on with nothing lost. Your own relay needs no token
-	unless you give it a secret (<a href="#binary"><code>PEERCONNECT_TOKEN_SECRET</code></a>).
+	A peer connects to <code>{RELAY_URL}/v1/&lt;room ID&gt;?token=&lt;token&gt;</code>. If the relay
+	closes the connection with 4403, the token is missing, invalid or revoked: get a new one before
+	connecting again. With 4429, wait at least a minute. Every request, answer and error is in the
+	<a href="/docs/api">API reference</a>. Your own relay needs no token unless you give it a secret (<a
+		href="#binary"><code>PEERCONNECT_TOKEN_SECRET</code></a
+	>).
 </p>
 
-<h2 id="javascript">JavaScript</h2>
+<h2 id="client">Build a client</h2>
 <p>
-	One peer creates a room and shows the invite; the other joins with it. Both persist their room
-	record so they can reconnect later, from anywhere.
+	There is no SDK to install: your application implements the peer side of the
+	<a href="/spec">specification</a>, with any WebSocket library and the usual primitives (Ed25519,
+	X25519, ChaCha20-Poly1305, SHA-256). What it takes:
 </p>
-<CodeBlock code={jsFull('en')} lang="js" title="app.js" />
-<h3>Connection events</h3>
-<div class="table">
-	<table>
-		<thead><tr><th>Event</th><th>When</th></tr></thead>
-		<tbody>
-			<tr
-				><td><code>state</code></td><td
-					><code>conn.state</code> (and <code>conn.reason</code>) changed.</td
-				></tr
-			>
-			<tr
-				><td><code>message</code></td><td
-					>A message arrived: authenticated, decrypted, in order. <code>e.data</code> is a
-					<code>Uint8Array</code>.</td
-				></tr
-			>
-			<tr
-				><td><code>delivered</code></td><td
-					>The peer has received every message whose id is below <code>e.detail</code>.</td
-				></tr
-			>
-			<tr
-				><td><code>paired</code></td><td
-					>Pairing completed; the room moved to its pair ID. Save <code>conn.room.toString()</code> again.</td
-				></tr
-			>
-			<tr
-				><td><code>replaced</code></td><td
-					>Another connection took this peer’s seat — the same room open elsewhere. The connection
-					retries in a minute; call <code>leave()</code> to let the other one keep it.</td
-				></tr
-			>
-		</tbody>
-	</table>
-</div>
-<h3>Methods</h3>
-<div class="table">
-	<table>
-		<thead><tr><th>Call</th><th>Does</th></tr></thead>
-		<tbody>
-			<tr
-				><td><code>Room.create(relay)</code></td><td
-					>Creates a room; you are the inviter. <code>room.invite</code> is the invite.</td
-				></tr
-			>
-			<tr
-				><td><code>Room.join(invite)</code></td><td
-					>Accepts an invite; you are the joiner. Save the record before connecting.</td
-				></tr
-			>
-			<tr><td><code>Room.parse(record)</code></td><td>Restores a saved room.</td></tr>
-			<tr
-				><td><code>connect(room, &#123; token &#125;)</code></td><td
-					>Connects and keeps the room connected until left or closed.</td
-				></tr
-			>
-			<tr
-				><td><code>conn.send(data)</code></td><td
-					>Queues a message (string or bytes, up to 16 MiB) and returns its id. Throws when 64 MiB
-					already await acknowledgement, or once the room is closing.</td
-				></tr
-			>
-			<tr
-				><td><code>conn.leave()</code></td><td
-					>Disconnects, keeping the room for later. Unacknowledged messages are dropped.</td
-				></tr
-			>
-			<tr
-				><td><code>conn.close()</code></td><td
-					>Ends the room for both peers. The connection carries on until the peer has been told;
-					save <code>conn.room</code>, then delete it once closed.</td
-				></tr
-			>
-		</tbody>
-	</table>
-</div>
-
-<h2 id="rust">Rust</h2>
+<ol>
+	<li>
+		<strong>Rooms and invites</strong> (<a href="/spec#sec-3">§3</a>): the room secret, the room ID
+		derived from it, the invite, and the record each peer keeps.
+	</li>
+	<li>
+		<strong>Joining the relay</strong> (<a href="/spec#sec-4">§4</a>): the endpoint, the HELLO
+		challenge and the signed JOIN, presence, and the keepalive.
+	</li>
+	<li>
+		<strong>The handshake and pairing</strong> (<a href="/spec#sec-5-1">§5.1</a>–<a
+			href="/spec#sec-5-2">5.2</a
+		>): <code>Noise_IKpsk1_25519_ChaChaPoly_SHA256</code>, the inviter pinning the joiner, the move
+		to the pair ID.
+	</li>
+	<li>
+		<strong>The reliable stream</strong> (<a href="/spec#sec-5-3">§5.3</a>–<a href="/spec#sec-5-5"
+			>5.5</a
+		>): numbered messages, acknowledgements, resending after a reconnection, and ending a room.
+	</li>
+	<li>
+		<strong>The connection lifecycle</strong> (<a href="/spec#sec-6">§6</a>) and the timers (<a
+			href="/spec#sec-7">§7</a
+		>).
+	</li>
+</ol>
 <p>
-	The Tokio client mirrors the JavaScript API: <code>send</code> queues and returns an id,
-	<code>next()</code> yields events, and the connection reconnects and resumes by itself.
-</p>
-<CodeBlock code={rustFull('en')} lang="rust" title="main.rs" />
-<p>
-	Try it from a terminal with the chat example:
-	<code>cargo run -p peerconnect --features client --example chat -- new {RELAY_URL} room-a</code>,
-	then <code>… -- join '&lt;invite&gt;' room-b</code> in a second terminal.
+	Check every derivation against the
+	<a href={`${REPO_URL}/tree/main/test-vectors`} rel="external">test vectors</a> before talking to
+	anyone. The repository's own implementations are there to read and to test against, not to
+	install:
+	<a href={`${REPO_URL}/tree/main/crates/peerconnect`} rel="external">the Rust core</a>, a state
+	machine without I/O (<code>src/peer.rs</code>), and
+	<a href={`${REPO_URL}/tree/main/js`} rel="external">the JavaScript one</a>, the same core in
+	WebAssembly driven by about 200 lines of JavaScript. For an AI agent writing the client,
+	<a href="/llms.txt">/llms.txt</a> has the essentials and
+	<a href="/llms-full.txt">/llms-full.txt</a>
+	everything.
 </p>
 
 <h2 id="relay">Run a relay</h2>
@@ -289,7 +210,7 @@
 			>
 			<tr
 				><td>Messages held for the peer</td><td
-					>64 MiB; beyond that <code>send</code> throws (JavaScript) or waits (Rust)</td
+					>64 MiB in the reference implementations; beyond that a sender refuses or waits</td
 				></tr
 			>
 			<tr
@@ -313,7 +234,7 @@
 	</li>
 	<li>
 		Where pairing the wrong device would be costly, let users compare a short code derived from both
-		identity keys (<code>room.publicKey</code> and <code>room.peerKey</code>) — the demo shows one.
+		identity keys (the two identity public keys) — the demo shows one.
 	</li>
 	<li>Delete a room’s record once the room is closed.</li>
 </ul>
@@ -321,14 +242,14 @@
 <h2 id="limitations">Limitations</h2>
 <ul>
 	<li>
-		<strong>The queue lives in the sender’s memory.</strong> Messages survive disconnections and
-		relay restarts, but not the sending process: keep your own copy until you see
-		<code>delivered</code> if you need delivery across restarts. A receiver that restarts may get again
-		what it received in its last ~50 ms.
+		<strong>The queue lives in the sender’s memory.</strong> Messages survive disconnections and relay
+		restarts, but not the sending process: keep your own copy until the peer has acknowledged it if you
+		need delivery across restarts. A receiver that restarts may get again what it received in its last
+		~50 ms.
 	</li>
 	<li>
-		<strong>Ending a room needs both peers online once more.</strong> <code>close()</code> keeps trying
-		until the other peer acknowledges; a peer that never returns is never told.
+		<strong>Ending a room needs both peers online once more.</strong> A closing peer keeps trying until
+		the other peer acknowledges; a peer that never returns is never told.
 	</li>
 	<li>
 		<strong>Before pairing, the invite is a bearer credential.</strong> Whoever uses it first pairs. The

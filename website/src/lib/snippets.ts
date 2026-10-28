@@ -1,98 +1,11 @@
 // Code shown on the site, with comments in the reader's language.
 
 import type { Lang } from '#lib/i18n/index.ts';
-import { RELAY_URL, REPO_URL } from '#lib/site.ts';
+import { RELAY_URL, REPO_URL, SITE_URL } from '#lib/site.ts';
 
 const REPO = REPO_URL ?? '<repository>';
 
 const pick = (lang: Lang, en: string, zh: string) => (lang === 'zh' ? zh : en);
-
-export function jsQuick(lang: Lang): string {
-	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `import { connect, Room } from "peerconnect";
-import { trialToken } from "peerconnect/auth"; // ${c('or your app’s tokens: peerconnect.dev/developers', '或用你应用的 token：peerconnect.dev/developers')}
-
-// ${c('Device A: create a room and show its invite as a QR code.', '设备 A：创建房间，把邀请显示成二维码。')}
-const room = Room.create("${RELAY_URL}");
-showQrCode(room.invite);
-const a = connect(room, { token: trialToken });
-a.addEventListener("message", (e) => {
-  console.log(new TextDecoder().decode(e.data));
-});
-
-// ${c('Device B: join with the scanned invite and say hello.', '设备 B：用扫到的邀请加入，打个招呼。')}
-const b = connect(Room.join(scannedInvite), { token: trialToken });
-b.send("hello"); // ${c('queued until A is reachable, delivered exactly once', '在 A 可达之前排队，恰好送达一次')}
-
-// ${c('Persist conn.room.toString() to reconnect after a restart.', '保存 conn.room.toString()，重启后即可重新连接。')}`;
-}
-
-export function rustQuick(lang: Lang): string {
-	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `use peerconnect::{client, Event, Room};
-
-let room = Room::join(&invite.parse()?);
-let token = std::env::var("PEERCONNECT_TOKEN").ok(); // ${c('peerconnect.dev/developers', 'peerconnect.dev/developers')}
-let mut conn = client::connect_with_token(room, token);
-conn.send(b"hello").await?; // ${c('queued until the inviter is reachable', '在邀请方可达之前排队')}
-
-while let Some(event) = conn.next().await {
-    if let Event::Message(data) = event {
-        println!("{}", String::from_utf8_lossy(&data));
-    }
-}`;
-}
-
-export function jsFull(lang: Lang): string {
-	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `import { connect, Room } from "peerconnect";
-
-// ${c('Peer A creates a room and shows the invite (e.g. as a QR code).', '端 A 创建房间并展示邀请（例如二维码）。')}
-const room = Room.create("${RELAY_URL}");
-showQrCode(room.invite);
-
-const conn = connect(room, { token }); // ${c('see Tokens', '见“Token”一节')}
-conn.addEventListener("paired", () => save(conn.room.toString())); // ${c('a secret: store it safely', '这是秘密，请妥善保存')}
-conn.addEventListener("state", () => console.log(conn.state));     // offline | waiting | connected | closed
-conn.addEventListener("message", (e) => console.log(new TextDecoder().decode(e.data)));
-
-// ${c('Peer B scans it and saves its room at once: it holds the identity A will pin.', '端 B 扫码后立即保存房间：其中包含 A 将要记住的身份。')}
-const joined = Room.join(scannedInvite);
-save(joined.toString());
-const connB = connect(joined, { token: tokenB }); // ${c('each peer its own', '每一端各用自己的')}
-connB.addEventListener("paired", () => save(connB.room.toString()));
-connB.send("hello"); // ${c('queued; delivered as soon as A is reachable', '先排队，A 一可达就送达')}
-connB.addEventListener("delivered", (e) => console.log("A has everything below", e.detail));
-
-// ${c('After a restart: connect(savedString) and carry on.', '重启之后：connect(savedString) 即可继续。')}
-// ${c('To end the room: conn.close(), save conn.room, delete it once closed.', '结束房间：conn.close()，保存 conn.room，关闭后删除。')}`;
-}
-
-export function rustFull(lang: Lang): string {
-	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `use peerconnect::{client, Event, Room, State};
-
-let room = Room::join(&invite.parse()?);
-save(&room.to_string());               // ${c('before connecting: it holds the identity the inviter pins', '连接之前保存：其中包含邀请方将要记住的身份')}
-let mut conn = client::connect_with_token(room, Some(token)); // ${c('see Tokens', '见“Token”一节')}
-conn.send(b"hello").await?;            // ${c('queued until the inviter is reachable', '在邀请方可达之前排队')}
-while let Some(event) = conn.next().await {
-    match event {
-        Event::Message(data) => println!("{}", String::from_utf8_lossy(&data)),
-        Event::Paired => save(&conn.room().to_string()),
-        Event::State(State::Closed(_)) => break,
-        _ => {}
-    }
-}`;
-}
-
-export function installJs(lang: Lang): string {
-	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `npm install peerconnect      # ${c('or: pnpm add, bun add, deno add npm:peerconnect', '或：pnpm add、bun add、deno add npm:peerconnect')}`;
-}
-
-export const rustDependency = `[dependencies]
-peerconnect = { version = "0.1", features = ["client"] }`;
 
 export function cloudflare(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
@@ -122,20 +35,48 @@ export PEERCONNECT_TOKEN_SECRET=$(openssl rand -hex 32)
 peerconnect-relay token my-app --ttl 30d`;
 }
 
-export function tokensJs(lang: Lang): string {
+export function accessSh(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
-	return `import { connect, Room } from "peerconnect";
-import { finishConnect, startConnect, trialToken } from "peerconnect/auth";
+	return `# ${c('Try it: a trial token, no account (two hours)', '试用：无需账户的试用 token（两小时）')}
+curl -X POST ${SITE_URL}/api/trial
+# → {"token": "eyJ…", "expires_at": …, "relay_url": "${RELAY_URL}"}
 
-// ${c('1. Trying it out: the public trial, no account (two hours, tight limits).', '1. 试用：公开试用通道，无需账户（两小时，限额较低）。')}
-const conn = connect(Room.create("${RELAY_URL}"), { token: trialToken });
+# ${c('Your app’s server: a token per user of yours, with the app secret', '你的应用服务器：用 App Secret 为每个用户申请 token')}
+curl ${SITE_URL}/api/apps/app_…/tokens \\
+  -H "authorization: Bearer $PEERCONNECT_APP_SECRET" \\
+  -H "content-type: application/json" \\
+  -d '{"user": "user-42"}'
 
-// ${c('2. Your users connect your app with their GitHub account.', '2. 你的用户用自己的 GitHub 账户连接你的应用。')}
-startConnect({ appId: "app_…", redirectUri: "https://example.com/peerconnect" });
-// ${c('…and on the redirect URI’s page:', '……在回调地址的页面上：')}
-const { token } = await finishConnect({ appId: "app_…" });
+# ${c('Then each peer connects with its own token', '然后每一端用自己的 token 连接')}
+#   ${RELAY_URL}/v1/<room id>?token=<token>`;
+}
 
-// ${c('3. Or your server asks for each user’s token with the app secret', '3. 或者你的服务器用 App Secret 为每个用户申请 token')}
-// ${c('   (POST /api/apps/app_…/tokens), and your app uses it:', '   （POST /api/apps/app_…/tokens），应用直接使用：')}
-connect(room, { token: () => fetch("/my-api/peerconnect-token").then((r) => r.text()) });`;
+export function relaySketch(lang: Lang): string {
+	const c = (en: string, zh: string) => pick(lang, en, zh);
+	return `${c('A peer, in outline (SPEC §4–§6):', '一个端的大致流程（SPEC §4–§6）：')}
+
+1. ${c('open', '打开')}  ${RELAY_URL}/v1/<room id>?token=<token>
+2. ${c('relay → HELLO nonce[32]', 'relay → HELLO nonce[32]')}
+3. ${c('peer  → JOIN role ‖ Ed25519 signature over the nonce', '端    → JOIN role ‖ 对 nonce 的 Ed25519 签名')}
+4. ${c('relay → PRESENCE (is the other peer here?)', 'relay → PRESENCE（对方在不在）')}
+5. ${c('both  ⇄ Noise_IKpsk1_25519_ChaChaPoly_SHA256 handshake', '双方  ⇄ Noise_IKpsk1_25519_ChaChaPoly_SHA256 握手')}
+6. ${c('both  ⇄ numbered, acknowledged messages; resent after reconnecting', '双方  ⇄ 编号并确认的消息，重连后重发')}
+7. ${c('text "ping" every 25 s', '每 25 秒发一次文本 "ping"')}
+
+${c('Check every step against test-vectors/v1.json.', '每一步都用 test-vectors/v1.json 核对。')}`;
+}
+
+export function agentPrompt(lang: Lang): string {
+	return pick(
+		lang,
+		`Read ${SITE_URL}/llms-full.txt and implement a PeerConnect peer in <your language>:
+rooms and invites, joining the relay with a token, the Noise handshake and
+pairing, and the reliable stream. Reproduce test-vectors/v1.json first. Use
+${SITE_URL}/api/trial for tokens while testing. The repository's Rust and
+JavaScript implementations are a reference, not a dependency.`,
+		`阅读 ${SITE_URL}/llms-full.txt，用 <你的语言> 实现一个 PeerConnect 端：
+房间与邀请、带 token 加入 relay、Noise 握手与配对、可靠消息流。
+先复现 test-vectors/v1.json。测试时用 ${SITE_URL}/api/trial 获取 token。
+仓库里的 Rust 和 JavaScript 实现只作参考，不作依赖。`
+	);
 }

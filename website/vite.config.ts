@@ -15,7 +15,18 @@ export default defineConfig({
 			prerender: {
 				// The Chinese pages are reached through the language switch, but list
 				// them anyway so that none is missed.
-				entries: ['*', '/zh', '/zh/docs', '/zh/demo', '/sitemap.xml']
+				entries: [
+					'*',
+					'/zh',
+					'/zh/docs',
+					'/zh/demo',
+					'/sitemap.xml',
+					'/docs/api',
+					'/llms.txt',
+					'/llms-full.txt',
+					'/spec.md',
+					'/docs/api.md'
+				]
 			},
 			// Small stylesheets go inline, saving a render-blocking request.
 			inlineStyleThreshold: 16 * 1024,
@@ -27,7 +38,7 @@ export default defineConfig({
 			csrf: { trustedOrigins: ['*'] }
 		})
 	],
-	// The specification page reads ../SPEC.md.
+	// The specification and API pages read ../SPEC.md and ../API.md.
 	server: { fs: { allow: ['..'] } },
 	test: {
 		expect: { requireAssertions: true },

@@ -20,6 +20,8 @@
 			<h2>{t.footer.project}</h2>
 			<ul>
 				<li><a href={i18n.href('/docs')}>{t.nav.docs}</a></li>
+				<li><a href="/docs/api">{t.nav.api}</a></li>
+				<li><a href="/llms.txt">llms.txt</a></li>
 				<li><a href={i18n.href('/demo')}>{t.nav.demo}</a></li>
 				<li><a href="/spec">{t.nav.spec}</a></li>
 				{#if REPO_URL}
