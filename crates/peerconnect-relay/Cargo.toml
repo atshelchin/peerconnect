@@ -12,7 +12,7 @@ keywords = ["relay", "websocket", "e2ee", "server", "pairing"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
-peerconnect = { path = "../peerconnect", version = "0.1.0" }
+peerconnect = { path = "../peerconnect", version = "0.1.0", features = ["tokens"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1"
@@ -22,5 +22,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
-peerconnect = { path = "../peerconnect", features = ["client"] }
+peerconnect = { path = "../peerconnect", features = ["client", "tokens"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }

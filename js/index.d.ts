@@ -42,6 +42,24 @@ export interface ConnectionEventMap {
    * other one keep it.
    */
   replaced: Event;
+  /**
+   * The relay requires a token and refused this connection's (missing,
+   * invalid, expired or revoked). The connection stays offline until it gets
+   * another: from the `token` function given to `connect`, or `setToken`.
+   */
+  unauthorized: Event;
+  /** The `token` function given to `connect` threw; it is asked again in 30 s. */
+  tokenerror: CustomEvent<unknown>;
+}
+
+export interface ConnectOptions {
+  /**
+   * For a relay that requires one (such as relay.peerconnect.dev): the token,
+   * or a function returning it (or a promise of it). A function is called
+   * before the first connection, and again whenever the relay refuses the
+   * token. Tokens are each peer's own: they are not part of the room.
+   */
+  token?: string | (() => string | Promise<string>);
 }
 
 /** A live room connection. It reconnects on its own until left or closed. */
@@ -72,6 +90,8 @@ export class Connection extends EventTarget {
    * so that connecting with it later finishes the job; delete it once closed.
    */
   close(): void;
+  /** Replaces the relay token: used from the next connection on, at once after `unauthorized`. */
+  setToken(token: string): void;
 
   addEventListener<K extends keyof ConnectionEventMap>(
     type: K,
@@ -82,4 +102,4 @@ export class Connection extends EventTarget {
 }
 
 /** Connects to a room (a `Room` or its saved string). */
-export function connect(room: Room | string): Connection;
+export function connect(room: Room | string, options?: ConnectOptions): Connection;

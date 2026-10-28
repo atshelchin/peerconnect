@@ -89,9 +89,23 @@ pub struct Peer(peerconnect::Peer);
 
 #[wasm_bindgen]
 impl Peer {
+    /// `token`: for a relay that requires one (SPEC §4.1).
     #[wasm_bindgen(constructor)]
-    pub fn new(room: &Room, now: f64) -> Peer {
-        Peer(peerconnect::Peer::new(room.0.clone(), now as u64))
+    pub fn new(room: &Room, now: f64, token: Option<String>) -> Peer {
+        Peer(peerconnect::Peer::with_token(room.0.clone(), token, now as u64))
+    }
+
+    /// A peer for a relay that requires a token not fetched yet: it stays
+    /// offline until `setToken`.
+    #[wasm_bindgen(js_name = awaitingToken)]
+    pub fn awaiting_token(room: &Room, now: f64) -> Peer {
+        Peer(peerconnect::Peer::awaiting_token(room.0.clone(), now as u64))
+    }
+
+    /// Replaces the relay token; after `unauthorized`, connects at once.
+    #[wasm_bindgen(js_name = setToken)]
+    pub fn set_token(&mut self, now: f64, token: Option<String>) {
+        self.0.set_token(now as u64, token);
     }
 
     pub fn room(&self) -> Room {
@@ -137,7 +151,7 @@ impl Peer {
     /// The next output as `{ type, ... }`, or `undefined`:
     /// `connect {url}`, `send {data}`, `ping`, `disconnect`,
     /// `state {state, reason?}`, `message {data}`, `delivered {id}`,
-    /// `paired`, `replaced`.
+    /// `paired`, `replaced`, `unauthorized`.
     #[wasm_bindgen(js_name = pollOutput)]
     pub fn poll_output(&mut self) -> JsValue {
         let Some(output) = self.0.poll_output() else { return JsValue::UNDEFINED };
@@ -166,6 +180,7 @@ impl Peer {
             }
             Output::Event(Event::Paired) => set("type", "paired".into()),
             Output::Event(Event::Replaced) => set("type", "replaced".into()),
+            Output::Event(Event::Unauthorized) => set("type", "unauthorized".into()),
             Output::Event(Event::State(state)) => {
                 set("type", "state".into());
                 let (name, reason) = match state {

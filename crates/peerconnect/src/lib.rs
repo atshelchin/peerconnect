@@ -8,7 +8,8 @@
 //! - [`Peer`]: the peer state machine. Drive it with any WebSocket
 //!   implementation, or enable the `client` feature for a ready-made Tokio
 //!   driver ([`client`]).
-//! - [`RoomId::verify_join`] and [`wire`]: what a relay needs.
+//! - [`RoomId::verify_join`] and [`wire`]: what a relay needs; with the
+//!   `tokens` feature, [`token`] for a relay that requires credentials.
 //!
 //! The protocol is specified in `SPEC.md` at the repository root.
 
@@ -17,6 +18,10 @@ mod noise;
 mod peer;
 pub mod relay;
 mod room;
+#[cfg(feature = "tokens")]
+pub mod token;
+#[cfg(feature = "tokens")]
+pub mod usage;
 pub mod wire;
 
 #[cfg(test)]

@@ -20,6 +20,10 @@ sha2 = { version = "0.11", default-features = false }
 x25519-dalek = { version = "3", default-features = false, features = ["zeroize", "static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }
 
+# The `tokens` feature: relay tokens (SPEC §4.1).
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+
 # The `client` feature: a Tokio WebSocket driver.
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
@@ -42,5 +46,7 @@ required-features = ["client"]
 default = ["fast"]
 # Precomputed curve tables: faster key generation and signing, ~30 KB more code.
 fast = ["ed25519-dalek/fast", "x25519-dalek/precomputed-tables"]
+# Relay tokens and their generations (`peerconnect::token`), for relays.
+tokens = ["dep:serde", "dep:serde_json"]
 # A Tokio WebSocket driver (`peerconnect::client`).
 client = ["dep:futures-util", "dep:rustls", "dep:tokio", "dep:tokio-tungstenite"]

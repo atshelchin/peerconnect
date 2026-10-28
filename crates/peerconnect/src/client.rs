@@ -56,12 +56,18 @@ const FLUSH_GRACE: Duration = Duration::from_secs(30);
 /// as needed, until the connection is left, closed or dropped. Must be
 /// called within a Tokio runtime. A room that is closing carries on ending.
 pub fn connect(room: Room) -> Connection {
+    connect_with_token(room, None)
+}
+
+/// [`connect`], for a relay that requires a token (SPEC §4.1). On
+/// [`Event::Unauthorized`], get another and call [`Connection::set_token`].
+pub fn connect_with_token(room: Room, token: Option<String>) -> Connection {
     let shared = Arc::new(Mutex::new(room.clone()));
     let closing = Arc::new(AtomicBool::new(room.is_closing()));
     let (commands, rx) = mpsc::channel(64);
     let (control, controls) = mpsc::unbounded_channel();
     let (tx, events) = mpsc::unbounded_channel();
-    tokio::spawn(drive(Peer::new(room, 0), rx, controls, tx, shared.clone()));
+    tokio::spawn(drive(Peer::with_token(room, token, 0), rx, controls, tx, shared.clone()));
     Connection { sender: Sender { commands, closing }, control, events, room: shared }
 }
 
@@ -106,6 +112,11 @@ impl Connection {
         let _ = self.control.send(Control::Close);
     }
 
+    /// Replaces the relay token (see [`Peer::set_token`]).
+    pub fn set_token(&self, token: Option<String>) {
+        let _ = self.control.send(Control::Token(token));
+    }
+
     /// Disconnects, keeping the room for later.
     pub async fn leave(mut self) {
         let _ = self.control.send(Control::Leave);
@@ -136,6 +147,7 @@ impl Sender {
 /// How the application stops the connection. Dropping it leaves.
 enum Control {
     Close,
+    Token(Option<String>),
     Leave,
 }
 
@@ -238,6 +250,7 @@ async fn drive(
             control = control.recv(), if controlled => match control {
                 // Takes effect once the sends issued before it are queued.
                 Some(Control::Close) => closing = true,
+                Some(Control::Token(token)) => peer.set_token(now(), token),
                 Some(Control::Leave) | None => {
                     controlled = false;
                     peer.leave();

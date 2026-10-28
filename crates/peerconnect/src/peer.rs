@@ -46,6 +46,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STABLE: Duration = Duration::from_secs(30);
 /// How long to wait before reclaiming a seat another connection took.
 const REPLACED_DELAY: Duration = Duration::from_secs(60);
+/// How long to wait at least after the relay said we connect too often.
+const RATE_LIMITED_DELAY: Duration = Duration::from_secs(60);
 /// A joiner alone this long at the invite ID, or unpaired at the pair ID,
 /// tries the other one.
 const SEEK_INTERVAL: Duration = Duration::from_secs(20);
@@ -104,6 +106,9 @@ pub enum Event {
     /// waits a minute before taking the seat back; call [`Peer::leave`] to
     /// let the other instance keep it.
     Replaced,
+    /// The relay requires a token (SPEC §4.1), and refused ours, or we have
+    /// none. The peer stays offline until [`Peer::set_token`] gives it one.
+    Unauthorized,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +158,8 @@ impl std::error::Error for SendError {}
 
 pub struct Peer {
     room: Room,
+    /// The relay token, appended to every endpoint (SPEC §4.1).
+    token: Option<String>,
     link: Link,
     /// The time of the latest input; `send` has none of its own.
     clock: u64,
@@ -271,6 +278,8 @@ enum Link {
         deadline: u64,
     },
     Open(Open),
+    /// The relay refused our token: wait for another.
+    Unauthorized,
     Done,
 }
 
@@ -327,6 +336,11 @@ impl Peer {
     /// Starts the machine; the first output asks the driver to connect. A
     /// room that is closing resumes telling the peer.
     pub fn new(room: Room, now: u64) -> Peer {
+        Peer::with_token(room, None, now)
+    }
+
+    /// [`Peer::new`], for a relay that requires a token (SPEC §4.1).
+    pub fn with_token(room: Room, token: Option<String>, now: u64) -> Peer {
         let mut stream = 0;
         while stream == 0 {
             stream = u64::from_le_bytes(crate::random());
@@ -334,6 +348,7 @@ impl Peer {
         let next_at = if room.is_paired() { Rendezvous::Pair } else { Rendezvous::Invite };
         let mut peer = Peer {
             room,
+            token: token.filter(|t| !t.is_empty()),
             link: Link::Idle { retry_at: now },
             clock: now,
             state: State::Offline,
@@ -359,6 +374,26 @@ impl Peer {
         }
         peer.connect(now);
         peer
+    }
+
+    /// [`Peer::new`], for a relay that requires a token the application is
+    /// still fetching: the peer stays offline until [`Peer::set_token`].
+    pub fn awaiting_token(room: Room, now: u64) -> Peer {
+        let mut peer = Peer::with_token(room, None, now);
+        peer.output.retain(|o| !matches!(o, Output::Connect(_)));
+        peer.link = Link::Unauthorized;
+        peer
+    }
+
+    /// Replaces the relay token. Used from the next connection on; a peer
+    /// waiting after [`Event::Unauthorized`] connects again at once.
+    pub fn set_token(&mut self, now: u64, token: Option<String>) {
+        self.clock = now;
+        self.token = token.filter(|t| !t.is_empty());
+        if matches!(self.link, Link::Unauthorized) {
+            self.failures = 0;
+            self.connect(now);
+        }
     }
 
     pub fn room(&self) -> &Room {
@@ -396,6 +431,7 @@ impl Peer {
                 };
                 [Some(open.receive_deadline), Some(open.next_ping), phase].into_iter().flatten().min()
             }
+            Link::Unauthorized => None,
             Link::Done => return None,
         };
         [link, self.ended_by_peer].into_iter().flatten().min()
@@ -469,10 +505,27 @@ impl Peer {
         if !matches!(self.link, Link::Connecting { .. } | Link::Open(_)) {
             return;
         }
+        let tried = match &self.link {
+            Link::Connecting { at, .. } => *at,
+            Link::Open(open) => open.at,
+            _ => self.next_at,
+        };
         self.drop_socket(now, false);
+        if matches!(code, Some(close::TOKEN | close::RATE_LIMITED)) {
+            // The relay never let us look: a joiner tries the same ID again.
+            self.next_at = tried;
+        }
         if code == Some(close::REPLACED) {
             self.output.push_back(Output::Event(Event::Replaced));
             let delay = ms(REPLACED_DELAY);
+            self.retry_at(now + delay + random_below(delay / 6));
+        } else if code == Some(close::TOKEN) {
+            // Never again with the same token (SPEC §4.7).
+            self.link = Link::Unauthorized;
+            self.set_state(State::Offline);
+            self.output.push_back(Output::Event(Event::Unauthorized));
+        } else if code == Some(close::RATE_LIMITED) {
+            let delay = self.backoff().max(ms(RATE_LIMITED_DELAY));
             self.retry_at(now + delay + random_below(delay / 6));
         } else {
             let delay = self.backoff();
@@ -585,7 +638,11 @@ impl Peer {
             Role::Joiner => self.next_at,
         };
         self.link = Link::Connecting { at, deadline: now + ms(CONNECT_TIMEOUT) };
-        self.output.push_back(Output::Connect(self.room.endpoint_at(at)));
+        let mut url = self.room.endpoint_at(at);
+        if let Some(token) = &self.token {
+            url = format!("{url}?token={token}");
+        }
+        self.output.push_back(Output::Connect(url));
     }
 
     /// Abandons the current socket and schedules another attempt.

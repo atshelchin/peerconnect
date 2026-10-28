@@ -33,7 +33,7 @@ const again = connect(load());
 
 Persist the room when you create or join it, and again after `"paired"` (inviter). A joiner that loses its saved room cannot get back in with the same invite: `Room.join` creates a new identity, and the inviter only accepts the one it paired with.
 
-`connect(room | saved)` returns a `Connection` (an `EventTarget`) that connects, reconnects with backoff, carries a reliable message stream across reconnections, and keeps going until you call:
+`connect(room | saved, { token })` returns a `Connection` (an `EventTarget`) that connects, reconnects with backoff, carries a reliable message stream across reconnections, and keeps going until you call:
 
 - `leave()` to disconnect while keeping the room;
 - `close()` to end the room for both peers. The connection carries on until the peer has been told; save `room` meanwhile, as it now says "closing".
@@ -50,6 +50,10 @@ Persist the room when you create or join it, and again after `"paired"` (inviter
 | event `delivered` | `detail`: the peer has every message with a lower id |
 | event `paired` | pairing is complete and the room moved to its pair ID: save `room` again |
 | event `replaced` | the room was opened elsewhere and took this seat; it retries in a minute unless you `leave()` |
+| `setToken(token)` | replaces the relay token, from the next connection on |
+| event `unauthorized` | the relay requires a token and refused this one; the connection stays offline until it has another |
+
+`token` is for a relay that requires one, such as relay.peerconnect.dev ([getting one](https://peerconnect.dev/developers)): a string, or a function that returns one (or a promise of one). A function is called before the first connection and again whenever the relay refuses the token, so a short-lived token from your server renews itself. Each peer brings its own token; it is not part of the room or the invite.
 
 Messages are delivered in order, exactly once, as long as both sides keep running; unacknowledged messages live in memory, so a page reload loses those not yet delivered.
 

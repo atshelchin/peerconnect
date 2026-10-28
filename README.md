@@ -41,7 +41,7 @@ cargo install worker-build
 cd crates/peerconnect-worker && npx wrangler deploy
 ```
 
-**Binary**: `cargo install peerconnect-relay`, then run `peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`.
+**Binary**: `cargo install peerconnect-relay`, then run `peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`. `PEERCONNECT_TOKEN_SECRET` makes it require tokens ([SPEC §4.1](SPEC.md)): `peerconnect-relay token <client> --ttl 30d` mints one.
 
 ### JavaScript (browsers, Node.js 22+, Deno, Bun)
 

@@ -64,6 +64,11 @@ pub mod close {
     pub const UNAUTHORIZED: u16 = 4401;
     /// No `JOIN` within the join timeout, or idle for too long.
     pub const TIMEOUT: u16 = 4408;
+    /// The relay requires a token, and this connection's is missing,
+    /// invalid, expired or revoked (SPEC §4.1).
+    pub const TOKEN: u16 = 4403;
+    /// The relay requires tokens, and this one connects too often.
+    pub const RATE_LIMITED: u16 = 4429;
     /// A newer connection took this seat.
     pub const REPLACED: u16 = 4409;
 }

@@ -123,6 +123,16 @@ relay_url "/v1/" room_id
 
 where `room_id` is the text form. A relay MUST accept such a path below any prefix (so `wss://example.com/peerconnect/v1/<id>` works when the relay is mounted at `/peerconnect`). It MUST refuse the upgrade, with HTTP 404, if the last segment is not a valid Ed25519 public key in canonical base64url. The relay cannot tell an invite ID from a pair ID, and does not need to.
 
+A relay MAY require a **token**: a credential its operator issues to the applications and people allowed to use it. A peer then appends it as a query parameter:
+
+```
+relay_url "/v1/" room_id "?token=" token
+```
+
+Tokens are opaque to peers, and are not part of an invite or a room record: each peer brings its own, so the two peers of a room may hold tokens from different applications. A relay that requires tokens accepts the upgrade and, if the token is missing, invalid, expired or revoked, closes the connection with **4403** before sending HELLO (an HTTP error would not reach browsers, which report a failed upgrade without its status). When a token is revoked, the relay MAY close the connections using it the same way, joined ones included, and then sends PRESENCE `0x00` to their partners. A relay that does not require tokens ignores the parameter. Tokens identify who uses the relay, never what they say: they change nothing in §4.3–§5, and a relay learns from them nothing about the room's keys.
+
+The public relays at peerconnect.dev use HS256 JSON Web Tokens with the claims `sub` (the client), `app`, `gen` and `exp`; the format is the relay's business, and others may use any.
+
 ### 4.2 Frames
 
 Each binary WebSocket message is one **frame**: a type byte followed by a body. Frames are at most **65,536 bytes**. The keepalive uses text messages; no other text messages are allowed.
@@ -195,6 +205,8 @@ A peer MUST send the text message `ping` every **25 s** while connected, whateve
 | 1002 | Protocol violation. |
 | 1009 | Frame too large. |
 | 4401 | JOIN signature did not verify. |
+| 4403 | The relay requires a token, and this connection's is missing, invalid, expired or revoked (§4.1). A peer MUST NOT reconnect with the same token. |
+| 4429 | The relay requires tokens, and this one opens connections too often. A peer waits at least 60 s before it tries again. |
 | 4408 | No JOIN in time, idle for too long, or not reading what is forwarded. |
 | 4409 | Replaced by a newer connection to the same seat. |
 

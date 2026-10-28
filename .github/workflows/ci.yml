@@ -82,6 +82,13 @@ jobs:
           npx --yes wrangler@4 dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
           for i in $(seq 1 180); do curl -sf http://127.0.0.1:8787/ && break; sleep 2; done
           PEERCONNECT_RELAY=ws://127.0.0.1:8787 cargo test -p peerconnect-relay --test e2e || { cat wrangler.log; exit 1; }
+          kill %1
+      # Tokens required (docs/self-serve.md): issuance, admission, rotation,
+      # deletion and metering, through the JavaScript SDK.
+      - name: Install the wasm-bindgen CLI matching Cargo.lock
+        run: cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid -p wasm-bindgen | sed 's/.*@//')"
+      - run: sh js/scripts/build.sh
+      - run: crates/peerconnect-worker/tests/run.sh
 
   docker:
     runs-on: ubuntu-latest

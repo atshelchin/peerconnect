@@ -7,6 +7,10 @@
 //! memory, and one that accepts nothing for 30 s is disconnected rather than
 //! allowed to hold its partner hostage. The only shared state is the seat
 //! table, one small mutex per room.
+//!
+//! With [`Config::tokens`], the relay requires a token signed by one of its
+//! secrets (SPEC §4.1) and checks its signature and expiry; revoking tokens
+//! means rotating the secrets.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -26,6 +30,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use peerconnect::RoomId;
 use peerconnect::relay::{self, Action, Conn};
+use peerconnect::token::Keys;
 use peerconnect::wire::{self, Role, close};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -58,11 +63,20 @@ pub struct Config {
     /// Bytes queued towards one connection before its partner is held back.
     /// Worst-case buffer memory is about `max_connections × queue_bytes`.
     pub queue_bytes: usize,
+    /// Require a token signed by one of these secrets (SPEC §4.1). `None`
+    /// admits everyone.
+    pub tokens: Option<Keys>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_connections: 10_000, max_per_address: 256, trust_proxy: false, queue_bytes: 256 << 10 }
+        Config {
+            max_connections: 10_000,
+            max_per_address: 256,
+            trust_proxy: false,
+            queue_bytes: 256 << 10,
+            tokens: None,
+        }
     }
 }
 
@@ -193,6 +207,10 @@ impl Relay {
         let Some(key) = websocket_key(&req) else {
             return text(StatusCode::UPGRADE_REQUIRED, "expected a WebSocket upgrade\n");
         };
+        let authorized = self.config.tokens.as_ref().is_none_or(|keys| {
+            let token = req.uri().query().and_then(peerconnect::token::from_query);
+            token.is_some_and(|token| keys.verify(token, unix_now()).is_ok())
+        });
         let address = if self.config.trust_proxy { forwarded_for(&req).unwrap_or(peer) } else { peer };
         let Some(per_address) = self.admit(address) else {
             return text(StatusCode::TOO_MANY_REQUESTS, "too many connections from this address\n");
@@ -210,8 +228,15 @@ impl Relay {
                 .write_buffer_size(16 << 10)
                 .max_message_size(Some(wire::MAX_FRAME_LEN))
                 .max_frame_size(Some(wire::MAX_FRAME_LEN));
-            let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
-            self.connection(room, ws, slot).await;
+            let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), WsRole::Server, Some(config)).await;
+            if authorized {
+                self.connection(room, ws, slot).await;
+            } else {
+                // Accepted, then closed: browsers see a close code, never an HTTP status.
+                let _ = timeout(Duration::from_secs(5), ws.send(close_message(close::TOKEN))).await;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while let Ok(Some(Ok(_))) = timeout_at(deadline, ws.next()).await {}
+            }
             drop(per_address);
         });
         let mut res = Response::new(Full::default());
@@ -487,6 +512,10 @@ fn text(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
     let mut res = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
     *res.status_mut() = status;
     res
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

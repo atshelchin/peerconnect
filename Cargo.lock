@@ -850,6 +850,8 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "rustls",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
  "snow",
  "tokio",
@@ -887,8 +889,11 @@ name = "peerconnect-worker"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "js-sys",
  "peerconnect",
  "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
  "wasm-bindgen",
  "worker",
 ]

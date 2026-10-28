@@ -6,7 +6,7 @@ compatibility_date = "2026-05-01"
 command = "worker-build --release"
 
 [durable_objects]
-bindings = [{ name = "ROOMS", class_name = "Room" }]
+bindings = [{ name = "ROOMS", class_name = "Room" }, { name = "CLIENTS", class_name = "Client" }]
 
 [[migrations]]
 tag = "v1"
@@ -21,3 +21,26 @@ new_sqlite_classes = ["Group"]
 [[migrations]]
 tag = "v3"
 deleted_classes = ["Group"]
+
+# One per token subject (docs/self-serve.md): generations, admission, metering.
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["Client"]
+
+[vars]
+# 1: refuse connections without a token (SPEC §4.1). Off until the SDKs that
+# send tokens are released.
+REQUIRE_TOKEN = "0"
+
+# Secrets, set with `wrangler secret put` (for `wrangler dev`, in .dev.vars):
+#   PEERCONNECT_TOKEN_SECRET    signs and checks tokens; whitespace-separated,
+#                               newest first, at least 32 bytes each
+#   PEERCONNECT_SERVICE_SECRET  opens /internal/ to the site's Worker
+# Without them, the relay admits everyone, as before.
+
+# Daily usage per client and the issuance audit.
+[[d1_databases]]
+binding = "RELAY_DB"
+database_name = "peerconnect-relay"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

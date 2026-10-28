@@ -8,7 +8,8 @@
 //!
 //! Lines typed are sent to the peer, queued while it is away; the peer's
 //! messages are printed. The room is saved to `<room-file>` (a secret!) so
-//! it can be reopened later. `/close` ends the room for both sides.
+//! it can be reopened later. `/close` ends the room for both sides. For a
+//! relay that requires a token, set `PEERCONNECT_TOKEN`.
 //!
 //! Run with `cargo run -p peerconnect --features client --example chat -- …`.
 
@@ -33,7 +34,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     fs::write(file, room.to_string())?;
 
-    let mut conn = client::connect(room);
+    let token = env::var("PEERCONNECT_TOKEN").ok();
+    let mut conn = client::connect_with_token(room, token);
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
@@ -44,6 +46,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     fs::write(file, conn.room().to_string())?;
                 }
                 Some(Event::Replaced) => eprintln!("* this room was opened elsewhere; retrying in a minute"),
+                Some(Event::Unauthorized) => {
+                    eprintln!("* the relay requires a token: set PEERCONNECT_TOKEN");
+                    return Ok(());
+                }
                 Some(Event::Delivered(_)) => {}
                 Some(Event::State(State::Closed(reason))) => {
                     eprintln!("* closed: {reason:?}");

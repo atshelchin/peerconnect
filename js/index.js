@@ -11,10 +11,15 @@ initSync({ module: Uint8Array.from(atob(module), (c) => c.charCodeAt(0)) });
 
 export { Room };
 
-/** Connects to a room and keeps it connected until left or closed. A room
- * that is closing carries on ending. */
-export function connect(room) {
-  return new Connection(typeof room === "string" ? Room.parse(room) : room);
+/**
+ * Connects to a room and keeps it connected until left or closed. A room
+ * that is closing carries on ending. `options.token` is for a relay that
+ * requires one: a string, or a function returning one (or a promise of
+ * one), called before the first connection and again whenever the relay
+ * refuses the token.
+ */
+export function connect(room, options = {}) {
+  return new Connection(typeof room === "string" ? Room.parse(room) : room, options);
 }
 
 const encoder = new TextEncoder();
@@ -29,12 +34,44 @@ export class Connection extends EventTarget {
   #socket = null;
   #timer = undefined;
   #epoch = performance.now();
+  #getToken;
+  /** Whether `#getToken` is being asked. */
+  #fetching = false;
 
-  constructor(room) {
+  constructor(room, { token } = {}) {
     super();
-    this.#peer = new Peer(room, this.#now());
-    // Let the caller attach listeners before anything happens.
-    queueMicrotask(() => this.#pump());
+    if (typeof token === "function") {
+      this.#getToken = token;
+      // Offline until the first token arrives: the relay would refuse us.
+      this.#peer = Peer.awaitingToken(room, this.#now());
+      queueMicrotask(() => this.#fetchToken());
+    } else {
+      this.#peer = new Peer(room, this.#now(), token ?? undefined);
+      // Let the caller attach listeners before anything happens.
+      queueMicrotask(() => this.#pump());
+    }
+  }
+
+  /** Replaces the relay token, used from the next connection on (at once if the relay refused the last one). */
+  setToken(token) {
+    this.#peer.setToken(this.#now(), token || undefined);
+    this.#pump();
+  }
+
+  async #fetchToken() {
+    if (this.#fetching) return;
+    this.#fetching = true;
+    let token;
+    try {
+      token = await this.#getToken();
+    } catch (error) {
+      this.dispatchEvent(new CustomEvent("tokenerror", { detail: error }));
+    } finally {
+      this.#fetching = false;
+    }
+    if (this.state === "closed") return;
+    if (typeof token === "string" && token) this.setToken(token);
+    else setTimeout(() => this.state !== "closed" && this.#fetchToken(), 30_000);
   }
 
   /** Bytes of messages waiting to be acknowledged by the peer. */
@@ -111,6 +148,10 @@ export class Connection extends EventTarget {
         case "paired":
         case "replaced":
           this.dispatchEvent(new Event(out.type));
+          break;
+        case "unauthorized":
+          this.dispatchEvent(new Event("unauthorized"));
+          if (this.#getToken) this.#fetchToken();
           break;
       }
     }
