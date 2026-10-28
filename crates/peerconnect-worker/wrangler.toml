@@ -27,16 +27,14 @@ deleted_classes = ["Group"]
 tag = "v4"
 new_sqlite_classes = ["Client"]
 
-[vars]
-# 1: refuse connections without a token (SPEC §4.1). Off until the SDKs that
-# send tokens are released.
-REQUIRE_TOKEN = "0"
-
 # Secrets, set with `wrangler secret put` (for `wrangler dev`, in .dev.vars):
 #   PEERCONNECT_TOKEN_SECRET    signs and checks tokens; whitespace-separated,
 #                               newest first, at least 32 bytes each
 #   PEERCONNECT_SERVICE_SECRET  opens /internal/ to the site's Worker
-# Without them, the relay admits everyone, as before.
+#   REQUIRE_TOKEN               1: refuse connections without a token
+#                               (SPEC §4.1); relay.peerconnect.dev has it
+#                               since 2026-10-28
+# Without them, the relay admits everyone.
 
 # Daily usage per client and the issuance audit.
 [[d1_databases]]
