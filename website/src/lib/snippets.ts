@@ -10,17 +10,18 @@ const pick = (lang: Lang, en: string, zh: string) => (lang === 'zh' ? zh : en);
 export function jsQuick(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
 	return `import { connect, Room } from "peerconnect";
+import { trialToken } from "peerconnect/auth"; // ${c('or your app’s tokens: peerconnect.dev/developers', '或用你应用的 token：peerconnect.dev/developers')}
 
 // ${c('Device A: create a room and show its invite as a QR code.', '设备 A：创建房间，把邀请显示成二维码。')}
 const room = Room.create("${RELAY_URL}");
 showQrCode(room.invite);
-const a = connect(room);
+const a = connect(room, { token: trialToken });
 a.addEventListener("message", (e) => {
   console.log(new TextDecoder().decode(e.data));
 });
 
 // ${c('Device B: join with the scanned invite and say hello.', '设备 B：用扫到的邀请加入，打个招呼。')}
-const b = connect(Room.join(scannedInvite));
+const b = connect(Room.join(scannedInvite), { token: trialToken });
 b.send("hello"); // ${c('queued until A is reachable, delivered exactly once', '在 A 可达之前排队，恰好送达一次')}
 
 // ${c('Persist conn.room.toString() to reconnect after a restart.', '保存 conn.room.toString()，重启后即可重新连接。')}`;
@@ -31,7 +32,8 @@ export function rustQuick(lang: Lang): string {
 	return `use peerconnect::{client, Event, Room};
 
 let room = Room::join(&invite.parse()?);
-let mut conn = client::connect(room);
+let token = std::env::var("PEERCONNECT_TOKEN").ok(); // ${c('peerconnect.dev/developers', 'peerconnect.dev/developers')}
+let mut conn = client::connect_with_token(room, token);
 conn.send(b"hello").await?; // ${c('queued until the inviter is reachable', '在邀请方可达之前排队')}
 
 while let Some(event) = conn.next().await {
@@ -49,7 +51,7 @@ export function jsFull(lang: Lang): string {
 const room = Room.create("${RELAY_URL}");
 showQrCode(room.invite);
 
-const conn = connect(room);
+const conn = connect(room, { token }); // ${c('see Tokens', '见“Token”一节')}
 conn.addEventListener("paired", () => save(conn.room.toString())); // ${c('a secret: store it safely', '这是秘密，请妥善保存')}
 conn.addEventListener("state", () => console.log(conn.state));     // offline | waiting | connected | closed
 conn.addEventListener("message", (e) => console.log(new TextDecoder().decode(e.data)));
@@ -57,7 +59,7 @@ conn.addEventListener("message", (e) => console.log(new TextDecoder().decode(e.d
 // ${c('Peer B scans it and saves its room at once: it holds the identity A will pin.', '端 B 扫码后立即保存房间：其中包含 A 将要记住的身份。')}
 const joined = Room.join(scannedInvite);
 save(joined.toString());
-const connB = connect(joined);
+const connB = connect(joined, { token: tokenB }); // ${c('each peer its own', '每一端各用自己的')}
 connB.addEventListener("paired", () => save(connB.room.toString()));
 connB.send("hello"); // ${c('queued; delivered as soon as A is reachable', '先排队，A 一可达就送达')}
 connB.addEventListener("delivered", (e) => console.log("A has everything below", e.detail));
@@ -72,7 +74,7 @@ export function rustFull(lang: Lang): string {
 
 let room = Room::join(&invite.parse()?);
 save(&room.to_string());               // ${c('before connecting: it holds the identity the inviter pins', '连接之前保存：其中包含邀请方将要记住的身份')}
-let mut conn = client::connect(room);
+let mut conn = client::connect_with_token(room, Some(token)); // ${c('see Tokens', '见“Token”一节')}
 conn.send(b"hello").await?;            // ${c('queued until the inviter is reachable', '在邀请方可达之前排队')}
 while let Some(event) = conn.next().await {
     match event {
@@ -113,5 +115,27 @@ DOMAIN=relay.example.com docker compose -f deploy/docker-compose.yml up -d`;
 export function binary(lang: Lang): string {
 	const c = (en: string, zh: string) => pick(lang, en, zh);
 	return `cargo install peerconnect-relay
-peerconnect-relay              # ${c('listens on 0.0.0.0:8080', '监听 0.0.0.0:8080')}`;
+peerconnect-relay              # ${c('listens on 0.0.0.0:8080', '监听 0.0.0.0:8080')}
+
+# ${c('Optional: require tokens, and mint one', '可选：要求 token，并签发一个')}
+export PEERCONNECT_TOKEN_SECRET=$(openssl rand -hex 32)
+peerconnect-relay token my-app --ttl 30d`;
+}
+
+export function tokensJs(lang: Lang): string {
+	const c = (en: string, zh: string) => pick(lang, en, zh);
+	return `import { connect, Room } from "peerconnect";
+import { finishConnect, startConnect, trialToken } from "peerconnect/auth";
+
+// ${c('1. Trying it out: the public trial, no account (two hours, tight limits).', '1. 试用：公开试用通道，无需账户（两小时，限额较低）。')}
+const conn = connect(Room.create("${RELAY_URL}"), { token: trialToken });
+
+// ${c('2. Your users connect your app with their GitHub account.', '2. 你的用户用自己的 GitHub 账户连接你的应用。')}
+startConnect({ appId: "app_…", redirectUri: "https://example.com/peerconnect" });
+// ${c('…and on the redirect URI’s page:', '……在回调地址的页面上：')}
+const { token } = await finishConnect({ appId: "app_…" });
+
+// ${c('3. Or your server asks for each user’s token with the app secret', '3. 或者你的服务器用 App Secret 为每个用户申请 token')}
+// ${c('   (POST /api/apps/app_…/tokens), and your app uses it:', '   （POST /api/apps/app_…/tokens），应用直接使用：')}
+connect(room, { token: () => fetch("/my-api/peerconnect-token").then((r) => r.text()) });`;
 }

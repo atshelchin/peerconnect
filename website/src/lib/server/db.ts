@@ -283,12 +283,17 @@ export async function client(
 }
 
 /** Every client of an app that is not deleted, up to `limit`. */
-export async function appClients(db: D1Database, app: string, limit = 500): Promise<ClientRow[]> {
+export async function appClients(
+	db: D1Database,
+	app: string,
+	limit = 500,
+	offset = 0
+): Promise<ClientRow[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT ${CLIENT_COLUMNS} FROM clients WHERE app = ?1 AND deleted_at IS NULL ORDER BY created_at LIMIT ?2`
+			`SELECT ${CLIENT_COLUMNS} FROM clients WHERE app = ?1 AND deleted_at IS NULL ORDER BY created_at, id LIMIT ?2 OFFSET ?3`
 		)
-		.bind(app, limit)
+		.bind(app, limit, offset)
 		.all<ClientRow>();
 	return results;
 }
@@ -468,4 +473,164 @@ export async function takeCode(db: D1Database, codeHash: string): Promise<CodeRo
 		)
 		.bind(codeHash, at)
 		.first<CodeRow>();
+}
+
+// ---------------------------------------------------------------------------
+// The public trial
+// ---------------------------------------------------------------------------
+
+/**
+ * Counts one trial token for `key` (an address's HMAC) and says whether it is
+ * within `limit` per `windowSeconds`. One statement: concurrent requests
+ * cannot both take the last one.
+ */
+export async function takeTrial(
+	db: D1Database,
+	key: string,
+	limit: number,
+	windowSeconds: number
+): Promise<boolean> {
+	const at = now();
+	const row = await db
+		.prepare(
+			`INSERT INTO trial_limits (key, window_start, count) VALUES (?1, ?2, 1)
+			 ON CONFLICT (key) DO UPDATE SET
+			   count = CASE WHEN window_start <= ?2 - ?3 THEN 1 ELSE count + 1 END,
+			   window_start = CASE WHEN window_start <= ?2 - ?3 THEN ?2 ELSE window_start END
+			 RETURNING count`
+		)
+		.bind(key, at, windowSeconds)
+		.first<{ count: number }>();
+	// Now and then, forget addresses not seen for a day.
+	if (Math.random() < 0.01) {
+		await db
+			.prepare('DELETE FROM trial_limits WHERE window_start < ?1')
+			.bind(at - 86_400)
+			.run();
+	}
+	return (row?.count ?? limit + 1) <= limit;
+}
+
+// ---------------------------------------------------------------------------
+// The admin page (docs/self-serve.md, "The admin page")
+// ---------------------------------------------------------------------------
+
+export interface AdminAccount {
+	id: string;
+	login: string;
+	created_at: number;
+	last_seen_at: number;
+	state: 'active' | 'suspended';
+	client_limit: number;
+	app_limit: number;
+	apps: number;
+	clients: number;
+}
+
+export async function adminAccounts(db: D1Database): Promise<AdminAccount[]> {
+	const { results } = await db
+		.prepare(
+			"SELECT a.id, i.login, a.created_at, a.last_seen_at, a.state, a.client_limit, a.app_limit, (SELECT COUNT(*) FROM apps p WHERE p.account_id = a.id AND p.deleted_at IS NULL) AS apps, (SELECT COUNT(*) FROM clients c WHERE c.account_id = a.id AND c.deleted_at IS NULL) AS clients FROM accounts a JOIN identities i ON i.account_id = a.id AND i.provider = 'github' ORDER BY a.last_seen_at DESC LIMIT 1000"
+		)
+		.all<AdminAccount>();
+	return results;
+}
+
+export interface AdminApp {
+	id: string;
+	name: string;
+	login: string;
+	state: 'active' | 'disabled';
+	user_limit: number;
+	created_at: number;
+	clients: number;
+}
+
+export async function adminApps(db: D1Database): Promise<AdminApp[]> {
+	const { results } = await db
+		.prepare(
+			"SELECT p.id, p.name, i.login, p.state, p.user_limit, p.created_at, (SELECT COUNT(*) FROM clients c WHERE c.app = p.id AND c.deleted_at IS NULL) AS clients FROM apps p JOIN identities i ON i.account_id = p.account_id AND i.provider = 'github' WHERE p.deleted_at IS NULL ORDER BY p.created_at DESC LIMIT 1000"
+		)
+		.all<AdminApp>();
+	return results;
+}
+
+/** Every client whose use an account answers for: its own, and its apps' server-issued ones. */
+export async function clientOwners(db: D1Database): Promise<Map<string, string>> {
+	const { results } = await db
+		.prepare('SELECT id, account_id FROM clients WHERE deleted_at IS NULL')
+		.all<{ id: string; account_id: string }>();
+	return new Map(results.map((r) => [r.id, r.account_id]));
+}
+
+/** The clients to revoke when an account is suspended, a batch at a time. */
+export async function accountClients(
+	db: D1Database,
+	account: string,
+	limit = 500,
+	offset = 0
+): Promise<ClientRow[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT ${CLIENT_COLUMNS} FROM clients WHERE account_id = ?1 AND deleted_at IS NULL ORDER BY created_at, id LIMIT ?2 OFFSET ?3`
+		)
+		.bind(account, limit, offset)
+		.all<ClientRow>();
+	return results;
+}
+
+export async function setAccountState(
+	db: D1Database,
+	account: string,
+	state: 'active' | 'suspended',
+	actor: string
+) {
+	await db.prepare('UPDATE accounts SET state = ?2 WHERE id = ?1').bind(account, state).run();
+	await audit(
+		db,
+		account,
+		state === 'suspended' ? 'account-suspended' : 'account-reactivated',
+		'',
+		actor
+	);
+}
+
+export async function setAccountLimits(
+	db: D1Database,
+	account: string,
+	clientLimit: number,
+	appLimit: number,
+	actor: string
+) {
+	await db
+		.prepare('UPDATE accounts SET client_limit = ?2, app_limit = ?3 WHERE id = ?1')
+		.bind(account, clientLimit, appLimit)
+		.run();
+	await audit(db, account, 'limits-set', `${clientLimit} ${appLimit}`, actor);
+}
+
+export async function setAppState(
+	db: D1Database,
+	app: string,
+	state: 'active' | 'disabled',
+	actor: string
+) {
+	await db.prepare('UPDATE apps SET state = ?2 WHERE id = ?1').bind(app, state).run();
+	await audit(db, null, state === 'disabled' ? 'app-disabled' : 'app-enabled', app, actor);
+}
+
+export interface AuditRow {
+	at: number;
+	account_id: string | null;
+	action: string;
+	detail: string;
+	actor: string;
+}
+
+export async function recentAudit(db: D1Database, limit = 100): Promise<AuditRow[]> {
+	const { results } = await db
+		.prepare('SELECT at, account_id, action, detail, actor FROM audit ORDER BY at DESC LIMIT ?1')
+		.bind(limit)
+		.all<AuditRow>();
+	return results;
 }

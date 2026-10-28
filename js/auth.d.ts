@@ -50,3 +50,9 @@ export function startConnect(options: {
 
 /** On the redirect page: the person's token. Rejects if not reached from `startConnect`. */
 export function finishConnect(options: { appId: string; url?: string; site?: string }): Promise<Connected>;
+
+/**
+ * A token of the public trial: no account, two hours, tighter limits. Pass the
+ * function itself as `connect(room, { token: trialToken })`.
+ */
+export function trialToken(options?: { site?: string }): Promise<string>;

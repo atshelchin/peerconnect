@@ -43,6 +43,10 @@ cd crates/peerconnect-worker && npx wrangler deploy
 
 **Binary**: `cargo install peerconnect-relay`, then run `peerconnect-relay`, configured with `PEERCONNECT_LISTEN`, `PEERCONNECT_MAX_CONNECTIONS`, `PEERCONNECT_MAX_PER_ADDRESS` (default 256, IPv6 counted per /64) and `PEERCONNECT_TRUST_PROXY=1` behind a proxy that sets `X-Forwarded-For`. `PEERCONNECT_TOKEN_SECRET` makes it require tokens ([SPEC §4.1](SPEC.md)): `peerconnect-relay token <client> --ttl 30d` mints one.
 
+### Tokens for the public relay
+
+`wss://relay.peerconnect.dev` requires a token on each connection, which says which application uses the relay and nothing more ([SPEC §4.1](SPEC.md), [docs/self-serve.md](docs/self-serve.md)). Try it with the public trial (`connect(room, { token: trialToken })`, from `peerconnect/auth`); for an application, register it on [peerconnect.dev/developers](https://peerconnect.dev/developers) for an app ID and an app secret, and either let your users connect it with their GitHub account (OAuth with PKCE: `startConnect` / `finishConnect`) or have your server issue a token per user with the app secret. Your own relay needs no token unless you set `PEERCONNECT_TOKEN_SECRET`.
+
 ### JavaScript (browsers, Node.js 22+, Deno, Bun)
 
 ```sh

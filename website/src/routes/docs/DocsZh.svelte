@@ -2,6 +2,7 @@
 	export const toc = [
 		{ id: 'concepts', label: '基本概念' },
 		{ id: 'install', label: '安装' },
+		{ id: 'tokens', label: 'Token' },
 		{ id: 'javascript', label: 'JavaScript' },
 		{ id: 'rust', label: 'Rust' },
 		{ id: 'relay', label: '运行中继' },
@@ -20,6 +21,7 @@
 		cloudflare,
 		docker,
 		jsFull,
+		tokensJs,
 		rustDependency,
 		rustFull
 	} from '#lib/snippets.ts';
@@ -90,6 +92,33 @@
 <CodeBlock code={rustDependency} lang="toml" title="Cargo.toml" />
 <p>如需从源码构建，请克隆<a href={REPO_URL} rel="external">代码仓库</a>，步骤见其 README。</p>
 
+<h2 id="tokens">Token</h2>
+<p>
+	公共 relay <code>{RELAY_URL}</code> 的每个连接都需要 token：这样它知道是哪个应用在用、能阻止滥用；除此之外，它从
+	token 里学不到任何东西。每一端各带自己的 token，token 不属于房间，也不在邀请里。获取方式有三种：
+</p>
+<ol>
+	<li>
+		<strong>公开试用</strong>：<code>trialToken</code> 无需账户即可拿到一个两小时有效的 token，用来试用。
+	</li>
+	<li>
+		<strong>用户连接你的应用</strong>：在<a href="/zh/developers">开发者页面</a>（用 GitHub
+		登录）登记应用，拿到 App ID 和 App Secret。用户从你的应用打开
+		<code>peerconnect.dev/connect</code>，登录后带着 code 回来，你的应用用 code 换取他们的
+		token（OAuth + PKCE）。
+	</li>
+	<li>
+		<strong>由你的服务器签发</strong>：适合用户无需知道 PeerConnect 的应用，服务器用 App Secret
+		为每个用户申请 token。
+	</li>
+</ol>
+<CodeBlock code={tokensJs('zh')} lang="js" title="tokens.js" />
+<p>
+	<code>token</code> 传一个函数时，relay 一旦拒绝 token（关闭码
+	4403），连接会重新调用它，然后继续，消息不丢。自己部署的 relay 不需要
+	token，除非你给它配置了密钥（<a href="#binary"><code>PEERCONNECT_TOKEN_SECRET</code></a>）。
+</p>
+
 <h2 id="javascript">JavaScript</h2>
 <p>一端创建房间并展示邀请，另一端用它加入。双方都要保存房间记录，以便之后在任何地方重新连接。</p>
 <CodeBlock code={jsFull('zh')} lang="js" title="app.js" />
@@ -144,7 +173,11 @@
 				></tr
 			>
 			<tr><td><code>Room.parse(record)</code></td><td>恢复已保存的房间。</td></tr>
-			<tr><td><code>connect(room)</code></td><td>连接房间，并保持连接，直到离开或关闭。</td></tr>
+			<tr
+				><td><code>connect(room, &#123; token &#125;)</code></td><td
+					>连接房间，并保持连接，直到离开或关闭。</td
+				></tr
+			>
 			<tr
 				><td><code>conn.send(data)</code></td><td
 					>把一条消息（字符串或字节，最大 16 MiB）加入队列并返回其 id。当已有 64 MiB

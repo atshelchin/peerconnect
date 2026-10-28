@@ -8,6 +8,8 @@
 // Native apps take the same steps with `connectRequest` and `exchangeCode`,
 // opening the URL in the system browser and receiving the redirect on their
 // own scheme or loopback port.
+//
+// To try PeerConnect without an account: `connect(room, { token: trialToken })`.
 
 const SITE = "https://peerconnect.dev";
 const PENDING = "peerconnect-auth:";
@@ -100,4 +102,22 @@ export async function finishConnect({ appId, url = location.href, site = SITE })
   sessionStorage.removeItem(PENDING + state);
   const { verifier, redirectUri } = JSON.parse(pending);
   return exchangeCode({ appId, code, verifier, redirectUri, site });
+}
+
+let trial;
+
+/**
+ * A token of the public trial: no account, two hours, tighter limits than an
+ * app's. Pass the function itself as `connect`'s `token`: it is asked again
+ * when the relay refuses an expired one. The same token is reused until it
+ * is about to expire.
+ */
+export async function trialToken({ site = SITE } = {}) {
+  const now = Date.now() / 1000;
+  if (trial && trial.site === site && trial.expires_at - 60 > now) return trial.token;
+  const response = await fetch(new URL("/api/trial", site), { method: "POST" });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error ?? `peerconnect.dev answered ${response.status}`);
+  trial = { ...body, site };
+  return body.token;
 }

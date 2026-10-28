@@ -1,7 +1,9 @@
 # Self-serve access to the PeerConnect relay
 
 **Status:** approved by the owner (2026-10-28), with server-issued tokens added
-(below). Phases 1 and 2 are built and tested locally; not deployed.
+(below). Phases 1–3 are built and tested locally; not deployed. Not built
+yet: the scheduled abuse alerts and Analytics Engine signals (phase 3), and
+the rollout (phase 4).
 
 Today anyone can open rooms on `wss://relay.peerconnect.dev`, anonymously.
 Nobody can tell who uses it, how much, or stop one abuser without stopping

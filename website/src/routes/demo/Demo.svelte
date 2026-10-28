@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import type { Connection, Room, State } from 'peerconnect';
+	import { trialToken } from 'peerconnect/auth';
 	import { encode } from 'uqr';
 	import { i18n } from '#lib/i18n/current.svelte.ts';
 	import { RELAY_URL } from '#lib/site.ts';
@@ -123,7 +124,8 @@
 	}
 
 	function start(room: Room) {
-		const c = sdk!.connect(room);
+		// The public trial's token (docs/self-serve.md): the relay requires one.
+		const c = sdk!.connect(room, { token: () => trialToken({ site: location.origin }) });
 		conn = c;
 		connected = true;
 		notice = null;

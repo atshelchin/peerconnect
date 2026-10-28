@@ -2,6 +2,7 @@
 	export const toc = [
 		{ id: 'concepts', label: 'Concepts' },
 		{ id: 'install', label: 'Install' },
+		{ id: 'tokens', label: 'Tokens' },
 		{ id: 'javascript', label: 'JavaScript' },
 		{ id: 'rust', label: 'Rust' },
 		{ id: 'relay', label: 'Run a relay' },
@@ -20,6 +21,7 @@
 		cloudflare,
 		docker,
 		jsFull,
+		tokensJs,
 		rustDependency,
 		rustFull
 	} from '#lib/snippets.ts';
@@ -98,6 +100,36 @@
 	README has the steps.
 </p>
 
+<h2 id="tokens">Tokens</h2>
+<p>
+	The public relay, <code>{RELAY_URL}</code>, requires a token on every connection, so that it knows
+	which application uses it and can stop abuse; it learns nothing more from it than before. Each
+	peer brings its own token, which is not part of the room or the invite. There are three ways to
+	get one:
+</p>
+<ol>
+	<li>
+		<strong>The public trial</strong>, for trying PeerConnect: <code>trialToken</code> fetches a token
+		that lasts two hours, without an account.
+	</li>
+	<li>
+		<strong>Your users connect your app.</strong> Register it on
+		<a href="/developers">the developers page</a> (sign in with GitHub) for an app ID and an app
+		secret. People open <code>peerconnect.dev/connect</code> from your app, sign in, and come back with
+		a code that your app exchanges for their token (OAuth with PKCE).
+	</li>
+	<li>
+		<strong>Your server issues the tokens</strong>, for apps whose users have no reason to see
+		PeerConnect: it asks for one per user with the app secret.
+	</li>
+</ol>
+<CodeBlock code={tokensJs('en')} lang="js" title="tokens.js" />
+<p>
+	Pass a function as <code>token</code> and the connection asks it again whenever the relay refuses
+	the token (close code 4403), then carries on with nothing lost. Your own relay needs no token
+	unless you give it a secret (<a href="#binary"><code>PEERCONNECT_TOKEN_SECRET</code></a>).
+</p>
+
 <h2 id="javascript">JavaScript</h2>
 <p>
 	One peer creates a room and shows the invite; the other joins with it. Both persist their room
@@ -156,7 +188,7 @@
 			>
 			<tr><td><code>Room.parse(record)</code></td><td>Restores a saved room.</td></tr>
 			<tr
-				><td><code>connect(room)</code></td><td
+				><td><code>connect(room, &#123; token &#125;)</code></td><td
 					>Connects and keeps the room connected until left or closed.</td
 				></tr
 			>

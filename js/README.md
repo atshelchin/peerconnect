@@ -53,7 +53,7 @@ Persist the room when you create or join it, and again after `"paired"` (inviter
 | `setToken(token)` | replaces the relay token, from the next connection on |
 | event `unauthorized` | the relay requires a token and refused this one; the connection stays offline until it has another |
 
-`token` is for a relay that requires one, such as relay.peerconnect.dev ([getting one](https://peerconnect.dev/developers)): a string, or a function that returns one (or a promise of one). A function is called before the first connection and again whenever the relay refuses the token, so a short-lived token from your server renews itself. Each peer brings its own token; it is not part of the room or the invite.
+`token` is for a relay that requires one, such as relay.peerconnect.dev: `trialToken` from `peerconnect/auth` to try it, or your app's ([getting one](https://peerconnect.dev/docs#tokens)): a string, or a function that returns one (or a promise of one). A function is called before the first connection and again whenever the relay refuses the token, so a short-lived token from your server renews itself. Each peer brings its own token; it is not part of the room or the invite.
 
 Messages are delivered in order, exactly once, as long as both sides keep running; unacknowledged messages live in memory, so a page reload loses those not yet delivered.
 

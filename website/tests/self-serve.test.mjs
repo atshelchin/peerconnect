@@ -457,3 +457,73 @@ test("the SDK's own helpers take an app through the same flow", async () => {
 		/unknown, used or expired/
 	);
 });
+
+test('the public trial needs no account, and is rate limited per address', async () => {
+	const first = await fetch(`${SITE}/api/trial`, {
+		method: 'POST',
+		headers: { origin: 'http://localhost:5173' }
+	});
+	assert.equal(first.status, 200);
+	assert.equal(first.headers.get('access-control-allow-origin'), '*');
+	const trial = await first.json();
+	assert.equal(trial.relay_url, RELAY);
+	assert.ok(trial.expires_at - Date.now() / 1000 <= 2 * 3600 + 5, 'two hours');
+	assert.equal(JSON.parse(Buffer.from(trial.token.split('.')[1], 'base64url')).app, 'trial');
+	assert.equal(await admitted(trial.token), 'hello');
+	const codes = [];
+	for (let i = 0; i < 10; i++)
+		codes.push((await fetch(`${SITE}/api/trial`, { method: 'POST' })).status);
+	assert.deepEqual(codes.slice(0, 9), Array(9).fill(200));
+	assert.equal(codes[9], 429, 'ten an hour');
+});
+
+test("the admin page is the owner's alone, and suspends accounts and disables apps", async () => {
+	const { browser: bobBrowser, html: bobHtml } = await signedIn('bob');
+	const bobApp = await register(bobBrowser, bobHtml);
+	const issued = await (await serverToken(bobApp.id, bobApp.secret, { user: 'x1' })).json();
+	assert.equal((await bobBrowser.fetch('/admin')).status, 404, 'nobody else sees it');
+
+	const { browser: admin } = await signedIn('alice');
+	const page = await admin.fetch('/admin');
+	assert.equal(page.status, 200);
+	const html = await page.text();
+	assert.match(html, /@bob/);
+	const bobAccount = html.match(/@bob<br\s*\/?>\s*<code[^>]*>(a-[a-z2-7]{20})/)?.[1];
+	assert.ok(bobAccount, "bob's account is listed");
+
+	const disabled = await admin.submit('/admin?/app', {
+		csrf: csrfOf(html),
+		app: bobApp.id,
+		state: 'disabled'
+	});
+	assert.equal(disabled.status, 200);
+	assert.equal(await admitted(issued.token), 4403, "its users' tokens stop");
+	assert.equal(
+		(await serverToken(bobApp.id, bobApp.secret, { user: 'x1' })).status,
+		401,
+		'and its secret'
+	);
+	await admin.submit('/admin?/app', { csrf: csrfOf(html), app: bobApp.id, state: 'active' });
+	const again = await (await serverToken(bobApp.id, bobApp.secret, { user: 'x1' })).json();
+	assert.notEqual(again.token, issued.token, 'enabled again: a new token');
+	assert.equal(await admitted(again.token), 'hello');
+
+	const suspended = await admin.submit('/admin?/account', {
+		csrf: csrfOf(html),
+		account: bobAccount,
+		state: 'suspended'
+	});
+	assert.equal(suspended.status, 200);
+	assert.equal(await admitted(again.token), 4403, 'everything bob answers for stops');
+	const blocked = await bobBrowser.submit('/developers?/create', {
+		csrf: csrfOf(bobHtml),
+		name: 'More',
+		redirect_uris: REDIRECT
+	});
+	assert.equal(blocked.status, 403);
+	await admin.submit('/admin?/account', {
+		csrf: csrfOf(html),
+		account: bobAccount,
+		state: 'active'
+	});
+});
