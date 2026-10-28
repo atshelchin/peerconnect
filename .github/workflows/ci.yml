@@ -61,6 +61,13 @@ jobs:
           bunx vitest --run
           bunx playwright install --with-deps chromium
           bunx playwright test
+      # Sign-in, apps, /connect, the token exchange and server-issued tokens,
+      # against the relay Worker, all local (docs/self-serve.md).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo install worker-build --locked
+      - run: website/tests/run-self-serve.sh
 
   cloudflare:
     runs-on: ubuntu-latest

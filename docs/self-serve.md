@@ -1,7 +1,7 @@
 # Self-serve access to the PeerConnect relay
 
 **Status:** approved by the owner (2026-10-28), with server-issued tokens added
-(below). Phase 1 in progress.
+(below). Phases 1 and 2 are built and tested locally; not deployed.
 
 Today anyone can open rooms on `wss://relay.peerconnect.dev`, anonymously.
 Nobody can tell who uses it, how much, or stop one abuser without stopping

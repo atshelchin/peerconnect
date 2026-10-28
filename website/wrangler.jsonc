@@ -11,5 +11,24 @@
 	// Served at peerconnect.dev only: a second host would duplicate every page.
 	"routes": [{ "pattern": "peerconnect.dev", "custom_domain": true }],
 	"workers_dev": false,
-	"preview_urls": true
+	"preview_urls": true,
+	// Developer accounts and relay tokens (docs/self-serve.md). Secrets, set
+	// with `wrangler secret put`: SERVICE_SECRET (the relay's
+	// PEERCONNECT_SERVICE_SECRET), GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET,
+	// SESSION_KEY, APP_SECRET_KEY. The site never holds the token secret: the
+	// relay signs.
+	"d1_databases": [
+		{
+			"binding": "SITE_DB",
+			"database_name": "peerconnect-site",
+			// Created at the first deploy with these.
+			"database_id": "00000000-0000-0000-0000-000000000000",
+			"migrations_dir": "migrations"
+		}
+	],
+	"services": [{ "binding": "RELAY", "service": "peerconnect-relay" }],
+	"vars": {
+		"RELAY_PUBLIC_URL": "wss://relay.peerconnect.dev",
+		"ADMIN_GITHUB_ID": "113176571"
+	}
 }

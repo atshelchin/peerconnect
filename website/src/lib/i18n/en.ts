@@ -35,6 +35,7 @@ export const en = {
 		docs: 'Docs',
 		demo: 'Demo',
 		spec: 'Spec',
+		developers: 'Developers',
 		github: 'GitHub',
 		skip: 'Skip to content',
 		language: 'Language',

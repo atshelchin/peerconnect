@@ -33,6 +33,7 @@ export const zh: Dict = {
 		docs: '文档',
 		demo: '演示',
 		spec: '规范',
+		developers: '开发者',
 		github: 'GitHub',
 		skip: '跳到正文',
 		language: '语言',

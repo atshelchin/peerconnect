@@ -1,0 +1,21 @@
+// Local end-to-end runs only (tests/run-site.sh): the site as deployed, bound
+// to the local relay Worker, with no route. Its GitHub is a local fake, and its
+// secrets come from the run.
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "peerconnect-website-e2e",
+	"compatibility_date": "2026-05-01",
+	"compatibility_flags": ["nodejs_als"],
+	"main": ".svelte-kit/cloudflare/_worker.js",
+	"assets": { "binding": "ASSETS", "directory": ".svelte-kit/cloudflare" },
+	"d1_databases": [
+		{
+			"binding": "SITE_DB",
+			"database_name": "peerconnect-site-e2e",
+			"database_id": "00000000-0000-0000-0000-0000000000e2",
+			"migrations_dir": "migrations"
+		}
+	],
+	"services": [{ "binding": "RELAY", "service": "peerconnect-relay" }],
+	"vars": { "ADMIN_GITHUB_ID": "1001" }
+}

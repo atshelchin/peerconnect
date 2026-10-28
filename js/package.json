@@ -26,11 +26,17 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./index.js"
+    },
+    "./auth": {
+      "types": "./auth.d.ts",
+      "default": "./auth.js"
     }
   },
   "files": [
     "index.js",
     "index.d.ts",
+    "auth.js",
+    "auth.d.ts",
     "dist/",
     "LICENSE-MIT",
     "LICENSE-APACHE"

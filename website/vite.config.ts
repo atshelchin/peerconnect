@@ -18,7 +18,13 @@ export default defineConfig({
 				entries: ['*', '/zh', '/zh/docs', '/zh/demo', '/sitemap.xml']
 			},
 			// Small stylesheets go inline, saving a render-blocking request.
-			inlineStyleThreshold: 16 * 1024
+			inlineStyleThreshold: 16 * 1024,
+			// Kit's origin check refuses any mutating request without an Origin
+			// and a content type, which an app's server calling the API (a bare
+			// `DELETE`) sends neither of. Every form here carries a CSRF token
+			// checked on the server (#lib/server/guard.ts), the JSON endpoints
+			// check the Origin themselves, and the session cookie is SameSite=Lax.
+			csrf: { trustedOrigins: ['*'] }
 		})
 	],
 	// The specification page reads ../SPEC.md.

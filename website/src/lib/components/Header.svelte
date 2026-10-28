@@ -15,7 +15,8 @@
 	const links = $derived([
 		{ path: '/docs', href: i18n.href('/docs'), label: t.nav.docs },
 		{ path: '/demo', href: i18n.href('/demo'), label: t.nav.demo },
-		{ path: '/spec', href: '/spec', label: t.nav.spec }
+		{ path: '/spec', href: '/spec', label: t.nav.spec },
+		{ path: '/developers', href: i18n.href('/developers'), label: t.nav.developers }
 	]);
 
 	afterNavigate(() => {
