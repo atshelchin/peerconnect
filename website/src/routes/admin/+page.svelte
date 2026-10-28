@@ -57,21 +57,27 @@
 	let action = $state('');
 	let auditQuery = $state('');
 	let shown = $state(30);
+	/** An action or an actor, in words; the code stays in the tooltip. */
+	const said = (action: string) => t.actions[action] ?? action;
+	const by = (actor: { kind: string; name: string }) =>
+		actor.kind ? fill(t.actors[actor.kind] ?? actor.kind, { name: actor.name }) : actor.name;
 	const rows = $derived(
 		source === 'site'
 			? data.audit.map((r) => ({
 					at: r.at,
 					action: r.action,
+					id: '',
 					subject: r.who ? `@${r.who}` : '',
 					detail: r.detail,
-					actor: r.actor
+					actor: by(r.actor)
 				}))
 			: data.issuance.map((r) => ({
 					at: r.at,
 					action: r.action,
-					subject: short(r.client),
-					detail: r.gen === null ? '' : `gen ${r.gen}`,
-					actor: r.actor
+					id: r.client,
+					subject: r.client.startsWith('t-') ? t.trialClient : short(r.client),
+					detail: r.gen === null ? '' : fill(t.generation, { n: r.gen }),
+					actor: by(r.actor)
 				}))
 	);
 	const actions = $derived([...new Set(rows.map((r) => r.action))].sort());
@@ -80,7 +86,7 @@
 			(r) =>
 				(!action || r.action === action) &&
 				(!auditQuery.trim() ||
-					[r.subject, r.detail, r.actor]
+					[said(r.action), r.subject, r.detail, r.actor]
 						.join(' ')
 						.toLowerCase()
 						.includes(auditQuery.trim().toLowerCase()))
@@ -562,7 +568,7 @@
 			</div>
 			<select bind:value={action} aria-label={t.allActions}>
 				<option value="">{t.allActions}</option>
-				{#each actions as a (a)}<option value={a}>{a}</option>{/each}
+				{#each actions as a (a)}<option value={a}>{said(a)}</option>{/each}
 			</select>
 			<input
 				class="search"
@@ -581,8 +587,11 @@
 						{#each filtered.slice(0, shown) as r, i (i)}
 							<tr>
 								<td class="muted nowrap">{@render when(r.at)}</td>
-								<td><span class="tag {tone(r.action)}">{r.action}</span></td>
-								<td><strong>{r.subject}</strong> <span class="muted">{r.detail}</span></td>
+								<td><span class="tag {tone(r.action)}" title={r.action}>{said(r.action)}</span></td>
+								<td
+									><strong title={r.id}>{r.subject}</strong>
+									<span class="muted">{r.detail}</span></td
+								>
 								<td class="muted">{r.actor}</td>
 							</tr>
 						{/each}
@@ -870,8 +879,8 @@
 		padding: 1px 8px;
 		border-radius: 6px;
 		background: var(--bg-soft);
-		font-family: var(--font-mono);
-		font-size: 0.75rem;
+		font-size: 0.78rem;
+		font-weight: 600;
 		white-space: nowrap;
 	}
 	.tag.good {

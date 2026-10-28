@@ -77,6 +77,14 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
 			.replace(/\b(?:app:)?(app_[a-z2-7]{16})\b/g, (m, id: string) =>
 				appNames.has(id) ? `${appNames.get(id)}` : m
 			);
+	/** Who asked, as a kind the page names in its language, and a name. */
+	const actorOf = (raw: string): { kind: string; name: string } => {
+		const [kind, id] = raw.includes(':') ? raw.split(/:(.*)/s) : [raw, ''];
+		if (kind === 'account' || kind === 'admin') return { kind, name: `@${logins.get(id) ?? id}` };
+		if (kind === 'app' && id) return { kind: 'appServer', name: appNames.get(id) ?? id };
+		if (['person', 'app', 'developer', 'trial'].includes(kind)) return { kind, name: '' };
+		return { kind: '', name: raw };
+	};
 	const today = new Date().toISOString().slice(0, 10);
 	const daysList = [...perDay.entries()]
 		.map(([day, u]) => ({ day, ...u }))
@@ -109,14 +117,14 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
 			action: row.action,
 			who: row.account_id ? (logins.get(row.account_id) ?? row.account_id) : '',
 			detail: readable(row.detail),
-			actor: readable(row.actor)
+			actor: actorOf(row.actor)
 		})),
 		issuance: issuance.map((row) => ({
 			at: row.at,
 			action: row.action,
 			client: row.client,
 			gen: row.gen,
-			actor: readable(row.actor)
+			actor: actorOf(row.actor)
 		})),
 		alerts: raised.map((a) => {
 			const owner = owners.get(a.client);
